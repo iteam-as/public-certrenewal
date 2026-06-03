@@ -1,0 +1,18 @@
+# This repo is a CI-managed mirror; only generated artifacts (scripts + manifest) belong here.
+# Block anything server-local or secret from ever being committed by mistake.
+
+cert-secrets.json
+*.secrets.json
+cert-config.json
+last-heartbeat.json
+log/
+*.new
+*.bak
+*.pfx
+*.key
+
+# Windows / editor cruft
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
