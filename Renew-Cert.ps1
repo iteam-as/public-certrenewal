@@ -6,12 +6,15 @@
   v2 plumbing (PR A): load cert-config.json, load + DPAPI-LM decrypt cert-secrets.json,
   self-update from the manifest (sha256 + Authenticode thumbprint gate + circuit-breaker +
   PinVersion), local logging (transcript + Windows Event Log), a Teams failure card, and a
-  Send-Telemetry stub. Renewal core (PR B, ported from v1): per-domain binding detection
+  best-effort Send-Telemetry event (Azure Monitor Logs Ingestion -> CertRenewal_CL, the fleet
+  liveness/inventory/billing signal; never blocks renewal). Renewal core (PR B, ported from v1): per-domain binding detection
   (netsh / IIS Web / IIS FTP) + config validation incl. the automatic CertStore->Netsh upgrade,
   Submit-Renewal with stale-authorization (-Force) recovery, self-heal via New-PACertificate
   when Posh-ACME has lost track of an order, per-Type deploy, old-cert cleanup, optional
   service restart (see docs/phase1-renew-cert-spec.md section9). Domeneshop creds (self-heal only) and
-  the Teams webhook come from cert-secrets.json. No periodic Teams heartbeat - the per-run
+  the Teams webhook come from cert-secrets.json, which the daily run best-effort refreshes from Azure
+  Key Vault (Decision D2, SP-cert auth via cert-config.Telemetry) so a rotated token/webhook reaches a
+  box that never re-runs the creator. No periodic Teams heartbeat - the per-run
   telemetry event to Log Analytics is the liveness signal (docs/telemetry-log-analytics-setup.md).
 .PARAMETER DryRun
   Read-only: log what WOULD happen; no self-update replace, no renew/deploy, no Teams/telemetry POST.
@@ -39,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '0.0.2-test'
+$ScriptVersion = '2.0.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -50,6 +53,20 @@ $AllowedSignerThumbprints = @(
 
 # Built-in production manifest URL (overridable via -ManifestUrl or cert-config.ManifestUrl test channel).
 $DefaultManifestUrl = 'https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/manifest.json'
+
+# Renew (and prune the superseded cert) once a certificate has this many days or fewer remaining.
+$RenewalThresholdDays = 30
+
+# Shared-secrets Key Vault (Decision D2/D3). The daily SYSTEM renewal best-effort refreshes
+# cert-secrets.json from here so a rotated Domeneshop token / Teams webhook reaches a box that never
+# re-runs the creator. Vault name overridable via cert-config.SecretsVault. Field -> vault secret name.
+$DefaultSecretsVaultName = 'kv-online-nwe-prod-1'
+$SecretNameMap = [ordered]@{
+    DomeneshopToken  = 'DomeneshopToken'
+    DomeneshopSecret = 'DomeneshopSecret'
+    TeamsWebhookUrl  = 'TeamsWebhookUrl'
+    Email            = 'Email'
+}
 
 # Paths
 $CertRenewalPath = 'C:\Cert\Renewal'
@@ -62,7 +79,11 @@ $SelfPath        = $PSCommandPath        # this script's own path, for the atomi
 # Windows Event Log
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
-$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; SigRefused = 1040; Breaker = 1050 }
+$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; SigRefused = 1040; SecretsRefreshed = 1045; Breaker = 1050 }
+
+# Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
+# Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
+$SelfUpdateStatus = 'Skipped'
 
 #region Helpers ---------------------------------------------------------------
 
@@ -218,13 +239,107 @@ function Send-TeamsNotification {
     catch { Write-Log "Failed to send Teams notification: $($_.Exception.Message)" -Level WARNING }
 }
 
+function ConvertTo-Base64Url {
+    # Base64url (JWT-safe): standard base64 with padding stripped and +/ swapped for -_.
+    param([Parameter(Mandatory)][byte[]] $Bytes)
+    [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-TelemetryAccessToken {
+    # Client-certificate assertion (RS256 JWT, no secret) -> AAD token for the Logs Ingestion scope
+    # https://monitor.azure.com/.default. Same flow as the verified tools/Test-TelemetryIngestion.ps1.
+    # Throws on any failure; the Send-Telemetry caller swallows it (best-effort, never blocks renewal).
+    param(
+        [Parameter(Mandatory)][string] $TenantId,
+        [Parameter(Mandatory)][string] $AppClientId,
+        [Parameter(Mandatory)][string] $CertThumbprint
+    )
+    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $CertThumbprint } | Select-Object -First 1
+    if (-not $cert)               { throw "telemetry cert (thumbprint $CertThumbprint) not found in LocalMachine\My" }
+    if (-not $cert.HasPrivateKey) { throw "telemetry cert $CertThumbprint has no private key" }
+
+    $now    = [DateTimeOffset]::UtcNow
+    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = ConvertTo-Base64Url -Bytes $cert.GetCertHash() } | ConvertTo-Json -Compress
+    $claims = @{
+        aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        iss = $AppClientId; sub = $AppClientId
+        jti = [Guid]::NewGuid().ToString()
+        nbf = $now.ToUnixTimeSeconds(); exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+    } | ConvertTo-Json -Compress
+    $toSign = (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($header))) + '.' +
+              (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($claims)))
+    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $sig = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($toSign),
+        [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    $jwt = $toSign + '.' + (ConvertTo-Base64Url -Bytes $sig)
+
+    return (Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+        -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 20 `
+        -Body @{
+            client_id             = $AppClientId
+            scope                 = 'https://monitor.azure.com/.default'
+            grant_type            = 'client_credentials'
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $jwt
+        }).access_token
+}
+
 function Send-Telemetry {
-    # Phase-1 STUB. The real Logs Ingestion API POST (client-cert assertion -> DCR) lands in the
-    # telemetry phase; see docs/telemetry-log-analytics-setup.md. This per-run event is the liveness signal.
+    # One structured event per run to the Azure Monitor Logs Ingestion API -> CertRenewal_CL
+    # (docs/telemetry-log-analytics-setup.md section 2/4). This is the fleet liveness/inventory/billing
+    # signal (no periodic Teams heartbeat). BEST-EFFORT: any failure (no Telemetry config, missing cert,
+    # token/POST error) logs locally and returns - it never throws and never blocks renewal, mirroring the
+    # Teams "never block" rule. DryRun -> log only, no POST. SP identity + DCR coordinates come from the
+    # cert-config.Telemetry block (written by bootstrap, Phase 3); skipped cleanly if absent/disabled.
     param([object] $Config, [object] $Outcome)
-    if ($DryRun) { Write-Log '[DryRun] WOULD emit telemetry event.' -Level INFO; return }
-    Write-Log ("[telemetry stub] event: server={0} version={1} outcome={2} certs={3} renewed={4} nextExpiry={5}" -f `
-        $env:COMPUTERNAME, $ScriptVersion, $Outcome.RunOutcome, $Outcome.CertCount, $Outcome.Renewed, $Outcome.NextExpiry) -Level DEBUG
+
+    $t = $Config.Telemetry
+    if (-not $t -or -not $t.Enabled) { Write-Log 'Telemetry not enabled (no cert-config.Telemetry block); skipping.' -Level DEBUG; return }
+    foreach ($f in 'TenantId', 'AppClientId', 'DcrImmutableId', 'Stream', 'EndpointUri', 'CertThumbprint') {
+        if ([string]::IsNullOrWhiteSpace([string]$t.$f)) { Write-Log "Telemetry block missing '$f'; skipping telemetry." -Level WARNING; return }
+    }
+
+    $billing       = $Config.Billing
+    $nextExpiryUtc = $null
+    if ($Outcome.NextExpiry) { try { $nextExpiryUtc = ([datetime]$Outcome.NextExpiry).ToUniversalTime().ToString('o') } catch { } }
+
+    $row = [ordered]@{
+        TimeGenerated    = (Get-Date).ToUniversalTime().ToString('o')
+        ServerName       = $env:COMPUTERNAME
+        Abr              = [string]$billing.Abr
+        CustomerName     = [string]$billing.CustomerName
+        CustomerNr       = [string]$billing.CustomerNr
+        InvoiceCode      = [string]$billing.InvoiceCode
+        Service          = 'CertRenewal'
+        ScriptVersion    = $ScriptVersion
+        RunOutcome       = [string]$Outcome.RunOutcome
+        SelfUpdateStatus = [string]$SelfUpdateStatus
+        CertCount        = [int]$Outcome.CertCount
+        NextExpiryUtc    = $nextExpiryUtc
+        NextExpiryDomain = [string]$Outcome.NextExpiryDomain
+        Certificates     = @($Outcome.Certificates)
+        Message          = [string]$Outcome.Message
+    }
+
+    if ($DryRun) {
+        Write-Log ("[DryRun] WOULD emit telemetry: server={0} outcome={1} selfUpdate={2} certs={3}" -f `
+            $row.ServerName, $row.RunOutcome, $row.SelfUpdateStatus, $row.CertCount) -Level INFO
+        return
+    }
+
+    try {
+        $token = Get-TelemetryAccessToken -TenantId $t.TenantId -AppClientId $t.AppClientId -CertThumbprint $t.CertThumbprint
+        $body  = ConvertTo-Json @($row) -Depth 6
+        $uri   = "$($t.EndpointUri)/dataCollectionRules/$($t.DcrImmutableId)/streams/$($t.Stream)?api-version=2023-01-01"
+        $resp  = Invoke-WebRequest -Method Post -Uri $uri -UseBasicParsing -TimeoutSec 20 `
+            -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body $body
+        if ($resp.StatusCode -eq 204) { Write-Log 'Telemetry event accepted (204).' -Level SUCCESS }
+        else { Write-Log ("Telemetry POST returned unexpected status {0}." -f $resp.StatusCode) -Level WARNING }
+    }
+    catch { Write-Log "Telemetry send failed (non-fatal): $($_.Exception.Message)" -Level WARNING }
 }
 
 function Invoke-SelfUpdate {
@@ -237,6 +352,7 @@ function Invoke-SelfUpdate {
 
     if ($Config.PinVersion) {
         Write-Log "PinVersion=$($Config.PinVersion) set in cert-config - skipping self-update." -Level INFO
+        $script:SelfUpdateStatus = 'Skipped'
         return $false
     }
 
@@ -249,6 +365,7 @@ function Invoke-SelfUpdate {
         if ($sinceH -lt 24) {
             Write-Log ("Self-update circuit-breaker open ({0} consecutive fails, last {1:N1}h ago) - backing off 24h." -f $state.consecutiveFailures, $sinceH) -Level WARNING
             Write-EventLogEntry $EID.Breaker Warning "Self-update circuit-breaker open ($($state.consecutiveFailures) fails)"
+            $script:SelfUpdateStatus = 'Refused'
             return $false
         }
     }
@@ -263,10 +380,11 @@ function Invoke-SelfUpdate {
             Write-Log "Renewal script up to date (current $ScriptVersion, manifest $latest)." -Level SUCCESS
             Write-EventLogEntry $EID.UpToDate Information "Up to date at $ScriptVersion"
             $state.consecutiveFailures = 0; Save-SelfUpdateState $state
+            $script:SelfUpdateStatus = 'UpToDate'
             return $false
         }
 
-        if ($DryRun) { Write-Log "[DryRun] WOULD upgrade $ScriptVersion -> $latest from $($manifest.renewal.url)" -Level INFO; return $false }
+        if ($DryRun) { Write-Log "[DryRun] WOULD upgrade $ScriptVersion -> $latest from $($manifest.renewal.url)" -Level INFO; $script:SelfUpdateStatus = 'Skipped'; return $false }
 
         # The download target MUST keep a .ps1 extension: Get-AuthenticodeSignature resolves
         # its signature parser (SIP) from the extension, so a '.new' file always reads as
@@ -278,6 +396,7 @@ function Invoke-SelfUpdate {
         $hash = (Get-FileHash $newPath -Algorithm SHA256).Hash.ToLower()
         if ($hash -ne ([string]$manifest.renewal.sha256).ToLower()) {
             Remove-Item $newPath -Force -ErrorAction SilentlyContinue
+            $script:SelfUpdateStatus = 'Refused'
             throw "sha256 mismatch (downloaded $hash, manifest $($manifest.renewal.sha256))"
         }
 
@@ -285,6 +404,7 @@ function Invoke-SelfUpdate {
         if (-not $auth.Allowed) {
             Remove-Item $newPath -Force -ErrorAction SilentlyContinue
             Write-EventLogEntry $EID.SigRefused Error "Self-update signature refused: $($auth.Reason)"
+            $script:SelfUpdateStatus = 'Refused'
             throw "signature refused ($($auth.Reason))"
         }
 
@@ -292,6 +412,7 @@ function Invoke-SelfUpdate {
         Write-Log "Upgraded renewal script $ScriptVersion -> $latest (signer $($auth.Thumbprint)). Next run executes the new version." -Level SUCCESS
         Write-EventLogEntry $EID.Upgraded Information "Upgraded $ScriptVersion -> $latest"
         $state.consecutiveFailures = 0; Save-SelfUpdateState $state
+        $script:SelfUpdateStatus = 'Upgraded'
         return $true
     }
     catch {
@@ -304,6 +425,189 @@ function Invoke-SelfUpdate {
 }
 
 #endregion Helpers ------------------------------------------------------------
+
+#region Key Vault secret refresh (Decision D2) --------------------------------
+# Daily SYSTEM rotation handling: a box can run for years on the renewal task without the creator ever
+# being re-run, so renewal is the only place a rotated Domeneshop token / Teams webhook reliably reaches
+# the fleet. Pure helpers below are COPIED VERBATIM from Create-New-Cert.ps1 (keep them byte-identical so
+# the two files stay diff-able). Connect-SecretsVault / Sync-SecretsFromVault DELIBERATELY differ from the
+# creator: identity comes from cert-config.Telemetry (renewal as SYSTEM has no built-in constants), and the
+# whole thing is BEST-EFFORT (Update-SecretsFromVault swallows every failure) where the creator hard-aborts.
+
+function Protect-Dpapi {
+    # Encrypt a UTF-8 string to a base64 DPAPI-LocalMachine blob (the inverse of Unprotect-Dpapi).
+    param([string] $PlainText)
+    # A [string] param coerces $null to '', so guard on empty (not $null) to stay the exact inverse of
+    # Unprotect-Dpapi (empty/blank -> $null) - a null/empty in round-trips back to $null.
+    if ([string]::IsNullOrEmpty($PlainText)) { return $null }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($PlainText)
+    $blob  = [System.Security.Cryptography.ProtectedData]::Protect(
+        $bytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+    return [Convert]::ToBase64String($blob)
+}
+
+function Get-VaultSecretPlainText {
+    # Fetch one Key Vault secret and return its plaintext (via Marshal so it works across Az versions
+    # and PS 5.1 without -AsPlainText). Throws if the secret is missing.
+    param([Parameter(Mandatory)][string] $VaultName, [Parameter(Mandatory)][string] $Name)
+    $sec = Get-AzKeyVaultSecret -VaultName $VaultName -Name $Name -ErrorAction Stop
+    if (-not $sec) { throw "Secret '$Name' not found in vault '$VaultName'." }
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec.SecretValue)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+}
+
+function Set-SecretsFileAcl {
+    # Restrict cert-secrets.json to Administrators + SYSTEM only (spec section4) so the SYSTEM renewal
+    # task can still decrypt it. SIDs (not names) for locale independence. Never fatal.
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        $adminSid  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')   # BUILTIN\Administrators
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')        # NT AUTHORITY\SYSTEM
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited rules
+        foreach ($sid in $adminSid, $systemSid) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'Allow')))
+        }
+        $acl.SetOwner($adminSid)
+        Set-Acl -Path $Path -AclObject $acl
+        Write-Log "  Restricted ACL on cert-secrets.json (Administrators + SYSTEM only)." -Level DEBUG
+    }
+    catch { Write-Log "Could not set restrictive ACL on ${Path}: $($_.Exception.Message)" -Level WARNING }
+}
+
+function Write-SecretsFile {
+    # Write cert-secrets.json: the 3 secret fields DPAPI-LM-encrypted, Email plaintext (spec section4 shape).
+    param([Parameter(Mandatory)][hashtable] $Values)
+    $obj = [ordered]@{
+        DomeneshopToken  = Protect-Dpapi $Values.DomeneshopToken
+        DomeneshopSecret = Protect-Dpapi $Values.DomeneshopSecret
+        TeamsWebhookUrl  = Protect-Dpapi $Values.TeamsWebhookUrl
+        Email            = $Values.Email
+    }
+    $json = [pscustomobject]$obj | ConvertTo-Json
+    [IO.File]::WriteAllText($SecretsPath, $json, (New-Object Text.UTF8Encoding($false)))   # no BOM
+    Set-SecretsFileAcl -Path $SecretsPath
+}
+
+function Get-ResolvedVaultName {
+    # cert-config.SecretsVault override, else the built-in default. (Renewal has no -VaultName parameter;
+    # the creator's copy also accepts a -VaultName switch.)
+    param([object] $Config)
+    if ($Config -and $Config.SecretsVault) { return $Config.SecretsVault }
+    return $DefaultSecretsVaultName
+}
+
+function Connect-SecretsVault {
+    # App-only sign-in to Azure with the shared telemetry SP cert (Decision D2/D3). Identity is passed in
+    # from cert-config.Telemetry (renewal as SYSTEM has no built-in constants - that's the creator's path).
+    # Throws if a module / the cert / the connection is missing; the best-effort caller swallows it.
+    param(
+        [Parameter(Mandatory)][string] $TenantId,
+        [Parameter(Mandatory)][string] $AppClientId,
+        [Parameter(Mandatory)][string] $CertThumbprint
+    )
+    foreach ($m in 'Az.Accounts', 'Az.KeyVault') {
+        if (-not (Get-Module -ListAvailable -Name $m)) { throw "Required module '$m' is not installed (Install-Module $m)." }
+    }
+    Import-Module Az.Accounts -ErrorAction Stop
+    Import-Module Az.KeyVault -ErrorAction Stop
+
+    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $CertThumbprint } | Select-Object -First 1
+    if (-not $cert) {
+        throw "SP cert (thumbprint $CertThumbprint) not found in LocalMachine\My - run bootstrap / install the telemetry cert first."
+    }
+
+    Invoke-WithRetry -OperationName 'Connect-AzAccount (SP cert)' -ScriptBlock {
+        Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -CertificateThumbprint $CertThumbprint `
+            -Tenant $TenantId -ErrorAction Stop | Out-Null
+    }
+    Write-Log "Connected to Azure as SP $AppClientId (tenant $TenantId)." -Level SUCCESS
+}
+
+function Sync-SecretsFromVault {
+    # Decision D2. Connect to the vault (SP cert), fetch the 4 current values, and rewrite cert-secrets.json
+    # IFF the file is absent or a value rotated. Idempotent (no change -> no rewrite). Logs changed FIELD
+    # NAMES only, never values. Returns $true if it rewrote the file. Throws on vault failure; the
+    # best-effort caller (Update-SecretsFromVault) swallows it so renewal never blocks on the vault.
+    # (Mirrors the creator's Sync-SecretsFromVault; differs only in config-driven auth + EID 1045.)
+    param(
+        [Parameter(Mandatory)][string] $VaultName,
+        [Parameter(Mandatory)][object] $Telemetry
+    )
+
+    Write-Log "Syncing shared secrets from Key Vault '$VaultName'..." -Level INFO
+    Connect-SecretsVault -TenantId $Telemetry.TenantId -AppClientId $Telemetry.AppClientId -CertThumbprint $Telemetry.CertThumbprint
+
+    $fetched = @{}
+    foreach ($field in $SecretNameMap.Keys) {
+        $fetched[$field] = Get-VaultSecretPlainText -VaultName $VaultName -Name $SecretNameMap[$field]
+    }
+
+    # Rotation check against the locally-decrypted copy.
+    $changed = @()
+    if (-not (Test-Path $SecretsPath)) {
+        $changed = @($SecretNameMap.Keys)
+        Write-Log '  cert-secrets.json absent - will write all fields.' -Level INFO
+    }
+    else {
+        $local = Get-Content $SecretsPath -Raw | ConvertFrom-Json
+        foreach ($field in $SecretNameMap.Keys) {
+            # Decrypt the local copy field-by-field. A blob written on another machine (re-image /
+            # file copy) can't be decrypted by LocalMachine DPAPI and throws - treat that (and any
+            # decrypt error) as "changed" so the vault value heals the broken file, rather than
+            # aborting the whole sync and leaving it broken.
+            $localVal = $null
+            try {
+                $localVal = if ($field -eq 'Email') { [string]$local.$field } else { Unprotect-Dpapi $local.$field }
+            }
+            catch {
+                Write-Log "  Local $field could not be decrypted ($($_.Exception.Message)); treating as changed." -Level WARNING
+                $changed += $field
+                continue
+            }
+            if ([string]$fetched[$field] -ne [string]$localVal) { $changed += $field }
+        }
+    }
+
+    if ($changed.Count -eq 0) {
+        Write-Log '  Secrets already current - no rewrite needed.' -Level SUCCESS
+        return $false
+    }
+    if ($DryRun) {
+        Write-Log ("[DryRun] WOULD refresh cert-secrets.json (changed: {0})." -f ($changed -join ', ')) -Level INFO
+        return $false
+    }
+
+    Write-SecretsFile -Values $fetched
+    Write-Log ("Refreshed cert-secrets.json from vault (changed: {0})." -f ($changed -join ', ')) -Level SUCCESS
+    Write-EventLogEntry $EID.SecretsRefreshed Information ("cert-secrets.json refreshed (fields: {0})" -f ($changed -join ', '))
+    return $true
+}
+
+function Update-SecretsFromVault {
+    # Decision D2 best-effort entry point for the daily SYSTEM renewal: refresh cert-secrets.json from the
+    # vault, but NEVER block renewal. Skips silently when there is no cert-config.Telemetry SP identity
+    # (nothing to auth with), and swallows every failure (missing module / cert / vault unreachable) so
+    # renewal continues on the last-known-good local secrets. (The creator aborts in the same spot because
+    # it must not issue with a stale token; the daily renewal must run regardless.)
+    param([Parameter(Mandatory)][object] $Config)
+
+    $t = $Config.Telemetry
+    if (-not $t -or [string]::IsNullOrWhiteSpace([string]$t.TenantId) -or
+        [string]::IsNullOrWhiteSpace([string]$t.AppClientId) -or
+        [string]::IsNullOrWhiteSpace([string]$t.CertThumbprint)) {
+        Write-Log 'No cert-config.Telemetry SP identity; skipping vault secret refresh (using local cert-secrets.json).' -Level DEBUG
+        return
+    }
+    $vaultName = Get-ResolvedVaultName -Config $Config
+    try { $null = Sync-SecretsFromVault -VaultName $vaultName -Telemetry $t }
+    catch { Write-Log "Vault secret refresh skipped (non-fatal): $($_.Exception.Message)" -Level WARNING }
+}
+
+#endregion Key Vault secret refresh -------------------------------------------
 
 #region Renewal core (ported from v1) ------------------------------------------
 # Faithful port of the proven v1 renewal logic (BHP-Leveranse/Cert/Create-New-Cert-SharedConfig.ps1,
@@ -466,7 +770,8 @@ function Get-ExistingIISWebBindingsForDomain {
     try {
         $cert = Get-StoreCertificateForDomain -Domain $Domain
         if (-not $cert) { return $null }
-        $bindings = Get-IISWebBindingsForThumbprint -Thumbprint $cert.Thumbprint
+        # @(...) so a single match doesn't unwrap to a bare PSCustomObject (whose .Count is $null).
+        $bindings = @(Get-IISWebBindingsForThumbprint -Thumbprint $cert.Thumbprint)
         if ($bindings.Count -gt 0) {
             Write-Log "  Found $($bindings.Count) existing IIS Web binding(s): $(($bindings | ForEach-Object { "$($_.SiteName) [$($_.BindingInformation)]" }) -join ', ')" -Level INFO
             return @{ Bindings = $bindings; Certificate = $cert }
@@ -484,7 +789,8 @@ function Get-ExistingIISFTPBindingsForDomain {
     try {
         $cert = Get-StoreCertificateForDomain -Domain $Domain
         if (-not $cert) { return $null }
-        $bindings = Get-IISFTPBindingsForThumbprint -Thumbprint $cert.Thumbprint
+        # @(...) so a single match doesn't unwrap to a bare PSCustomObject (whose .Count is $null).
+        $bindings = @(Get-IISFTPBindingsForThumbprint -Thumbprint $cert.Thumbprint)
         if ($bindings.Count -gt 0) {
             Write-Log "  Found $($bindings.Count) existing IIS FTP binding(s): $(($bindings | ForEach-Object { $_.SiteName }) -join ', ')" -Level INFO
             return @{ Bindings = $bindings; Certificate = $cert }
@@ -594,9 +900,9 @@ function Invoke-SelfHealCertificate {
         $oldNetshBindings = Get-NetshBindingForCertificate -Thumbprint $OldThumbprint
         if ($oldNetshBindings) { Write-Log "  Captured $($oldNetshBindings.Bindings.Count) netsh binding(s) against old thumbprint" -Level INFO }
         try {
-            $oldIISWebBindings = Get-IISWebBindingsForThumbprint -Thumbprint $OldThumbprint
+            $oldIISWebBindings = @(Get-IISWebBindingsForThumbprint -Thumbprint $OldThumbprint)
             if ($oldIISWebBindings.Count -gt 0) { Write-Log "  Captured $($oldIISWebBindings.Count) IIS Web binding(s) against old thumbprint" -Level INFO }
-            $oldIISFTPBindings = Get-IISFTPBindingsForThumbprint -Thumbprint $OldThumbprint
+            $oldIISFTPBindings = @(Get-IISFTPBindingsForThumbprint -Thumbprint $OldThumbprint)
             if ($oldIISFTPBindings.Count -gt 0) { Write-Log "  Captured $($oldIISFTPBindings.Count) IIS FTP binding(s) against old thumbprint" -Level INFO }
         }
         catch { Write-Log "  Error capturing IIS bindings: $($_.Exception.Message)" -Level WARNING }
@@ -782,6 +1088,8 @@ function Invoke-RenewalCore {
     $domains = @($Config.Domains)
     $renewalFailures = @()
     $renewedCount = 0
+    $renewedDomains = @()
+    $criticalError = $null
     $webhook = $Secrets.TeamsWebhookUrl
 
     try {
@@ -1009,7 +1317,7 @@ function Invoke-RenewalCore {
             $daysToExpiry = ($expiryDate - (Get-Date)).Days
             Write-Log "Certificate expires $expiryDate ($daysToExpiry days)" -Level INFO
 
-            if ($daysToExpiry -gt 30) {
+            if ($daysToExpiry -gt $RenewalThresholdDays) {
                 Write-Log "Certificate for $domain is still valid ($daysToExpiry days remaining). No renewal needed." -Level INFO
                 continue
             }
@@ -1020,7 +1328,7 @@ function Invoke-RenewalCore {
                 continue
             }
 
-            Write-Log 'Certificate expires in 30 days or less. Initiating renewal...' -Level WARNING
+            Write-Log "Certificate expires in $RenewalThresholdDays days or less. Initiating renewal..." -Level WARNING
             try {
                 # Submit renewal with retry. If the ACME server has pruned stale authorizations for
                 # the existing order (common when ARI signals "renew AS SOON AS POSSIBLE"),
@@ -1045,6 +1353,7 @@ function Invoke-RenewalCore {
                 Install-PACertificate -PACertificate $newCert -StoreLocation LocalMachine -StoreName My
                 Write-Log 'Certificate installed to LocalMachine\My.' -Level SUCCESS
                 $renewedCount++
+                $renewedDomains += $domain
 
                 $bindingSuccess = $false
 
@@ -1094,7 +1403,7 @@ function Invoke-RenewalCore {
                         if ($oldCert.Thumbprint -eq $newCert.Thumbprint) { continue }
                         $oldDays = ($oldCert.NotAfter - (Get-Date)).Days
                         try {
-                            if ($oldDays -le 30) {
+                            if ($oldDays -le $RenewalThresholdDays) {
                                 Write-Log "Removing old certificate $($oldCert.Thumbprint) (expires $($oldCert.NotAfter), $oldDays days)" -Level INFO
                                 Remove-Item -Path "Cert:\LocalMachine\My\$($oldCert.Thumbprint)" -Force -ErrorAction Stop
                             }
@@ -1175,28 +1484,48 @@ function Invoke-RenewalCore {
         $renewalFailures += @{ Domain = '(run)'; Type = 'Critical'; Error = $criticalError; ExpiryDate = 'N/A'; DaysToExpiry = 'N/A' }
     }
 
-    # Outcome for telemetry (liveness payload, spec section7) + Event Log in main
-    $nextExpiry = $null
+    # Outcome for telemetry (liveness/inventory/billing payload, spec section7 + telemetry section2) +
+    # Event Log in main. Tracks the soonest expiry (+ its domain) and per-cert detail.
+    $nextExpiry = $null; $nextExpiryDomain = $null
     foreach ($d in $domains) {
         if ($d.NotAfter) {
             try {
                 $dt = [datetime]$d.NotAfter
-                if (-not $nextExpiry -or $dt -lt $nextExpiry) { $nextExpiry = $dt }
+                if (-not $nextExpiry -or $dt -lt $nextExpiry) { $nextExpiry = $dt; $nextExpiryDomain = $d.MainDomain }
             }
             catch { }
         }
     }
+    $failedDomains = @($renewalFailures | ForEach-Object { $_.Domain })
+    $certificates = @(foreach ($d in $domains) {
+        [ordered]@{
+            domain     = [string]$d.MainDomain
+            thumbprint = [string]$d.Thumbprint
+            notAfter   = if ($d.NotAfter) { [string]$d.NotAfter } else { $null }
+            outcome    = if ($failedDomains -contains $d.MainDomain) { 'Failed' }
+                         elseif ($renewedDomains -contains $d.MainDomain) { 'Renewed' }
+                         else { 'Valid' }
+        }
+    })
     $runOutcome =
         if ($DryRun) { 'DryRun' }
         elseif ($renewalFailures.Count -eq 0) { 'Success' }
         elseif ($domains.Count -gt 0 -and $renewalFailures.Count -lt $domains.Count) { 'PartialFailure' }
         else { 'Failure' }
+    $message =
+        if ($criticalError) { "Critical failure: $criticalError" }
+        elseif ($renewalFailures.Count -gt 0) { "$($renewalFailures.Count) of $($domains.Count) renewal(s) failed: $($failedDomains -join ', ')" }
+        elseif ($renewedCount -gt 0) { "Renewed $renewedCount of $($domains.Count) certificate(s)." }
+        else { "No renewals due ($($domains.Count) certificate(s) checked)." }
     return [pscustomobject]@{
-        RunOutcome = $runOutcome
-        CertCount  = $domains.Count
-        Renewed    = $renewedCount
-        Failures   = @($renewalFailures)
-        NextExpiry = if ($nextExpiry) { $nextExpiry.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        RunOutcome       = $runOutcome
+        CertCount        = $domains.Count
+        Renewed          = $renewedCount
+        Failures         = @($renewalFailures)
+        NextExpiry       = if ($nextExpiry) { $nextExpiry.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        NextExpiryDomain = $nextExpiryDomain
+        Certificates     = $certificates
+        Message          = $message
     }
 }
 
@@ -1232,6 +1561,7 @@ try {
         Write-Log 'CheckOnly complete.' -Level SUCCESS
     }
     else {
+        Update-SecretsFromVault -Config $config   # D2: best-effort rotation refresh before reading secrets
         $secrets = Get-Secrets   # fail closed if missing
 
         if (-not $SkipSelfUpdate) {
@@ -1241,14 +1571,14 @@ try {
                 exit 0
             }
         }
-        else { Write-Log 'Self-update skipped (-SkipSelfUpdate).' -Level INFO }
+        else { Write-Log 'Self-update skipped (-SkipSelfUpdate).' -Level INFO; $SelfUpdateStatus = 'Skipped' }
 
         $outcome = Invoke-RenewalCore -Config $config -Secrets $secrets
 
         if ($outcome.RunOutcome -eq 'Success') { Write-EventLogEntry $EID.RenewSuccess Information 'Renewal run succeeded' }
         elseif ($outcome.Failures.Count -gt 0)  { Write-EventLogEntry $EID.RenewFailure Error "Renewal run had $($outcome.Failures.Count) failure(s)" }
 
-        Send-Telemetry -Config $config -Outcome $outcome   # liveness signal (stub in PR A)
+        Send-Telemetry -Config $config -Outcome $outcome   # best-effort liveness/inventory/billing event
 
         # Exit-code policy (spec section10): 0 even on partial/total renewal failure - Teams + telemetry are the signal.
         Write-Log "=== Renew-Cert finished (outcome=$($outcome.RunOutcome)) ===" -Level SUCCESS
@@ -1271,8 +1601,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBU8r/UIoeRb9O/
-# 00/FCyK51Yt+2SMG5D89XSmIqh+n9KCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCTozo807lq6EBr
+# wqkodOxAiVaXNu2oWrfPDrdmvrnYW6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1403,31 +1733,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEsuxUOfM4BwqyuHgyXNh23Ebs10y4oQMRbz
-# EcM32pFfMA0GCSqGSIb3DQEBAQUABIIBgD8VOIFZmg+iG9DVisnwjsiMl/QdCbmf
-# SMQ2rnU11XQiXOqJTqTGuRo3n6XLFn7LAAlgdH3QANK0KI5SPo5HcCG9lX/AHHaN
-# HRCFeHjbt1U/8gz9KV85h/9ETJ6Fk65+lsSL/piDAyyEmw2W3sEjXYUW2jbAUKhP
-# UDwwN9HzzM9txV8mKNBpt/quGnkHw9/II2YG8ZuRSs6kfKL5d+fPngldg2r0dLix
-# /Rb0e9SRXPHw5jwv2BlXXy1CfJuJ4eMN31L4UvM+nesGz3ci/iv0bHHeBIrFRqbL
-# YOYRjLRTJvucdSnJnn3FG9w3Eq5Jn/Fqys0/vGZ4+PRhV/w0PHldIX9Zs08PmWif
-# 6EPOgwHcLneAhrWTccBQeJL/8dqwqF6p3toNi/RiZlj28ExZn/UCYXNPbglT61Um
-# KGkYvF94rFG+lHyRvatYJUfRA0eUUQaNZGVJJ8jKy5pU55dg+DBchNXQrngRgy9I
-# Wsg7QdgpiVOCzR/HO3sM/Peq28qR23nWe6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIO7O6UWS+TSWbnoOZv8CTYUIDw5I/T1yXie3
+# jtz6lkj4MA0GCSqGSIb3DQEBAQUABIIBgL6+Krk/Ia2Mt69NFav65uCZbsWXArse
+# FLF7c4VrBcCxtHXuTjlXI9BRY1fRyWnEHxDyOhPdjJAT94YAJe8srVPp8UOGjU2+
+# 2LH9g0BVP2husEQm99/sKbb2XJCj8s+WXgjwV3ohxkS1XwzzFgXbB87PTyVm9/nT
+# jnUXaMInKc6TAEXjmxtx6gu9Q1hxOGZ1xo+gxEEPdRae0JcC5KA+dgig3WIbT1Yx
+# NJUbbSkhttcNtn954MUUavX0P6x3BfumEjTW7Cw8hizTaC+wgOptM1AbL0CthDSk
+# EY7zlMVgiHdAoJrppfK+MNoT3A72+O0vM6Z0K+nkZTq4fnLYSbTCfQiPHqmS+TcM
+# Su5b2PAs7nTlmTMcHnNxrUZttOTUWQfB6eC6cQaI2YBV0P94Uz/u6gTdvsfnBOFJ
+# l06DP/uo7cmHXi+Q6TVXaFFIyUMhXkgrtP4wY4wkuRN7GaNkEOOB18o32VZPy6M/
+# w76z9UQucFjbv8bsBZFYh/v+dHZTMm6QX6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MTYwNzI5NTVaMC8GCSqGSIb3DQEJBDEiBCBUOvWxRsH3Bwgb51FSgyZC
-# 2mNzgyBp4sV12Ki6U1drpDANBgkqhkiG9w0BAQEFAASCAgCuwY32WWsAVdzpXUEn
-# 3bkClMKunhRwQbu7lg9YMG8kRMFW5ZEY8PXh9hFzujvcMdnMgjph8YkzmSUT19M3
-# blAFnC/CVc8fGMlrC3+7GY3oiiAYIHT352EJJy6rdYPmoiTjRqZqnQEl6sK9KqaG
-# a72GKnV264sUnCB0/N6H/e5Ub56AgiWDw0quspQBXkzf/trA0zbecOubS8Nf6uwZ
-# pYl4IhNx4zaxK4ozPAjoPX8vybLatAQ0oCJ2yckydbK8pXhLZpq8QVmiYkoZbglD
-# IbPGhsi9OWkJpC294b1A4EC6zsJ+U5fqN1W6dX69xAEgmWsO/U7h7+Waw+FMNtEn
-# 7EPWdEwKuB/6K9c0vKFTPk6gP3bWZe/6w3cGdw2X+m9eefKjV4jOQ9YDxmGImnnv
-# c/mmI3szDi35FQgw6wql6uhGKls1YcyOmYs2HakRLCeDYObijPia2zUKKgz10B8Q
-# mOYH9VKWI1eXLv1hwFOVR9dVJ7gJ1jtKMcEOy1m2EpWz9si6yeReQuRq/jQy7gRh
-# rO+vM/DCKB4vIyIymu7FlSghijy0GJ9zLWwoiAC2mZz8/Boti9FbYcqu+YEAcMJf
-# 2NW1aCMwvVMULJGXcXRNo9AjYAN4OG1BnhagDBzAi5hTeRshOHRWAqf5G6ZVBSev
-# 48FXAdGJIX9OokSGYoEf7mFHnA==
+# Fw0yNjA2MTcxMjI3NDFaMC8GCSqGSIb3DQEJBDEiBCD3NzvGgxLBQKIfRGCDbm+o
+# bQlOBTNzmQ2pUxfKH/MuQjANBgkqhkiG9w0BAQEFAASCAgBT55niaEYEgw2R3bF8
+# wopJ0QdFWLHgYRXPrkyR58bqQFp8sJedjPpy2R6tV+bhC23dWT+P5wkeBsQvZXit
+# QettAkfQwLBiEvyT1z1RfEq7oPlRP/JHIAcW5MzW1tPCRq/tdEFk0HnXv+PR9vaT
+# ewwwfbdsUa8RphX1r9nzshJ0DhwdsvlNoqn2Hta8HG8H+dlD33SGvmuGh8EcvRly
+# rJ70BWYbb963cjKrWIjOikjXrY+XhfMoou34Z+lB/7M8dUdKwR3PNwQJPvgqTiAl
+# jNAHFytHmI4/JPkbZ2D0NwkUJXLChUPXz4enj8qoIAn05dFFm0zU2ksGt2lh8w5y
+# PzNdZY5iQHsqf7pt/Okx0AtFfjwY1CXWAGPaL8Wlkj7u6Q5XXBr1PyefWr3X4yYh
+# H/Ra9Nk2JiPXnErPEavs6b2T3B7977Rx6xKbUGuI/501rsyBDa2vsCOTaksl9T9I
+# N9BfBTm0gMKX0JC1rJQavnJe4mkdJuGHq2xmz4Wd6f+qXP7Qci09uwozSrhCd3aS
+# kSQP1NJoBFNgT2IG0ucj720oAFFMMGrIQdloS58sU4Gr6F5ERm577Vh8OEiFusxA
+# 4/+REPacwWOmcnxtrBml0Slj5CNVASGg58XgIm7tIz/42f6gCgrdsNze4/hiC3xC
+# Cv8FlLeasn/Ha0F/AxkGaCNw6g==
 # SIG # End signature block
