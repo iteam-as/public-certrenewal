@@ -32,6 +32,17 @@
   Skip the (slow) machine-wide module install (test isolation).
 .PARAMETER VaultName
   Override the Key Vault name (test). Else cert-config.SecretsVault, else the built-in default.
+.PARAMETER Abr
+  Billing: customer abbreviation. Supply the four billing params for an unattended run; on an interactive
+  run, omit them to be prompted. Required (all four) when the config has no complete Billing block.
+.PARAMETER CustomerName
+  Billing: full customer name.
+.PARAMETER CustomerNr
+  Billing: customer number.
+.PARAMETER InvoiceCode
+  Billing: invoice / cost-centre code.
+.PARAMETER Services
+  Billing: comma-separated service list (default 'CertRenewal').
 .NOTES
   Source of truth : iteam-as/private-certrenewal (this repo, src/). Published (signed) to
   iteam-as/public-certrenewal by .github/workflows/release.yml on a v*.*.* tag. Do NOT edit the
@@ -45,7 +56,12 @@ param(
     [string]       $ManifestUrl,
     [string]       $CodeSignCertUrl,
     [switch]       $SkipModules,
-    [string]       $VaultName
+    [string]       $VaultName,
+    [string]       $Abr,
+    [string]       $CustomerName,
+    [string]       $CustomerNr,
+    [string]       $InvoiceCode,
+    [string]       $Services
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.0.1'
+$ScriptVersion = '2.0.2'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -542,6 +558,64 @@ function Register-RenewalTask {
 
 #region Bootstrap-only helpers ------------------------------------------------
 
+function Read-Billing {
+    # Prompt for the per-install Billing block (plaintext customer identifiers, not secrets). Same fields
+    # and prompt strings as the creator's Read-BillingPrompts; bootstrap-native (returns a Billing object,
+    # no save) because the creator's version calls creator-only helpers. Set-BootstrapBilling gates when
+    # this is reached (interactive, no params, billing incomplete).
+    Write-Log 'Enter the Billing block (customer identifiers stamped on Teams cards / telemetry):' -Level INFO
+    $abr      = (Read-Host 'Abbreviation (Abr)').Trim()
+    $custName = (Read-Host 'Customer name').Trim()
+    $custNr   = (Read-Host 'Customer number').Trim()
+    $invoice  = (Read-Host 'Invoice code').Trim()
+    $svcRaw   = Read-Host 'Services (comma-separated) [CertRenewal]'
+    $services = if ([string]::IsNullOrWhiteSpace($svcRaw)) { @('CertRenewal') }
+                else { @($svcRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    return [pscustomobject][ordered]@{
+        Abr = $abr; CustomerName = $custName; CustomerNr = $custNr; InvoiceCode = $invoice; Services = $services
+    }
+}
+
+function Set-BootstrapBilling {
+    # Force a complete Billing block onto a fresh/migrated box so telemetry/Teams are never stamped blank
+    # (the gap: it otherwise stays null until someone runs the creator, which on an upgraded box may never
+    # happen). Precedence: explicit -Abr/... params > an existing complete block > interactive prompt.
+    # Unattended (non-interactive host) + incomplete + no params -> FATAL with a clear message (keeps the
+    # no-hang unattended contract). DryRun -> log + skip. Returns the (possibly updated) config object.
+    param([Parameter(Mandatory)][object] $Config)
+
+    $b = $Config.Billing
+    $complete    = $b -and $b.Abr -and $b.CustomerName -and $b.CustomerNr -and $b.InvoiceCode
+    $paramsGiven = $Abr -or $CustomerName -or $CustomerNr -or $InvoiceCode -or $Services
+
+    if ($paramsGiven) {
+        foreach ($pair in @{ '-Abr' = $Abr; '-CustomerName' = $CustomerName; '-CustomerNr' = $CustomerNr; '-InvoiceCode' = $InvoiceCode }.GetEnumerator()) {
+            if ([string]::IsNullOrWhiteSpace($pair.Value)) { throw "Billing parameters are incomplete: $($pair.Key) is required (supply all of -Abr/-CustomerName/-CustomerNr/-InvoiceCode)." }
+        }
+        $svc = if ($Services) { @($Services -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @('CertRenewal') }
+        $billing = [pscustomobject][ordered]@{ Abr = $Abr; CustomerName = $CustomerName; CustomerNr = $CustomerNr; InvoiceCode = $InvoiceCode; Services = $svc }
+        Write-Log "Billing block set from parameters (Customer: $CustomerName)." -Level INFO
+    }
+    elseif ($complete) {
+        Write-Log "Billing block already present (Customer: $($b.CustomerName), Nr: $($b.CustomerNr), Invoice: $($b.InvoiceCode)); keeping it." -Level INFO
+        return $Config
+    }
+    elseif ($DryRun) {
+        Write-Log '[DryRun] WOULD prompt for the Billing block (no complete block present).' -Level INFO
+        return $Config
+    }
+    elseif (-not [Environment]::UserInteractive) {
+        throw 'Billing block is missing and bootstrap is running non-interactively. Supply -Abr/-CustomerName/-CustomerNr/-InvoiceCode (and optional -Services), or run bootstrap in an interactive session.'
+    }
+    else {
+        $billing = Read-Billing
+    }
+
+    $Config | Add-Member -NotePropertyName 'Billing' -NotePropertyValue $billing -Force
+    $null = Save-CertConfig -Config $Config -Reason 'Billing block'
+    return $Config
+}
+
 function Test-IsElevated {
     # True if the current process runs with the Administrators role (required for LocalMachine cert
     # stores, machine-wide modules, the scheduled task, and the event source).
@@ -890,6 +964,9 @@ try {
     # Duties 5 + 6 - cert-config.json (Telemetry block; migrate v1 / top-up v2 / fresh skeleton).
     $config = Initialize-CertConfig
 
+    # Billing - force a complete block on a fresh/migrated box (params, else prompt; never blank telemetry).
+    $config = Set-BootstrapBilling -Config $config
+
     # Secrets - pull from the vault (best-effort, Decision Q1).
     Sync-BootstrapSecrets -Config $config
 
@@ -917,8 +994,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCm+76l1i/AGtow
-# oMguUR40kwvfdzyRA44qrvP12ocEuKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAovALhDXQ2SGxA
+# GpJFeQbLO1/PV7VNlF5nYVl5WDeqc6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1049,31 +1126,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIIwuvp6/Fzx9bdMPH4BomFRORwn5zZZi7A0g
-# Qf+dK05BMA0GCSqGSIb3DQEBAQUABIIBgAu2KLELT2rRSDlcyLS5Im4US2kVRLnk
-# LozHuTcam4UIGJ7pmUhVi74U1Qs1E9jee1Ka6VEkksj0DXmt3wKYtF71w2IoR4bf
-# AFvOHPznsF/JBr4XIXpnf8zYfaPSQpkhl8qyU6ia5RMirvJM1Xe6h5NlHzd8o3ns
-# 6/Z9NMxfx38/OWGPH0VHtiHS8TikEg7sHt651qPA5fLDP9USbhfZTwRDldK4qoBp
-# +GsAocP7GlJ4461il2cp7RbcK0sxQzXTJf4qbHjRBxdXn0Gnph8YnHXpPFrlGfcM
-# +YQi02NOJhfJeuc6wU0tqy2CuxV5x18CgFJCWmQT23mUpVTQhK+MwhX85Gvdw1Sn
-# nnkA8Mbhgrc2x92+1ZK1f+tg2eQSMg5Vz5CDMxoP+bBT5T0a5K0iV+ugKmWgQOab
-# 7aNCAQDm/QoLEiXNgk2XVtBZHzAX8yVIJbHegiatk5kptNUTPjO4GyiP0d6OsUbe
-# 39FBmrvPDBtaSmdcmOKF3DS7Sv+00jfjnKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIKMHH+VQE4abUBeSaHUH8Koy6dFaTawxc2sm
+# Tas0Vu1cMA0GCSqGSIb3DQEBAQUABIIBgDM8Rghpjf2/5uKOb9W6JCaKOSJDNKIj
+# 7Q2blU/zxg8I++jI/mK6gs7EODWdym1nEAarlFTCjiITMzulVSVG5dRjJcnRfXDS
+# ogYxnz8tz6dIhPtjoMaEqHSW1fEjGrpCIbPoj21O7t2bLd1YtJiTl8TaDiasjBq6
+# YY7QbdY2IvGaljjL2WEKZILCuBi9nLP2HJ29aw+jMO/11ycT3qixbmmEnkx7sow+
+# oK2dWM/GDmKLpJPbpiIQz9tLLs6HhQIA8wkUpgzdifb/dHZL/LxhzJHV0uUK0LV6
+# 8LpOdeXQ2VomE9gDrV2G8Va4m0qdxlwoOdSddJfUsY4xL6wSsXIb4pY4v6wnd7hr
+# R0/ceCWE1g3Fbw0JPLqGRj3JsUXPG4frKeCRjNhrJAPhNyJ1Y6MshYycqAETs74V
+# eqar87Uy431jeLl78VnC6nW9OIUEHjWnxeTDAKwNvKjDuZjvdh12/JZ1v3X+9AEM
+# lTXeyHQMGsybnZr9P8HfXMgERTWDhXplO6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MTcxMzI2MTNaMC8GCSqGSIb3DQEJBDEiBCANL5QjI52F39Al+Z9d+uhR
-# p9GJcaexdZ6ktvp9GE6isTANBgkqhkiG9w0BAQEFAASCAgAkfSCyP/d5D7REKRqx
-# ZpRgdiEHwyNwMv+HPab8ruKVjRKlj6AIyiIRmF47/CQHrRNEFvKY03VwFrGGWHrv
-# Ec2jPOJAHtRKbz0cP+C07gEOVrYglg+z8kPlN8WIwmDFeqmsafBGaszvSadQFqTK
-# 0+n9bvy25TxDZNDlQRykVXAs6g7LBeQlLBie5TtjSm/Df0Yc2G+QUHcQ/X0lzanZ
-# lzMYO4jGIJ2GyEDRcAccz958T/vNggW/dymji5yNp2RRUS3t4I2p91z8qm8Y5YAb
-# 4Qejm+GQBJE5YGx+vMl0UmBiN7+W17UnRp15s7+Mm4VrrLKS4MuWI5EARepkofl1
-# Uop4pJOSMImjDriG8XRkhaNZe8IvK2PnLIn3dJOm8aop/kF59QEF3oAwD8m39w/V
-# vn7tghdeCUIcSKzFMmfeCqWqNUqcqh18Dktfe1czfnm7yqXbrnJS33oJsrVXbbbd
-# hIr9vDEyiojYxWCs4ZYZhwX2ydQq3Q9giOSkB848MdmIMypKRsCVnYuQYpY5u6GJ
-# 8zEHwWpEpgs/vs46iiUScvfrZG9ELS4bhvosOYJlxDSTXeTDWeYGbggIH5fSAlHv
-# zWUKGX/odoGyNv08LTdwTYEKHyobEqBjH9ZVOs5sNCXTIN6riY9ICoaqXNqAirtS
-# Vg0OzcuGXluOeI60CWNYDmciuA==
+# Fw0yNjA2MTgxMDQ1NTJaMC8GCSqGSIb3DQEJBDEiBCBacHJZhbzHviuyua8nDLvd
+# wRSe+O1DHWkAxvSH8cMmszANBgkqhkiG9w0BAQEFAASCAgDJt/x46STF62ABtfFs
+# xW1arkst+YhxVrmpt0Powty2SfBGBg5k/92XJDFMGfLCGixulFy993XzkANlk6bi
+# K0/6UKBsYUNse+rl/T1L9xUB7/2U19TACfx1hGgk8RSCzOgZj8sxouLhgFwyfy3X
+# 4dbKLiTSOOTZJhozyNmzS3/yRYcJjHwSAdyudGSp5HX4qoN4RbvtD92Fh4bfQvTd
+# vqJ1SvkdzIDWjEz0K6GzhIexuzvbZE51QsFNQ3YKUoBA9/UguFz43Lnz5O9fy0Vi
+# 0h+6aZCK/9sGhpaxKIyser/OAZIYhTUUASAD6oOiqjikPPXngF7woKBooUl/IVaq
+# dnZW+bRxL+plNbEq2k3gaw2rjBjQ575Da34nwMv2nUjO9RwDAaOJfUR+mOsORp+V
+# wlek6SrqKUmXRlHvhHUJ5Uc1FkDuxChB2yeh/aTPKL0ioZ8pgvhy6agA9hf2zQTH
+# HhgBusNj9MyOkcZ3yBfGrR4+X7q9/LY4T4tYntAA5fDnZZGnkFre93h14xU4gqeD
+# SIgwyd2kXZq435feLkYJttSOQwohGrWpo3I5LoFRr+az8+MoqYzMealEFFdX73NO
+# uSXp/eswQyuIF4uLK0ntBe7W6NRmmfpuo+yN8TrynSOtwesVNWJ7AMNXDDdCNC+z
+# oj+EQsk5Cjz44x3AIxpPZokWSQ==
 # SIG # End signature block
