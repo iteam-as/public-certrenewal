@@ -24,6 +24,9 @@
   Skip the self-update check (isolate renewal logic in tests).
 .PARAMETER CheckOnly
   Print version + certificate inventory and exit (ad-hoc audit). Skips secrets, self-update, renewal.
+.PARAMETER Force
+  Renew every managed certificate now, ignoring the expiry threshold (forced rotation, or to exercise
+  the pre/post-renewal hooks on demand). Honors -DryRun. Old-cert cleanup is unchanged.
 .NOTES
   Source of truth : iteam-as/private-certrenewal (this repo, src/). Published (signed) to
   iteam-as/public-certrenewal by .github/workflows/release.yml on a v*.*.* tag. Do NOT edit the
@@ -34,7 +37,8 @@ param(
     [switch] $DryRun,
     [string] $ManifestUrl,
     [switch] $SkipSelfUpdate,
-    [switch] $CheckOnly
+    [switch] $CheckOnly,
+    [switch] $Force      # renew every managed cert now, ignoring the expiry threshold (forced rotation / hook testing)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.0'
+$ScriptVersion = '2.1.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1414,14 +1418,18 @@ function Invoke-RenewalCore {
             $daysToExpiry = ($expiryDate - (Get-Date)).Days
             Write-Log "Certificate expires $expiryDate ($daysToExpiry days)" -Level INFO
 
-            if ($daysToExpiry -gt $RenewalThresholdDays) {
+            if (-not $Force -and $daysToExpiry -gt $RenewalThresholdDays) {
                 Write-Log "Certificate for $domain is still valid ($daysToExpiry days remaining). No renewal needed." -Level INFO
                 continue
+            }
+            if ($Force -and $daysToExpiry -gt $RenewalThresholdDays) {
+                Write-Log "Force: renewing $domain now despite $daysToExpiry days remaining (threshold $RenewalThresholdDays)." -Level WARNING
             }
 
             if ($DryRun) {
                 $deployVia = if ($bindingsDetected) { "detected: $($detectionResults -join ', ')" } else { "config Type $($domainConfig.Type)" }
-                Write-Log "[DryRun] WOULD renew $domain (expires in $daysToExpiry days) and update bindings ($deployVia)." -Level INFO
+                $forcedNote = if ($Force) { ' [forced]' } else { '' }
+                Write-Log "[DryRun] WOULD renew $domain (expires in $daysToExpiry days)$forcedNote and update bindings ($deployVia)." -Level INFO
                 if ($domainConfig.PSObject.Properties['PreRenewalScript'] -and $domainConfig.PreRenewalScript) {
                     Write-Log "[DryRun] WOULD run pre-renewal hook '$($domainConfig.PreRenewalScript)' for $domain." -Level INFO
                 }
@@ -1431,7 +1439,9 @@ function Invoke-RenewalCore {
                 continue
             }
 
-            Write-Log "Certificate expires in $RenewalThresholdDays days or less. Initiating renewal..." -Level WARNING
+            if (-not ($Force -and $daysToExpiry -gt $RenewalThresholdDays)) {
+                Write-Log "Certificate expires in $RenewalThresholdDays days or less. Initiating renewal..." -Level WARNING
+            }
             # Pre-renewal hook (config.PreRenewalScript) - best-effort; a failure never blocks the renewal.
             if ($domainConfig.PSObject.Properties['PreRenewalScript'] -and $domainConfig.PreRenewalScript) {
                 Invoke-RenewalHook -ScriptPath $domainConfig.PreRenewalScript -Phase Pre -DomainConfig $domainConfig `
@@ -1661,7 +1671,7 @@ try { Start-Transcript -Path $transcriptPath -Append | Out-Null } catch { }
 
 $exitCode = 0
 try {
-    Write-Log "=== Renew-Cert v$ScriptVersion starting (DryRun=$DryRun, CheckOnly=$CheckOnly, SkipSelfUpdate=$SkipSelfUpdate) ===" -Level INFO
+    Write-Log "=== Renew-Cert v$ScriptVersion starting (DryRun=$DryRun, CheckOnly=$CheckOnly, SkipSelfUpdate=$SkipSelfUpdate, Force=$Force) ===" -Level INFO
     Write-EventLogEntry $EID.Start Information "Renew-Cert v$ScriptVersion starting"
 
     $config = Get-CertConfig
@@ -1716,8 +1726,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCZe5yu5DU42IvF
-# 0dYyADs+cvi92y+Vz3NmBidON0FImKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDHs7HPjz/zu/2T
+# OHHH0JZWvIyRp8SWpbe0DbL+8u86jKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1848,31 +1858,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBe0U2zcSfvl3N6GqzAZZNCYR5i3sB0TagC8
-# Z4B2qD2uMA0GCSqGSIb3DQEBAQUABIIBgJfD70MdbbYBPCL+g+R9DclpjbK44JNb
-# i8GLtjfXInKRxnoKKIHYXeT6iQAmj3wGU0GYunvcLfpK4/1fsIY07mGwzRiXhfYl
-# h83n5mw4jQquQlPh9x+qdYxEPOB+OmDM0atsCqyda7bZk1kCHLfze0DWFlJLGJ4Y
-# 8wPm5Qr94wx2V55FxpCWzOxmndNNYdLLp4r0rWSUjRSq5gKVgcCMNN56u9AP58e1
-# UJ1dLMwLrvFifqDKpyL5X4p5yMliTa3RQLtZixJZU7ddItEXiUdN85OZAN7M8ZrZ
-# gCrdloD1YSPqTB+iDVni0GhArDuWozBULigLbINAUtriY0Y+AQenwCO2tpAKZS5M
-# RuVQS4dP/yVlHVgMNjA+tUJZfTd4rrxoiV836F2DzoGQ9aFl6sTv2rsE1DyhYc1c
-# Ius6ZFAYQom3/qRdGxZfn9Sn4Tuucb0irV6HsX0hr4MOdsf8XSGugg0TUYsrkNel
-# kKn4cymKNSZ2UiHnIe9q8B/cXnTu1JaqWqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIOWUAEaYIy35MwJWTHvcg+zFKt8XYfbYvByP
+# 5o6rLud0MA0GCSqGSIb3DQEBAQUABIIBgA32ZO7AT5mOVH2A7xN0rppjN1zLbhTt
+# bB4R+q/U9vtoQEt9lQTb1yQytP13ODsgaZ9/Z1wSS3k6lJo2gK01R9YrBuV0xXBv
+# oIBrnj13sR2CR7I2ed5riYcxeIEADzD/oDxNNvDzlnFXa+uTyOkhZfrbqHjl1lee
+# KyqNr09skn9ImGwsoOFy7vbgm+fbKWZAsxVK7Wg2XRv3ZSehIbtyCLon5qSsGZ5Z
+# IgA1cGMbV1LIakrvPS9YeaTS+F5StRuqtUi2W+37md+1u+0nDq1wHplYchfkboD4
+# NYqpaPQr8N+qaWbISFuhGf9XFNhdkvW4csbxbgW/dwxq/40CMvyo9UpFESQ+RIon
+# /c31sdOB72pVDk7Q3+V/iDp9QqIaF74NfQQMrf3H5gHINM2dNKoTmAa+wcMeiidj
+# 9at4r1IUsCJFnwTMbU0dRxeMwmfqOgnWEAkpW4EsJ7U6mhLDuBNcDc7HR0kKj1lV
+# OpjhgkO50xxXdOH71qOxxpd7Zzzq59SwXKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjIxMzA0MjhaMC8GCSqGSIb3DQEJBDEiBCDC3PE+oR51n70A3CHsbcCB
-# sX3DhgY+yH3zQ7nk4qMjHjANBgkqhkiG9w0BAQEFAASCAgCkUUQpEM4155xkKBvw
-# oKujblr3Ah1bvUBaDOmzH6QWuq4My9+9Vpa1ui3CuAQ4i5u6FwKAtbu4unyS0dlA
-# LRgK9dYosPkt4SOjwO/FsUVDewoWBNauCNyhUO3ezMbSYt+eoFQWPu+6sitRm/vS
-# Y7WDch1qQPTPu2i83gIcbO46fIX+cI1tYEry4ezRIuqPu+zPcR5DwtQKW/K17UjZ
-# 8Oee9/olO0n6z6ZvL0nGIowsa+1hrROj12Ul/JvVn3mTg7fm3UwMLzQNK4MbBlfd
-# PCDlUCB+8HOXo+BreLugdDChU4dP1TEeo1lph+evUSp6aV0y0Iu+jcBIgxEBIxw0
-# ENFoEasZQDpwc9vgeGVjv4BCFIr4cGWk00bdyhIpzHe1CTRnYtLL3IE+DyB8RyHr
-# vUJy385KStIGxcA/kiHTQQ5AV/YLs0Y7CaQfZjXytRgRX0JBaNN3S2+4C2rAmFus
-# qipAy04E0AxQAaSGEzJLcJ8EV/Ndyj/oB5lXZIr2Xfh9ARIpcEniBAOuIuKvt+By
-# x1zqkQGcQ+VQBdUU1YJHXVijbsg1K1kmlWaYZnVjKgYtnziwhzqGmBcDuHhJukgT
-# qKiQq4F53lqbAK6FXuuPyY5GHsj6sC6AElWtc45vzp9TBf9HLw0+L8ppgldTJi5x
-# OMM3An7ptF1pum4IWZx9HdrtIQ==
+# Fw0yNjA2MjIxNDA2NDRaMC8GCSqGSIb3DQEJBDEiBCDQ0ZElXhmvTVu9mrUd1ENL
+# MKuiDFA+Yi+xr9kO+R4/7DANBgkqhkiG9w0BAQEFAASCAgBGwR7auBaN950Wo7xr
+# OYhCJ6BMw4R6sVK8ZTvHQemgGGU3ZDGQZVeAQackrYsKV31QstXQhvHS3xKIUt/X
+# IrN2TsY0mJsEQJqgSo6WZqDZbZh0o1YJJNkBkMcOUBCGcABGp42pmp2weQN6yxu/
+# Q0bAHrsbUVGCVx6xcWVFj4CaHSJFZab9haKnlZw+xelaw22rTvvnO0K+XnZ+UqYH
+# tAKKr2trbfJ7VEw6/JF/beM63+/GIUZx0zxFsBkvkBpw62NgAviXm6AA7HrIjmI1
+# 3Fc01h/jsaRdiXiKHsSnkXenZlCK0vGU2gso5ny2joGv5fQA0krz8NDGc4wH6qIR
+# l5W/P4GL6e05Z6GWO58X1XnlVdevbEPyxEA4TbcWFrMYczcIpNBWdgPYLD3VUhM0
+# J1RVgBrgAmGA+ICGPWlyo4qhaxEX1X8jxlb2GibFZPqOkViRj3cyrVRuxEj+2r0k
+# 5yNk4QOs5yZ0xc44zNOiAbAS2rKLPsTuMEQGVaClpB8NHdcBK0om7bbF8Gb2OH7u
+# evNvm7I6MQLvMoZYI/fwUJPvHmzkPPhyoXKWPTVIvJ0t6uUTZMPa5S2gr/jGb4aR
+# ph4QKsTcGBID5Lb2wWcXTPvVlPc2ESSy02LRGqmJ991ti77fPLW+G1XQAoL6RlSs
+# 4ty5voWeg/bz98AA6PwygjBL+w==
 # SIG # End signature block

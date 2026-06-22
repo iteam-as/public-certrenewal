@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.0'
+$ScriptVersion = '2.1.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1831,6 +1831,9 @@ function Invoke-UpdateFlow {
 
     # Re-deploy the existing store cert per the new Type (no re-issue). If the cert is gone from the
     # store, just save the config - the next renewal deploys with the new Type.
+    # Load the IIS:\ provider so Deploy-Certificate can rebind IIS Web/FTP sites (issue #54 - the Add and
+    # renewal paths import this, the Update flow previously did not -> "Cannot find drive 'IIS'").
+    if (Get-Module -ListAvailable -Name WebAdministration) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
     $cert = Get-StoreCertificateForDomain -Domain ([string]$selected.MainDomain)
     if ($cert) {
         $deployConfig = [pscustomobject]@{
@@ -2000,8 +2003,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAyV+9QPWJLc+Lf
-# mt0yq4NR443aWayFtlAQd9KWDTHzEaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAQM+RSc1vli1pw
+# q3KRcNia8sBSffSoZHyf7qS+Aiz6H6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2132,31 +2135,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIOXyjgHY6FPCCdQCfuMF7Y9Tbtgv/TsSrMYA
-# U4rjw8RJMA0GCSqGSIb3DQEBAQUABIIBgHVaepHv5J/Rz+GudVkq6ioQnei2bZOB
-# hY0JjF6MsCZbuQX/++7owFQsvJjCfVP3GMwfX7vV412kEcqBhpKX0ZJybyVo8bff
-# hKZI5J0DDD3KhK7VdbB8buOgSOhTZCftbYVeaeondt31iWUdtFbVkZWkhUhkDQ9v
-# v4R0vdyd+1ULyu51Fc19c2zEEb8VaMRDLxZLRKvoxUG3NILJ2jaIvXTdG5ENhTVb
-# ikqauRhtx9NmvAG8Ef0Z4AUbMJKhbXp/nvupTOtHXq0fnaS7vQKemlt3gNOKGPU2
-# /cHfWcH52at+LxUNqjeHoHPGpeY46umJJOFBYt7JcakTKBPlzyIJMZp4nMocUvUK
-# QSTGGXA8HILBeKAMM4RzYKzYy9AVzByF5rYdefmx0BSgZSRj0M8uOeGlOMiBYnq+
-# f0TZZkblFI7v6I5jwLFB3NkYCUbJGhvJJYUctVkI8Z23jDN+3wyDe6DzSi5CbbZt
-# 1l8zo4kZHNQnkJYFyPn5EqwpoZKkx+95RqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEICwaoaQxEnVyU9PTylcCm2/FMg4E3XRSJrTy
+# kiA4QqCjMA0GCSqGSIb3DQEBAQUABIIBgK3NVzlCBk+zrNNgAhW/x+dkqs5eJfgh
+# J0LLNNlTqNfRl+gaYM6w2U5hAnZes0Y3LhIvfNlMVTcTZu9TZhzail7nu9SascD7
+# SJ+BZfx4qfLCO4KOMoxVYgqXV+x1N+JuZb862iM1gCh/FfhrIom8+VaBg6Dx1989
+# FF+EFOAjt+MYB67BXgrz7HFXR0trGAq0LePvfUjYMzVeK8RHMUe12sBg1FzcK3sw
+# U1vgpjRbVGod24B/zlaPOG+zVo3HqZ6rDkL2OhXzm/EYLKoTqKfdnScyobFFcFrt
+# IDexvUuUQld9QLfpFVxVpOvIdTyIUEa6EPV2LAoGWcVxejX7xC4BITXYlpspHg5s
+# GAHFlj1KuMoMbYFAZenTmVxSD1GrCgumw8urpl/wucgFKTXiAIFRaAZIGPFwQ3sI
+# WO4dMQT+r5ggtqCp5m+xprhlIomBCqXsNBjocIWqtZLJTt16VmGK/4DG45u4A8dX
+# aYTgessuIHp8aPNgtBfLiEqEtEAzs8vxdKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjIxMzA0MjdaMC8GCSqGSIb3DQEJBDEiBCDYx6APhqQS1Z2MOo1s98q7
-# zPY1LioOtfT84U4PhEq0HTANBgkqhkiG9w0BAQEFAASCAgCQV4sqM6bQ+jKCk0Tv
-# OeR3m98n2IevqWqKP8jBaPD91lodxH4lV18F2uxMS2yYj4uM+XzX/iAfnX8R9pxk
-# HyLjx05w7QXYMHvLrFPqESGth8IXOuWwquPEbioux/auMNx11PELxtX2PptLINp3
-# WMkiRr4Aj+toJFdx+m4TYDfypmTRYXTArimuiivD3/334r6I/ErBgRyneX9IQfv2
-# qRLJlLhs9DWpT7V5kkNGfQgi2qMmR0bt119tqKHurMeTf1xqVi7MQIOy5mNMzbXx
-# 52E5iXlV+oVZbfbJ0kah+x7+uUUd3QJiJZTao8XSbFgGoADUBRtKGqos6XSmeEN0
-# 5YiQkOuAz10cKdvclmT8Hd8d5v57s2aYZyLG0DiO0XqvOzHpZbnaJzmBwBM2LMf9
-# 1YlC6riNV9YuNOCXQcp4Sjhy68co0m6MGcrtt3Co10zAWbPO/n3teYNhO3jrwWbp
-# FUyrONzmgqZ3f+DbEGWxa2OZZDgzw9poWSl+J4rZdLloVOojs1Fr5HrrdFKE+KQ1
-# toCAwc0cVUNkcA0xfET66geIAdYi0lEyA0nHQYZcvO8frlZUAn6BtonDUDvTew83
-# +d0zL72c8C0XReXmal31ZR0lNsmrCHBAaEuTLXakGDsHnuzkqt5l0gc3gHFhEcad
-# h+FSbNjFQdksdXLsFWyGXjRJvg==
+# Fw0yNjA2MjIxNDA2NDNaMC8GCSqGSIb3DQEJBDEiBCAeOS8q9LcoyTJfyLFmm4wd
+# PBZPOgHEpoSbT/4AvSOPwTANBgkqhkiG9w0BAQEFAASCAgALO8EjNRnv6GTtuVHl
+# uUPk5+f/4LO6ft566CLWH9nH8/3Q7yh/OvDx7keADuZ21OvnFlb/fbZzu0hS+5t/
+# 9u23hn+5sxxf9+uUGDNtBfMXr6hSG9VouHHyJaijYPf6Bl9bph/2AP8mgSalCfxv
+# TIRkfVHqzV7xzbwPOeCuC/MKzdx7FDXQ2jrZNYeA9Cuu4IQrHQJBXojPbwhHNS0n
+# E3I+bnyP7kIdUwu0sojrcjpQGAgq+vNXxGZ98pohHzNtk36Fv3f2kJ8EYePTjVhD
+# OC45hyeyVcsrqe76zJLSdCqYgPSj+hAIR/zS5WT990gN34WT+hTBa+2PDBytqxWQ
+# GQGY2Nkl7iZWZibaZXuNU24n4uh4C2cUybxFEgfhg5+Xm34f7Uw82D0wVHRjFYWa
+# 4g74hwEAcgMh1AHLrrkOmkNfTxredX+qfT11yJ0IX1ApovdpGcFq8Sfp4D6TKUbD
+# Bh6nES6CYMhd/cgF4g7DWAs5Pr3mdA1nN22xN3LcFSNrxVUPwZfMVkJgAM5WbToP
+# zd4G8QW+jybvnhoMl5lFDNBNMcZw8PFH5kUX/AMAbwE1LCX8KkFzgp9ftfYuVBWN
+# Egt6P8+TGXUpBxuxsQzAKXhsZcrYO6Qg1khGClr+hT1AaJhEjfIGHD1DUEjXF+TI
+# /ti1/XFg8BpUvfp+suhAfgoP/g==
 # SIG # End signature block
