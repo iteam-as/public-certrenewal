@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.0.2'
+$ScriptVersion = '2.1.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -82,7 +82,7 @@ $SecretNameMap = [ordered]@{
 # Windows Event Log (source shared with renewal; creator owns 1100-1150, renewal owns 1000-1050).
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
-$EID = @{ Start = 1100; SecretsWritten = 1110; CertIssued = 1120; CertDeleted = 1130; TaskRegistered = 1140; SelfUpdate = 1150 }
+$EID = @{ Start = 1100; SecretsWritten = 1110; CertIssued = 1120; CertDeleted = 1130; CertUpdated = 1135; TaskRegistered = 1140; SelfUpdate = 1150 }
 
 # Read by the shared Send-Telemetry (SelfUpdateStatus column). The creator reports its own self-update via
 # the 'self-update' event's RunOutcome; this default keeps the field defined for its other events.
@@ -402,6 +402,16 @@ function Get-NetshBindingForCertificate {
         Write-Log "Error scanning netsh bindings: $($_.Exception.Message)" -Level WARNING
         return $null
     }
+}
+
+function Test-IsIISWebAppId {
+    # True when a netsh sslcert appid is IIS's well-known http.sys appid. A no-SNI IIS Web binding
+    # (sslFlags=0) is stored by http.sys IP-based at 0.0.0.0:443 under THIS appid, so the same physical
+    # binding surfaces as BOTH Netsh and IIS Web; the appid is the discriminator that it is really
+    # IIS-owned (issue #49). Compared brace-, whitespace- and case-insensitively.
+    param([string] $AppId)
+    if ([string]::IsNullOrWhiteSpace($AppId)) { return $false }
+    return ((($AppId -replace '[{}\s]', '').ToLower()) -eq '4dc3e181-e14b-4a21-b022-59fc669b0914')
 }
 
 function Get-ExistingNetshBindingsForDomain {
@@ -1381,6 +1391,18 @@ function Read-NetshBinding {
     Write-Log "Checking for existing netsh bindings for $FQDN..." -Level INFO
     $existing = Get-ExistingNetshBindingsForDomain -Domain $FQDN
     if ($existing -and $existing.Bindings.Count -gt 0) {
+        # Guard (issue #49): a no-SNI IIS Web binding (sslFlags=0) is stored by http.sys at 0.0.0.0:443
+        # under IIS's own appid, so it ALSO shows up here as a netsh binding. Capturing it as Type=Netsh
+        # is what produced the misclassified fleet configs; if the existing binding is IIS-owned, steer
+        # the admin to [W] IIS Web instead of registering an IIS binding as a "manual netsh" one.
+        if (Test-IsIISWebAppId -AppId $existing.AppId) {
+            Write-Log "The existing binding for $FQDN is owned by IIS (appid $($existing.AppId)) - this is a no-SNI IIS Web binding, not a manual Netsh one. Registering it as Netsh risks a stale-thumbprint outage (issue #49)." -Level WARNING
+            if ((Read-Host 'Cancel Netsh and re-pick the deployment type as [W] IIS Web? (Y/N, Y recommended)').Trim().ToUpper() -ne 'N') {
+                Write-Log 'Cancelling Netsh capture. Choose [W] IIS Web at the deployment-type prompt.' -Level INFO
+                return @{ Guid = $null; NetshIpPorts = @() }
+            }
+            Write-Log 'Proceeding to register the IIS-owned binding as Netsh anyway (not recommended).' -Level WARNING
+        }
         $bindingChoice = $null
         do {
             $bindingChoice = (Read-Host 'Existing bindings detected - [U]se existing (recommended) / [M]anually configure').Trim().ToUpper()
@@ -1432,15 +1454,105 @@ function Read-NetshBinding {
     return @{ Guid = $guid; NetshIpPorts = $ipPortArray }
 }
 
+function Read-DeploymentType {
+    # Interactive deployment-Type selection (shared by the Add and Update flows). Loops until a valid
+    # Type is chosen: [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS. For Netsh it
+    # captures IP:port(s) via Read-NetshBinding (recording them in $KnownBindings for conflict
+    # detection); for FTP it prompts for the site name. -CurrentType, when supplied (Update flow), is
+    # shown so the admin sees what they are changing. Returns @{ Type; Guid; NetshIpPorts }.
+    param(
+        [Parameter(Mandatory)][string] $FQDN,
+        [hashtable] $KnownBindings = @{},
+        [string] $CurrentType
+    )
+    $type = $null; $guid = $null; $netshIpPorts = $null
+    $prompt = if ($CurrentType) { "Deployment type (current: $CurrentType) - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS" }
+              else { 'Deployment type - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS' }
+    $validType = $false
+    do {
+        $envChoice = (Read-Host $prompt).Trim().ToUpper()
+        switch ($envChoice) {
+            'W' { $type = 'IIS Web'; $validType = $true }
+            'C' { $type = 'CertStore'; $validType = $true }
+            'F' {
+                $ftpSite = (Read-Host 'FTP site name (default: Default FTP Site)').Trim()
+                if ([string]::IsNullOrWhiteSpace($ftpSite)) { $ftpSite = 'Default FTP Site' }
+                $type = 'IIS FTP'; $guid = $ftpSite; $validType = $true
+            }
+            'N' {
+                $netsh = Read-NetshBinding -FQDN $FQDN -KnownBindings $KnownBindings
+                if (@($netsh.NetshIpPorts).Count -eq 0) { Write-Log 'At least one IP:port is required for Netsh. Choose a type again.' -Level WARNING; $validType = $false }
+                else {
+                    $type = 'Netsh'; $guid = $netsh.Guid; $netshIpPorts = @($netsh.NetshIpPorts)
+                    foreach ($p in $netshIpPorts) { $KnownBindings[[string]$p] = $FQDN }
+                    $validType = $true
+                }
+            }
+            default { Write-Log 'Invalid choice. Enter W, F, C, or N.' -Level WARNING; $validType = $false }
+        }
+    } while (-not $validType)
+    return @{ Type = $type; Guid = $guid; NetshIpPorts = $netshIpPorts }
+}
+
+function Read-RestartService {
+    # Interactive optional post-renewal service-restart capture (shared by the Add and Update flows).
+    # Returns the validated service name, or $null if none. -Current, when supplied (Update flow), is
+    # shown so the admin sees the existing value.
+    param([string] $Current)
+    $suffix = if ($Current) { " (current: $Current)" } else { '' }
+    $restartService = $null
+    if ((Read-Host "Restart a Windows service after successful renewal?$suffix (Y/N)").Trim().ToUpper() -eq 'Y') {
+        $svcName = (Read-Host 'Windows service name to restart').Trim()
+        if (-not [string]::IsNullOrWhiteSpace($svcName)) {
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc) { Write-Log "Service found: $($svc.DisplayName) (Status: $($svc.Status))." -Level SUCCESS; $restartService = $svcName }
+            elseif ((Read-Host "Service '$svcName' not found on this machine. Configure it anyway? (Y/N)").Trim().ToUpper() -eq 'Y') { $restartService = $svcName }
+        }
+    }
+    return $restartService
+}
+
+function Read-RenewalHook {
+    # Issue #13: interactive optional pre/post-renewal hook-script capture (shared by the Add and Update
+    # flows), mirroring Read-RestartService. Returns a .ps1 path, or $null if none. The path is validated
+    # (exists + .ps1) but - like RestartService - the admin may configure it anyway (it may live on a share
+    # or be created later). The renewal runs it as SYSTEM. -Current, when supplied (Update flow), shows the
+    # existing value.
+    param(
+        [Parameter(Mandatory)][ValidateSet('Pre', 'Post')][string] $Phase,
+        [string] $Current
+    )
+    $when   = if ($Phase -eq 'Pre') { 'BEFORE' } else { 'AFTER' }
+    $suffix = if ($Current) { " (current: $Current)" } else { '' }
+    $hook = $null
+    if ((Read-Host "Run a custom script $when each renewal of this cert?$suffix (Y/N)").Trim().ToUpper() -eq 'Y') {
+        $path = (Read-Host 'Full path to the .ps1 to run (runs as SYSTEM)').Trim()
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            if ([System.IO.Path]::GetExtension($path) -ne '.ps1') {
+                Write-Log "'$path' is not a .ps1 file - the renewal would skip it. Not configuring." -Level WARNING
+            }
+            elseif (Test-Path -LiteralPath $path -PathType Leaf) {
+                Write-Log "Script found: $path" -Level SUCCESS; $hook = $path
+            }
+            elseif ((Read-Host "'$path' not found on this machine. Configure it anyway? (Y/N)").Trim().ToUpper() -eq 'Y') {
+                $hook = $path
+            }
+        }
+    }
+    return $hook
+}
+
 function Read-DomainsToAdd {
     # Interactive collection of the new certificates to issue (ported from v1 ~856-1153). For each
     # primary FQDN: validate format, optionally collect SANs, pick a deployment Type (IIS Web / IIS FTP
-    # / CertStore / Netsh), and an optional post-renewal service restart. Returns an array of domain
-    # config objects ([pscustomobject] MainDomain/Type/Guid/SANs/NetshIpPorts/RestartService).
+    # / CertStore / Netsh), an optional post-renewal service restart, and optional pre/post-renewal hook
+    # scripts (issue #13). Returns an array of domain config objects ([pscustomobject] MainDomain/Type/
+    # Guid/SANs/NetshIpPorts/RestartService/PreRenewalScript/PostRenewalScript).
     param([object[]] $ExistingDomains = @())
 
     $existingNames = @{}
     $knownNetsh = @{}    # ipPort -> domain, for conflict detection
+    $hookTipShown = $false
     foreach ($d in $ExistingDomains) {
         if ($d.MainDomain) { $existingNames[[string]$d.MainDomain] = $d }
         if ($d.Type -eq 'Netsh' -and $d.NetshIpPorts) { foreach ($p in @($d.NetshIpPorts)) { $knownNetsh[[string]$p] = [string]$d.MainDomain } }
@@ -1472,50 +1584,30 @@ function Read-DomainsToAdd {
             }
         }
 
-        # Deployment Type
-        $type = $null; $guid = $null; $netshIpPorts = $null
-        $validType = $false
-        do {
-            $envChoice = (Read-Host 'Deployment type - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS').Trim().ToUpper()
-            switch ($envChoice) {
-                'W' { $type = 'IIS Web'; $validType = $true }
-                'C' { $type = 'CertStore'; $validType = $true }
-                'F' {
-                    $ftpSite = (Read-Host 'FTP site name (default: Default FTP Site)').Trim()
-                    if ([string]::IsNullOrWhiteSpace($ftpSite)) { $ftpSite = 'Default FTP Site' }
-                    $type = 'IIS FTP'; $guid = $ftpSite; $validType = $true
-                }
-                'N' {
-                    $netsh = Read-NetshBinding -FQDN $fqdn -KnownBindings $knownNetsh
-                    if (@($netsh.NetshIpPorts).Count -eq 0) { Write-Log 'At least one IP:port is required for Netsh. Choose a type again.' -Level WARNING; $validType = $false }
-                    else {
-                        $type = 'Netsh'; $guid = $netsh.Guid; $netshIpPorts = @($netsh.NetshIpPorts)
-                        foreach ($p in $netshIpPorts) { $knownNetsh[[string]$p] = $fqdn }
-                        $validType = $true
-                    }
-                }
-                default { Write-Log 'Invalid choice. Enter W, F, C, or N.' -Level WARNING; $validType = $false }
-            }
-        } while (-not $validType)
+        # Deployment Type (shared with the Update flow)
+        $deploy = Read-DeploymentType -FQDN $fqdn -KnownBindings $knownNetsh
+        $type = $deploy.Type; $guid = $deploy.Guid; $netshIpPorts = $deploy.NetshIpPorts
 
-        # Optional post-renewal service restart
-        $restartService = $null
-        if ((Read-Host 'Restart a Windows service after successful renewal? (Y/N)').Trim().ToUpper() -eq 'Y') {
-            $svcName = (Read-Host 'Windows service name to restart').Trim()
-            if (-not [string]::IsNullOrWhiteSpace($svcName)) {
-                $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-                if ($svc) { Write-Log "Service found: $($svc.DisplayName) (Status: $($svc.Status))." -Level SUCCESS; $restartService = $svcName }
-                elseif ((Read-Host "Service '$svcName' not found on this machine. Configure it anyway? (Y/N)").Trim().ToUpper() -eq 'Y') { $restartService = $svcName }
-            }
+        # Optional post-renewal service restart (shared with the Update flow)
+        $restartService = Read-RestartService
+
+        # Optional pre/post-renewal hook scripts (issue #13; shared with the Update flow)
+        if (-not $hookTipShown) {
+            Write-Log 'Tip: pre/post-renewal scripts run as SYSTEM and can be added or changed later via the [U]pdate menu or by editing cert-config.json.' -Level INFO
+            $hookTipShown = $true
         }
+        $preRenewalScript  = Read-RenewalHook -Phase Pre
+        $postRenewalScript = Read-RenewalHook -Phase Post
 
         $collected += [pscustomobject]@{
-            MainDomain     = $fqdn
-            Type           = $type
-            Guid           = $guid
-            SANs           = $sans
-            NetshIpPorts   = $netshIpPorts
-            RestartService = $restartService
+            MainDomain        = $fqdn
+            Type              = $type
+            Guid              = $guid
+            SANs              = $sans
+            NetshIpPorts      = $netshIpPorts
+            RestartService    = $restartService
+            PreRenewalScript  = $preRenewalScript
+            PostRenewalScript = $postRenewalScript
         }
         $sanStr = if ($sans.Count -gt 0) { " + SANs: $($sans -join ', ')" } else { '' }
         Write-Log "Queued: $fqdn [$type]$sanStr" -Level INFO
@@ -1525,7 +1617,8 @@ function Read-DomainsToAdd {
 
 function ConvertTo-DomainConfigObject {
     # Build the cert-config.json Domains[] entry for an issued domain (matches the schema Renew-Cert.ps1
-    # consumes: MainDomain/Type/Guid/SANs/Thumbprint/NotAfter + optional NetshIpPorts/RestartService).
+    # consumes: MainDomain/Type/Guid/SANs/Thumbprint/NotAfter + optional NetshIpPorts/RestartService/
+    # PreRenewalScript/PostRenewalScript).
     param([Parameter(Mandatory)][object] $DomainConfig, [object] $Cert)
     $cleanSans = @(); if ($DomainConfig.SANs) { $cleanSans = @($DomainConfig.SANs | Where-Object { $_ }) }
     $obj = [pscustomobject]@{
@@ -1540,6 +1633,8 @@ function ConvertTo-DomainConfigObject {
         $obj | Add-Member -NotePropertyName 'NetshIpPorts' -NotePropertyValue (@($DomainConfig.NetshIpPorts | Where-Object { $_ }))
     }
     if ($DomainConfig.RestartService) { $obj | Add-Member -NotePropertyName 'RestartService' -NotePropertyValue $DomainConfig.RestartService }
+    if ($DomainConfig.PreRenewalScript)  { $obj | Add-Member -NotePropertyName 'PreRenewalScript'  -NotePropertyValue $DomainConfig.PreRenewalScript }
+    if ($DomainConfig.PostRenewalScript) { $obj | Add-Member -NotePropertyName 'PostRenewalScript' -NotePropertyValue $DomainConfig.PostRenewalScript }
     return $obj
 }
 
@@ -1684,6 +1779,100 @@ function Invoke-DeleteFlow {
     Write-Log "Delete flow complete: removed $($toDelete.Count) domain(s), $($remaining.Count) remaining." -Level SUCCESS
 }
 
+function Invoke-UpdateFlow {
+    # Issue #24: change how an already-issued cert is DEPLOYED without re-issuing it. The admin picks one
+    # managed domain and reconfigures its deployment Type/bindings (CertStore / IIS Web / IIS FTP / Netsh)
+    # and optional post-renewal service restart; the existing LocalMachine\My certificate is then re-bound
+    # per the new Type (no New-PACertificate - the domain set is unchanged). The OLD binding is left in
+    # place (binding cleanup is the admin's call, same as the Delete flow). SANs / the domain set are not
+    # editable here - that would change the cert and is a Delete + Add. Emits an 'update' telemetry event.
+    param([object] $Config)
+
+    $domains = @(); if ($Config -and $Config.Domains) { $domains = @($Config.Domains) }
+    if ($domains.Count -eq 0) { Write-Log 'No managed domains to update.' -Level INFO; return }
+
+    for ($i = 0; $i -lt $domains.Count; $i++) {
+        $d = $domains[$i]
+        $sans = if ($d.SANs) { " + SANs: $($d.SANs -join ', ')" } else { '' }
+        Write-Log "  [$($i + 1)] $($d.MainDomain) [$($d.Type)]$sans" -Level INFO
+    }
+
+    $selected = $null
+    while ($true) {
+        $pick = (Read-Host 'Enter a number to update (or press Enter to cancel)').Trim()
+        if ($pick -eq '') { Write-Log 'Update cancelled.' -Level INFO; return }
+        $idx = 0
+        if (-not [int]::TryParse($pick, [ref]$idx)) { Write-Log 'Enter a numeric value.' -Level WARNING; continue }
+        $idx--
+        if ($idx -lt 0 -or $idx -ge $domains.Count) { Write-Log "Enter a number between 1 and $($domains.Count)." -Level WARNING; continue }
+        $selected = $domains[$idx]; break
+    }
+
+    $curGuid    = if ($selected.Guid) { " guid=$($selected.Guid)" } else { '' }
+    $curNetsh   = if ($selected.NetshIpPorts) { " ports=$(@($selected.NetshIpPorts) -join ', ')" } else { '' }
+    $curRestart = if ($selected.RestartService) { " restart=$($selected.RestartService)" } else { '' }
+    $curPre     = if ($selected.PreRenewalScript)  { " pre=$($selected.PreRenewalScript)" } else { '' }
+    $curPost    = if ($selected.PostRenewalScript) { " post=$($selected.PostRenewalScript)" } else { '' }
+    Write-Log "Updating $($selected.MainDomain): current Type=$($selected.Type)$curGuid$curNetsh$curRestart$curPre$curPost" -Level INFO
+
+    # Conflict detection in Read-DeploymentType only considers OTHER domains' netsh ports (re-selecting
+    # this domain's own ports is not a conflict with itself).
+    $knownNetsh = @{}
+    foreach ($d in $domains) {
+        if ([string]$d.MainDomain -ne [string]$selected.MainDomain -and $d.Type -eq 'Netsh' -and $d.NetshIpPorts) {
+            foreach ($p in @($d.NetshIpPorts)) { $knownNetsh[[string]$p] = [string]$d.MainDomain }
+        }
+    }
+
+    $deploy = Read-DeploymentType -FQDN ([string]$selected.MainDomain) -KnownBindings $knownNetsh -CurrentType ([string]$selected.Type)
+    $restartService = Read-RestartService -Current ([string]$selected.RestartService)
+    $preRenewalScript  = Read-RenewalHook -Phase Pre  -Current ([string]$selected.PreRenewalScript)
+    $postRenewalScript = Read-RenewalHook -Phase Post -Current ([string]$selected.PostRenewalScript)
+
+    # Re-deploy the existing store cert per the new Type (no re-issue). If the cert is gone from the
+    # store, just save the config - the next renewal deploys with the new Type.
+    $cert = Get-StoreCertificateForDomain -Domain ([string]$selected.MainDomain)
+    if ($cert) {
+        $deployConfig = [pscustomobject]@{
+            MainDomain   = $selected.MainDomain
+            Type         = $deploy.Type
+            Guid         = $deploy.Guid
+            SANs         = @($selected.SANs | Where-Object { $_ })
+            NetshIpPorts = $deploy.NetshIpPorts
+        }
+        Write-Log "Re-deploying existing certificate (thumbprint $($cert.Thumbprint)) as Type=$($deploy.Type)..." -Level INFO
+        $null = Deploy-Certificate -DomainConfig $deployConfig -NewCert $cert
+    }
+    else {
+        Write-Log "No current certificate in LocalMachine\My for $($selected.MainDomain) - config will be saved and applied on the next renewal." -Level WARNING
+    }
+
+    if ($DryRun) {
+        Write-Log "[DryRun] WOULD save cert-config.json (update $($selected.MainDomain): Type $($selected.Type) -> $($deploy.Type))." -Level INFO
+        return
+    }
+
+    # Apply the changes to the config entry in place: preserve MainDomain/SANs/Thumbprint/NotAfter (and
+    # any fields this version doesn't know about), update the rest.
+    $selected | Add-Member -NotePropertyName 'Type' -NotePropertyValue $deploy.Type -Force
+    $selected | Add-Member -NotePropertyName 'Guid' -NotePropertyValue $deploy.Guid -Force
+    if ($deploy.Type -eq 'Netsh' -and @($deploy.NetshIpPorts).Count -gt 0) {
+        $selected | Add-Member -NotePropertyName 'NetshIpPorts' -NotePropertyValue (@($deploy.NetshIpPorts | Where-Object { $_ })) -Force
+    }
+    elseif ($selected.PSObject.Properties['NetshIpPorts']) { $selected.PSObject.Properties.Remove('NetshIpPorts') }
+    if ($restartService) { $selected | Add-Member -NotePropertyName 'RestartService' -NotePropertyValue $restartService -Force }
+    elseif ($selected.PSObject.Properties['RestartService']) { $selected.PSObject.Properties.Remove('RestartService') }
+    if ($preRenewalScript) { $selected | Add-Member -NotePropertyName 'PreRenewalScript' -NotePropertyValue $preRenewalScript -Force }
+    elseif ($selected.PSObject.Properties['PreRenewalScript']) { $selected.PSObject.Properties.Remove('PreRenewalScript') }
+    if ($postRenewalScript) { $selected | Add-Member -NotePropertyName 'PostRenewalScript' -NotePropertyValue $postRenewalScript -Force }
+    elseif ($selected.PSObject.Properties['PostRenewalScript']) { $selected.PSObject.Properties.Remove('PostRenewalScript') }
+
+    $null = Save-CertConfig -Config $Config -Reason "update $($selected.MainDomain)"
+    Write-EventLogEntry $EID.CertUpdated Information "Certificate config updated for $($selected.MainDomain) [$($deploy.Type)]"
+    Send-Telemetry -Config $Config -Outcome ([pscustomobject]@{ Action = 'update'; RunOutcome = 'Updated'; Message = [string]$selected.MainDomain })
+    Write-Log "Update flow complete: $($selected.MainDomain) is now Type=$($deploy.Type)." -Level SUCCESS
+}
+
 function Invoke-CreatorMenu {
     # spec section6 top-level control flow. Returns { SelfReplaced; Failed } so Main can halt for a
     # re-run (SelfReplaced) or exit non-zero on a task-registration failure (Failed).
@@ -1706,18 +1895,13 @@ function Invoke-CreatorMenu {
     }
 
     while ($true) {
-        $choice = (Read-Host 'Choose an option ([A]dd / [D]elete / [U]pdate-scripts-only / [Q]uit)').Trim().ToUpper()
+        $choice = (Read-Host 'Choose an option ([A]dd / [U]pdate / [D]elete / [Q]uit)').Trim().ToUpper()
         switch ($choice) {
             'A' { Invoke-AddFlow -Config $Config; return $result }
+            'U' { Invoke-UpdateFlow -Config $Config; return $result }
             'D' { Invoke-DeleteFlow -Config $Config; return $result }
-            'U' {
-                Write-Log 'Update-scripts-only: re-running self-update and re-registering the scheduled task.' -Level INFO
-                if (Invoke-CreatorSelfUpdate -Config $Config) { $result.SelfReplaced = $true; return $result }
-                if (-not (Register-RenewalTask)) { $result.Failed = $true }
-                return $result
-            }
             'Q' { Write-Log 'Quit.' -Level INFO; return $result }
-            default { Write-Log 'Invalid choice. Enter A, D, U, or Q.' -Level WARNING }
+            default { Write-Log 'Invalid choice. Enter A, U, D, or Q.' -Level WARNING }
         }
     }
 }
@@ -1816,8 +2000,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAgT9+v8MZzNuaE
-# D360RHec90gVtu5cq/AYmdSQQ/gjwaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAyV+9QPWJLc+Lf
+# mt0yq4NR443aWayFtlAQd9KWDTHzEaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1948,31 +2132,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGlMPh3f2Fo/BPd+BAAT+q7rh3aniaAmhErS
-# +dS4Pa4wMA0GCSqGSIb3DQEBAQUABIIBgEgXXUwB6cIFwfGkPpTKHeUI+n1c0PaK
-# OES8/MhYWLvnbkMthXYQXOSAC6xwNMresMKk+He/DLbHS86TkI5BTulnepFI48hA
-# SG9eThUkMXwo2hctoy+aBQM2g/VVPzGPkbIfOewWOel/H7DO9D6Bu88n77xP/V3t
-# QxjNGlP6sBB2xPngEYyFnhTeN+NLf/H86kGKHLsjiep9pC2X9zexcOM/mbDp33zg
-# gahr57Rxm1YNlBbJxAInmyPUq77iJzwlgY95GojcM3xFgHktBXw5+oGPh+WAjMrQ
-# 4MqNIvDgfZP7GSfj/xiyOruqwK005T8oyNLRcm3bbyr+OBOlJJVu7MyHrRt1s59x
-# TT0asGoke5sAdtJGxY+j0HajQV57ccbAmW2kq3pNb2DfQwQNCqXhsQllqA61BUcx
-# /S8PsOEXEFgl88dNbz0X+Z7Rs4SeY41e26h1BqvQZeIxoI8r1vKbX9cmi6Vyk+oU
-# Bjmt0tLuGjFzlsTZpY1aDQOPCDN7A47UpaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIOXyjgHY6FPCCdQCfuMF7Y9Tbtgv/TsSrMYA
+# U4rjw8RJMA0GCSqGSIb3DQEBAQUABIIBgHVaepHv5J/Rz+GudVkq6ioQnei2bZOB
+# hY0JjF6MsCZbuQX/++7owFQsvJjCfVP3GMwfX7vV412kEcqBhpKX0ZJybyVo8bff
+# hKZI5J0DDD3KhK7VdbB8buOgSOhTZCftbYVeaeondt31iWUdtFbVkZWkhUhkDQ9v
+# v4R0vdyd+1ULyu51Fc19c2zEEb8VaMRDLxZLRKvoxUG3NILJ2jaIvXTdG5ENhTVb
+# ikqauRhtx9NmvAG8Ef0Z4AUbMJKhbXp/nvupTOtHXq0fnaS7vQKemlt3gNOKGPU2
+# /cHfWcH52at+LxUNqjeHoHPGpeY46umJJOFBYt7JcakTKBPlzyIJMZp4nMocUvUK
+# QSTGGXA8HILBeKAMM4RzYKzYy9AVzByF5rYdefmx0BSgZSRj0M8uOeGlOMiBYnq+
+# f0TZZkblFI7v6I5jwLFB3NkYCUbJGhvJJYUctVkI8Z23jDN+3wyDe6DzSi5CbbZt
+# 1l8zo4kZHNQnkJYFyPn5EqwpoZKkx+95RqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MTgxMDQ1NTNaMC8GCSqGSIb3DQEJBDEiBCBV3pdm8C22ZUkiw7GsMYbQ
-# n/gkeHzXO6x2VIsX+PP89zANBgkqhkiG9w0BAQEFAASCAgDGPNBRxQtRLPLK1NUs
-# qyxFosvgDSonLfgNG0I2TMnJvxxKPqjfFb2SqaPB9LSm/SWbeAl6+tFJC/5y2Rxt
-# hO2jcj5yZcYySZjmKULoF01dYgSvS4RLUsEYOmFc3RZvLaJo7tfyvsu3tNVVV4FH
-# x8ZOxNbJN/RwpvYK++hxnZBIU5Bdc9PWHPVLXM3MKb05F3gCif+h6vcw7tl9WX4m
-# yakX1mxhJioNpQH4kEx73QL1Cyure6zLiGyM0N8/T3AhcaWQTSzG9yd3mhfmHfYe
-# u7SitY746O8lCc8UMSUMKXf1kQxFGfei0FgOKOwhZGuGwTjPDNzGHAemyfZjUfeI
-# A2+zh53zH0L7j1PAqsTUKzlhaNf+H825YtAvXeviZPkTMBs1e3SiimrUoj8E8FRo
-# 2rsxj5gFOG+HYzZ+Jmz03MrOqVk/URdi/GQq/27YbZy90DNh/7hjRwvY+vS6JLXH
-# F+T7vx44a7u6G2aV6pbr13qyVdkdA6FA3wHknO1CXWkiUv/tRA0hGMvVUW6K8XJv
-# 9bUtwBz3vXPjeWK8xDA1py/t/dZvZITr96bPoyQ26wWBLLcjnKVoIjbXnQUrAzu7
-# Rtv3tWIqyCFwNWBzaG2a0ECNQvf1WeAn2h/mmAiviXFDu2er/1C4l4fw3M09uA99
-# 0Ngs2RshKpW1KenEGEDnxDFFCQ==
+# Fw0yNjA2MjIxMzA0MjdaMC8GCSqGSIb3DQEJBDEiBCDYx6APhqQS1Z2MOo1s98q7
+# zPY1LioOtfT84U4PhEq0HTANBgkqhkiG9w0BAQEFAASCAgCQV4sqM6bQ+jKCk0Tv
+# OeR3m98n2IevqWqKP8jBaPD91lodxH4lV18F2uxMS2yYj4uM+XzX/iAfnX8R9pxk
+# HyLjx05w7QXYMHvLrFPqESGth8IXOuWwquPEbioux/auMNx11PELxtX2PptLINp3
+# WMkiRr4Aj+toJFdx+m4TYDfypmTRYXTArimuiivD3/334r6I/ErBgRyneX9IQfv2
+# qRLJlLhs9DWpT7V5kkNGfQgi2qMmR0bt119tqKHurMeTf1xqVi7MQIOy5mNMzbXx
+# 52E5iXlV+oVZbfbJ0kah+x7+uUUd3QJiJZTao8XSbFgGoADUBRtKGqos6XSmeEN0
+# 5YiQkOuAz10cKdvclmT8Hd8d5v57s2aYZyLG0DiO0XqvOzHpZbnaJzmBwBM2LMf9
+# 1YlC6riNV9YuNOCXQcp4Sjhy68co0m6MGcrtt3Co10zAWbPO/n3teYNhO3jrwWbp
+# FUyrONzmgqZ3f+DbEGWxa2OZZDgzw9poWSl+J4rZdLloVOojs1Fr5HrrdFKE+KQ1
+# toCAwc0cVUNkcA0xfET66geIAdYi0lEyA0nHQYZcvO8frlZUAn6BtonDUDvTew83
+# +d0zL72c8C0XReXmal31ZR0lNsmrCHBAaEuTLXakGDsHnuzkqt5l0gc3gHFhEcad
+# h+FSbNjFQdksdXLsFWyGXjRJvg==
 # SIG # End signature block

@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.0.2'
+$ScriptVersion = '2.1.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -79,7 +79,7 @@ $SelfPath        = $PSCommandPath        # this script's own path, for the atomi
 # Windows Event Log
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
-$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; SigRefused = 1040; SecretsRefreshed = 1045; Breaker = 1050 }
+$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; SigRefused = 1040; SecretsRefreshed = 1045; Breaker = 1050 }
 
 # Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
 # Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
@@ -708,6 +708,16 @@ function Get-NetshBindingForCertificate {
     }
 }
 
+function Test-IsIISWebAppId {
+    # True when a netsh sslcert appid is IIS's well-known http.sys appid. A no-SNI IIS Web binding
+    # (sslFlags=0) is stored by http.sys IP-based at 0.0.0.0:443 under THIS appid, so the same physical
+    # binding surfaces as BOTH Netsh and IIS Web; the appid is the discriminator that it is really
+    # IIS-owned (issue #49). Compared brace-, whitespace- and case-insensitively.
+    param([string] $AppId)
+    if ([string]::IsNullOrWhiteSpace($AppId)) { return $false }
+    return ((($AppId -replace '[{}\s]', '').ToLower()) -eq '4dc3e181-e14b-4a21-b022-59fc669b0914')
+}
+
 function Get-IISWebBindingsForThumbprint {
     # All IIS https site bindings using cert $Thumbprint -> @( @{ SiteName; BindingInformation } ).
     param([string] $Thumbprint)
@@ -1083,6 +1093,67 @@ function Get-TeamsFacts {
     return $facts
 }
 
+function Invoke-RenewalHook {
+    # Issue #13 - best-effort SYSTEM execution of an admin-supplied .ps1 around a renewal
+    # (PreRenewalScript / PostRenewalScript on a domain). Renewal context is exposed via
+    # $env:CERTRENEWAL_HOOK_* (NOT script parameters) so any existing script runs unmodified - no
+    # required param() block, no parameter-binding errors. Best-effort: a missing/failing/non-zero hook
+    # logs WARNING + the HookFailed event and NEVER throws (a failed Pre hook must not block the renewal;
+    # a failed Post hook rolls nothing back). -DryRun => log WOULD + no-op. Only non-secret cert metadata
+    # is exported/logged. The hook runs as SYSTEM (the renewal task identity) - operations-guide documents
+    # that the .ps1 must therefore live somewhere only admins can write.
+    param(
+        [Parameter(Mandatory)][string] $ScriptPath,
+        [Parameter(Mandatory)][ValidateSet('Pre', 'Post')][string] $Phase,
+        [Parameter(Mandatory)][object] $DomainConfig,
+        [string] $Thumbprint,
+        [string] $NotAfter
+    )
+    $domain = [string]$DomainConfig.MainDomain
+    $label  = "$($Phase.ToLower())-renewal hook"
+
+    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf) -or
+        [System.IO.Path]::GetExtension($ScriptPath) -ne '.ps1') {
+        Write-Log "Skipping $label for ${domain}: '$ScriptPath' is not an existing .ps1 file." -Level WARNING
+        Write-EventLogEntry $EID.HookFailed Warning "$label skipped for ${domain}: '$ScriptPath' not found or not a .ps1"
+        return
+    }
+
+    if ($DryRun) {
+        Write-Log "[DryRun] WOULD run $label '$ScriptPath' for $domain." -Level INFO
+        return
+    }
+
+    Write-Log "Running $label '$ScriptPath' for $domain..." -Level INFO
+    $hookVars = [ordered]@{
+        CERTRENEWAL_HOOK_PHASE      = $Phase
+        CERTRENEWAL_HOOK_DOMAIN     = $domain
+        CERTRENEWAL_HOOK_TYPE       = [string]$DomainConfig.Type
+        CERTRENEWAL_HOOK_THUMBPRINT = [string]$Thumbprint
+        CERTRENEWAL_HOOK_NOTAFTER   = [string]$NotAfter
+    }
+    try {
+        foreach ($k in $hookVars.Keys) { Set-Item -Path "Env:$k" -Value $hookVars[$k] }
+        $global:LASTEXITCODE = 0
+        & $ScriptPath
+        $exit = $LASTEXITCODE
+        if ($exit) {
+            Write-Log "$label '$ScriptPath' for $domain exited with code $exit." -Level WARNING
+            Write-EventLogEntry $EID.HookFailed Warning "$label for ${domain} exited with code $exit ('$ScriptPath')"
+        }
+        else {
+            Write-Log "$label completed for $domain." -Level SUCCESS
+        }
+    }
+    catch {
+        Write-Log "$label '$ScriptPath' for ${domain} failed: $($_.Exception.Message)" -Level WARNING
+        Write-EventLogEntry $EID.HookFailed Warning "$label for ${domain} failed: $($_.Exception.Message)"
+    }
+    finally {
+        foreach ($k in $hookVars.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
+    }
+}
+
 function Invoke-RenewalCore {
     # The ported v1 renewal loop: binding detection + config validation (incl. CertStore->Netsh
     # upgrade-on-detect), expiry check, Submit-Renewal with stale-authorization (-Force) recovery,
@@ -1277,6 +1348,18 @@ function Invoke-RenewalCore {
                 elseif ($detectedNetsh -and -not $detectedIISWeb -and -not $detectedIISFTP) { 'Netsh' }
                 elseif ($detectedIISWeb -and -not $detectedNetsh -and -not $detectedIISFTP) { 'IIS Web' }
                 elseif ($detectedIISFTP -and -not $detectedNetsh -and -not $detectedIISWeb) { 'IIS FTP' }
+                elseif ($domainConfig.Type -eq 'Netsh' -and $detectedIISWeb -and $detectedNetsh -and
+                        (Test-IsIISWebAppId -AppId $detectedNetsh.AppId)) {
+                    # Self-heal (issue #49): a no-SNI IIS Web binding (sslFlags=0) is stored by http.sys
+                    # at 0.0.0.0:443 under IIS's own appid, so it surfaces as BOTH Netsh and IIS Web. The
+                    # v1 creator could capture that as Type=Netsh; flip it to IIS Web here (the one path
+                    # that reaches every fleet box) so the IIS surface stays authoritative and a future
+                    # fallback deploy never re-pushes a stale thumbprint via netsh. The IIS appid on the
+                    # netsh binding is the discriminator - a genuine non-IIS netsh binding (custom appid)
+                    # coexisting with an IIS site falls through to the preserve branch below.
+                    Write-Log "Netsh binding is IIS-owned (appid $($detectedNetsh.AppId)) and an IIS Web binding exists for the same cert. Reclassifying Type=Netsh -> IIS Web (issue #49)." -Level WARNING
+                    'IIS Web'
+                }
                 else {
                     # Multiple binding types detected - keep the configured Type but still update
                     # all detected bindings after a renewal.
@@ -1305,6 +1388,14 @@ function Invoke-RenewalCore {
                         $domainConfig | Add-Member -NotePropertyName 'Guid' -NotePropertyValue $ftpSiteName -Force
                         Write-Log "  FTP site name: $ftpSiteName" -Level INFO
                     }
+                    if ($correctType -eq 'IIS Web') {
+                        # IIS manages its own binding by site name; drop any stale Netsh Guid/IpPorts so a
+                        # future fallback deploy can't re-push via netsh (issue #49 self-heal target).
+                        foreach ($p in 'Guid', 'NetshIpPorts', 'NetshIpPort') {
+                            if ($domainConfig.PSObject.Properties[$p]) { $domainConfig.PSObject.Properties.Remove($p) }
+                        }
+                        Write-Log '  IIS Web binding is authoritative; dropped any stale Netsh Guid/IpPorts.' -Level INFO
+                    }
                     if ($correctType -eq 'CertStore') {
                         foreach ($p in 'Guid', 'NetshIpPorts', 'NetshIpPort') {
                             if ($domainConfig.PSObject.Properties[$p]) { $domainConfig.PSObject.Properties.Remove($p) }
@@ -1331,10 +1422,21 @@ function Invoke-RenewalCore {
             if ($DryRun) {
                 $deployVia = if ($bindingsDetected) { "detected: $($detectionResults -join ', ')" } else { "config Type $($domainConfig.Type)" }
                 Write-Log "[DryRun] WOULD renew $domain (expires in $daysToExpiry days) and update bindings ($deployVia)." -Level INFO
+                if ($domainConfig.PSObject.Properties['PreRenewalScript'] -and $domainConfig.PreRenewalScript) {
+                    Write-Log "[DryRun] WOULD run pre-renewal hook '$($domainConfig.PreRenewalScript)' for $domain." -Level INFO
+                }
+                if ($domainConfig.PSObject.Properties['PostRenewalScript'] -and $domainConfig.PostRenewalScript) {
+                    Write-Log "[DryRun] WOULD run post-renewal hook '$($domainConfig.PostRenewalScript)' for $domain." -Level INFO
+                }
                 continue
             }
 
             Write-Log "Certificate expires in $RenewalThresholdDays days or less. Initiating renewal..." -Level WARNING
+            # Pre-renewal hook (config.PreRenewalScript) - best-effort; a failure never blocks the renewal.
+            if ($domainConfig.PSObject.Properties['PreRenewalScript'] -and $domainConfig.PreRenewalScript) {
+                Invoke-RenewalHook -ScriptPath $domainConfig.PreRenewalScript -Phase Pre -DomainConfig $domainConfig `
+                    -Thumbprint $cert.Thumbprint -NotAfter ($cert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
+            }
             try {
                 # Submit renewal with retry. If the ACME server has pruned stale authorizations for
                 # the existing order (common when ARI signals "renew AS SOON AS POSSIBLE"),
@@ -1445,6 +1547,13 @@ function Invoke-RenewalCore {
                         }
                     }
                     catch { Write-Log "Failed to restart service '$serviceName' after renewal of ${domain}: $($_.Exception.Message)" -Level ERROR }
+                }
+
+                # Optional post-renewal hook (config.PostRenewalScript) - best-effort; runs after a
+                # successful renew + deploy, with the NEW thumbprint/expiry in the environment.
+                if ($domainConfig.PSObject.Properties['PostRenewalScript'] -and $domainConfig.PostRenewalScript) {
+                    Invoke-RenewalHook -ScriptPath $domainConfig.PostRenewalScript -Phase Post -DomainConfig $domainConfig `
+                        -Thumbprint $newCert.Thumbprint -NotAfter ($newCert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
                 }
 
                 # Persist new certificate details
@@ -1607,8 +1716,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBB1YvxlUSxl9f1
-# ZvwYuuWnRCjf2Hl+v75xnZ2Xf2TIn6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCZe5yu5DU42IvF
+# 0dYyADs+cvi92y+Vz3NmBidON0FImKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1739,31 +1848,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIKGtFyRPzaAxXYiIlR0uiyd36UbSWuUUJfqn
-# CcRJqM3jMA0GCSqGSIb3DQEBAQUABIIBgIBvk5HST9/C7s9W0CVSGicsOcvW36dj
-# OUz7LplpqjtYpaW/XQ0J16t/un+EOTbyzWNEgtbFkkAxdroV6X9yNpYae7cspFIR
-# 50+2E9/toaCt5PNmVeaaa2B8aOXIYHLGkUwvAJFtLEZuJSJ7QuwHrsYoHD++p5AJ
-# Oy/er/MJ+fYMMYqGebmQsmSZ7Nb0iRUF5J9+lTKItT+exnFtoNPPehN6cgLJ1Ln7
-# l2qIfzsL8jb3KOszi2o4L8Q70hpX+RSDQFU0yKkrFc47MrQPMfM2mgvSKKnFl+aX
-# 3sJc6qwPbSvDqoYTUaPwUOAEnXSPBKWrYEVv35U3BwVxTZlCk8fPfb8AJY1uAnWv
-# IK6nzmO91+F1x+DUyKkwwfsOBCP5AdjH4aiSjREC5KoQxVZU8UTYWEKz0MW4Ncbs
-# fgnIpE2dG0YYWR+JM7pwUPZ3Ft0998c0gNN0UcxwLQxAb3+OSbSKpelFKJy6RSoY
-# k6dekTjxGcZjImiplFuL5qFldezT2BAEXaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBe0U2zcSfvl3N6GqzAZZNCYR5i3sB0TagC8
+# Z4B2qD2uMA0GCSqGSIb3DQEBAQUABIIBgJfD70MdbbYBPCL+g+R9DclpjbK44JNb
+# i8GLtjfXInKRxnoKKIHYXeT6iQAmj3wGU0GYunvcLfpK4/1fsIY07mGwzRiXhfYl
+# h83n5mw4jQquQlPh9x+qdYxEPOB+OmDM0atsCqyda7bZk1kCHLfze0DWFlJLGJ4Y
+# 8wPm5Qr94wx2V55FxpCWzOxmndNNYdLLp4r0rWSUjRSq5gKVgcCMNN56u9AP58e1
+# UJ1dLMwLrvFifqDKpyL5X4p5yMliTa3RQLtZixJZU7ddItEXiUdN85OZAN7M8ZrZ
+# gCrdloD1YSPqTB+iDVni0GhArDuWozBULigLbINAUtriY0Y+AQenwCO2tpAKZS5M
+# RuVQS4dP/yVlHVgMNjA+tUJZfTd4rrxoiV836F2DzoGQ9aFl6sTv2rsE1DyhYc1c
+# Ius6ZFAYQom3/qRdGxZfn9Sn4Tuucb0irV6HsX0hr4MOdsf8XSGugg0TUYsrkNel
+# kKn4cymKNSZ2UiHnIe9q8B/cXnTu1JaqWqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MTgxMDQ1NTRaMC8GCSqGSIb3DQEJBDEiBCCTFFAbBWTKN+KbyFxN+O2o
-# Qh07DipApFU5s55b1m/piDANBgkqhkiG9w0BAQEFAASCAgC35lDKXllqMwbaipwp
-# abiMhRqsEQEk5gmV14+Vgr66iv7Lpb1lu5WC3Zizri/BVn8pA1pCYb31PBRKg2Ov
-# o3/YkaiF1JLHgyvfbQ078l6J21iUs87Qvp2+JzNc54QF7KhUGribXqI5G9JLuMyu
-# yKXWpCM3h5nbMuEW7Y8dIY2wi//j2XigC1Ow6k8DaHVWvGDcfMGUjVvAoXuAHGRI
-# jmR23yZN2BUwCiSi7FaDMCq7b7dcPIrlnZAY7AYvcohUKnYkPSkH4w80zDF8L5sQ
-# XDgy+RdSffJhRu0vADgk1dmOcnPjtMGXxYsmGTCGPe9x4cVP7X2eZtsBRCLNuSMK
-# pVM/BI2DpXaPlDAOaEoOghGM0Ma/FDfBUlIXHppo/ky5RQ6s7Gi/VJJcmFqJFn4Q
-# br+lCzNFSCplG4QBd8Tx5jjfy8UVBbSSSMKDVXMjT4S6zKp9QLU8WljagGYIEt8v
-# +GSFpXJo1LgfQ0dBEGAAgrSjoBXW9RjJlaDivvJGiLXYFaVoFv587UtoNp5psp8H
-# Qv04X8oj/XJ7txUnnMsMFPVv6ZNLe+FFlo6QaGMsw4Aad05IYT1C9fIUPB0GNt08
-# O4kMwhiCgDxL7HhZAaADyQiSFjJ4Gr8JeGeXT/jglOJ6a4Q+MlMcWXXZZpU43dGB
-# XWxpTJwzvDyDc8ju+kvh6nfxXw==
+# Fw0yNjA2MjIxMzA0MjhaMC8GCSqGSIb3DQEJBDEiBCDC3PE+oR51n70A3CHsbcCB
+# sX3DhgY+yH3zQ7nk4qMjHjANBgkqhkiG9w0BAQEFAASCAgCkUUQpEM4155xkKBvw
+# oKujblr3Ah1bvUBaDOmzH6QWuq4My9+9Vpa1ui3CuAQ4i5u6FwKAtbu4unyS0dlA
+# LRgK9dYosPkt4SOjwO/FsUVDewoWBNauCNyhUO3ezMbSYt+eoFQWPu+6sitRm/vS
+# Y7WDch1qQPTPu2i83gIcbO46fIX+cI1tYEry4ezRIuqPu+zPcR5DwtQKW/K17UjZ
+# 8Oee9/olO0n6z6ZvL0nGIowsa+1hrROj12Ul/JvVn3mTg7fm3UwMLzQNK4MbBlfd
+# PCDlUCB+8HOXo+BreLugdDChU4dP1TEeo1lph+evUSp6aV0y0Iu+jcBIgxEBIxw0
+# ENFoEasZQDpwc9vgeGVjv4BCFIr4cGWk00bdyhIpzHe1CTRnYtLL3IE+DyB8RyHr
+# vUJy385KStIGxcA/kiHTQQ5AV/YLs0Y7CaQfZjXytRgRX0JBaNN3S2+4C2rAmFus
+# qipAy04E0AxQAaSGEzJLcJ8EV/Ndyj/oB5lXZIr2Xfh9ARIpcEniBAOuIuKvt+By
+# x1zqkQGcQ+VQBdUU1YJHXVijbsg1K1kmlWaYZnVjKgYtnziwhzqGmBcDuHhJukgT
+# qKiQq4F53lqbAK6FXuuPyY5GHsj6sC6AElWtc45vzp9TBf9HLw0+L8ppgldTJi5x
+# OMM3An7ptF1pum4IWZx9HdrtIQ==
 # SIG # End signature block
