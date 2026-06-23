@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.2.0'
+$ScriptVersion = '2.3.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -260,10 +260,33 @@ function Save-VerifiedDownload {
     return $auth.Thumbprint
 }
 
+function Backup-CertConfig {
+    # Snapshot the current cert-config.json before it is overwritten, so an admin can diff a save and see
+    # what changed (and recover a prior version). Best-effort: writes to <CertRenewalPath>\config-backups\
+    # cert-config.<timestamp>.<reason>.json and prunes to the newest 20. Never throws (a failed backup must
+    # not block the save) and is a no-op when the file does not yet exist (first write).
+    param([string] $Reason = 'config update')
+    try {
+        if (-not (Test-Path -LiteralPath $ConfigPath)) { return }
+        $backupDir = Join-Path $CertRenewalPath 'config-backups'
+        if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+        $slug = ($Reason -replace '[^A-Za-z0-9]+', '-').Trim('-'); if (-not $slug) { $slug = 'save' }
+        $dest = Join-Path $backupDir ('cert-config.{0}.{1}.json' -f (Get-Date -Format 'yyyy-MM-dd-HH_mm_ss_fff'), $slug)
+        Copy-Item -LiteralPath $ConfigPath -Destination $dest -Force
+        Write-Log "Backed up previous cert-config.json -> $dest" -Level DEBUG
+        Get-ChildItem -LiteralPath $backupDir -Filter 'cert-config.*.json' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    catch { Write-Log "Could not back up cert-config.json: $($_.Exception.Message)" -Level DEBUG }
+}
+
 function Save-CertConfig {
-    # Persist the (mutated) config object back to cert-config.json. DryRun-gated; never throws.
+    # Persist the (mutated) config object back to cert-config.json. DryRun-gated; never throws. Snapshots
+    # the previous on-disk file to config-backups\ first (best-effort, see Backup-CertConfig).
     param([Parameter(Mandatory)][object] $Config, [string] $Reason = 'config update')
     if ($DryRun) { Write-Log "[DryRun] WOULD save cert-config.json ($Reason)." -Level INFO; return $true }
+    Backup-CertConfig -Reason $Reason
     try {
         $Config | ConvertTo-Json -Depth 10 | Out-File -FilePath $ConfigPath -Force -Encoding UTF8
         Write-Log "cert-config.json saved ($Reason)." -Level SUCCESS
@@ -1002,8 +1025,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBoxUwBO4Uh4LaL
-# zHq/bcyyVGgHetnMDak5KIjCSy/C96CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCgfoBol4QBYE4f
+# BQ3JVsiR2EvbgmOOwob0F+k8WgN0MaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1134,31 +1157,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEdIZ7E5O6zEWRCeyWllJQPW/C6FscQxQ9zz
-# /5yv28M1MA0GCSqGSIb3DQEBAQUABIIBgJQyXq57typdw6vJ8MYzm/bNWthBCKXS
-# TDzJ7A15ECnxWEv5wfYNSCq5ezaee2sO8kPlFIzJNiGcNvUEQM469HKXqmScpnJd
-# drzQKj5581AWY50m9so7DE5w/3rxWa45DMhiptULh0pcrYHYBnrPH9sortgxdnKw
-# +YGrTotnDlJqaqJwq2a4mq7P3mHSjXbvCvrsHsdsMl1wYzK6qIZkFdC4kBmNBkNw
-# aF2tneqGGknC0hTb1ojkqOuSYVRiCg1AEl6GNdzIYfIDNzlyfCX6P1HIBxGFug6G
-# Pm5yp+qM416O+5Vf/wIh5m3te1TMswh9xc/8nUsn0SMyqPExfPARQMYwuQjiNuPH
-# 5vBtDLP4pc922HKhlqhW8xvVP/RUwC24cL8Pk59GIFrCsOYW77MEmd7BxBRuSxvO
-# /PFNt8p5TcVHrbQCDuK1E34EHZ3gxsWZbfwaE7ogVpR8R/skIZjFHWWG4+nujMSG
-# r5M20hhn7pth2/M2sGmyVfGNkqN4t2mp66GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIOeWoZZoW2tfKxPKow3+EeNzx1ewpQItZhem
+# B+G/vPJJMA0GCSqGSIb3DQEBAQUABIIBgBKeVyAkStY13xU5mS4Z8IuoVxk5VYAw
+# YMqTODD/jDd9E7T6Rj39UODBJJO/pyCSuPSqRZeKBS/qWwduIAFFPbO7GLL975BL
+# xGxhxcQCCbOs4tYCAoLuesYbSeCZCBiTbyMzXpaFZKiwMU5yjNlFkLQhh2tDlEpL
+# EmDmby1G0JPwLTJg29XgGgURD0zypDW/2xda8IdbsneXWcbFL+GUEXHK6JoVLCTe
+# fKNu3/UNSqsx2LeDww1vIVJOA+V6j6NNXd05dQ5F2A9MWsiTNcwnmjycp+a3+VZ9
+# gfmU0y5QE4gRCZFe3TX2uwrPAar1Z5vRoqzKG/28d26H3YjlBAkX9J8tBuv8tyd2
+# 1VSb7xswMy+32mJEf3JkFXrb3CMiiqtME1oqfSFne3XW6QMEdau1uJsd20raUswG
+# YR9qjHSeftqQ47K4b44CbEB7sGnMTguEg/s6TJdfwp+cnLaSuSgsG4WDKnfXqDtB
+# k4vgmpIoxwGhJYmcToULXWqQah6bD5uCyqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjMwNzQyMTFaMC8GCSqGSIb3DQEJBDEiBCDNxZlXefuWmAo8pm83BCJJ
-# SpdL6GbenCHqV50+GTl/kTANBgkqhkiG9w0BAQEFAASCAgCg+vucauWPSSn1+Lkc
-# VMS/cLs6EMq01PLk93DlXP5nG1TXRxi73Arkgf77Vxr+xu+1eoIORS7H/3oPOOK/
-# bP1ftd/eyNpkXWgS3Q4Szvbj0XkxMiLn9Zx9kzr2qpx6hGLSUCST82OKs96M0frD
-# 4tikwMhxIvHLKA/Vf/zREXKdk2OR24bFWOK7wWKGBpHyvWvvD4kGu2CujSXibGME
-# 53Qg56Hbs7eC+p/wvd11x2qgUpqh9Zz5ZLyfTSNLi/H2Nq+WE8cXZVGgL6yQ4cZm
-# DsMfnnQwBdpYP9R5z43SeyXn4/6cJCmleY7/2EE2Crzt4FK2+kGPFKKByDTo7/Uf
-# dHkuvpFSXFzMlkJkxs0y7gAuW6DKyaPuCaM6PdxfHEUqq/D9BUtitEGwHmtIcX3u
-# u/iJM7g2FHfdZn2OSE/LFh4KvwTvlDWhmxWyYv8yvBNUr2XYxemKGegxHI5GNb9/
-# sFdZHjfV70okIXDorZXygSjdwecmZMOJ3nkJ66IVjwwLGcmIbT4q83mbCzJv/acn
-# 17G2iO0RwFmeO7aBGrIbu9WR0pSZcfYIZpZMxiBpkcllOwxo/0NGFKL8XC9+wAmQ
-# RKWG+3oz/pBIe9e5ukQca/2bDkTZYcSvd1RLy4kuXEJudGy8nlmDOZ7EfBIh2JWj
-# SLu7MYWcVYkqtxO75TZMFuel4A==
+# Fw0yNjA2MjMwODU5MTFaMC8GCSqGSIb3DQEJBDEiBCCnN5q5B/GJ3gMY+WAGwq8F
+# iTc6o/5zoQz1lMn7JZo7OzANBgkqhkiG9w0BAQEFAASCAgCqWRU8TioHm7gjMRGI
+# T+3zNlllRt6nUyPedu81GUg3/mB474lRALhorsiZPm1iXu728JeQFoxvunB/uB3p
+# D2RPNYACjctnuqhjA7ojQGF1zUY30bQo/Ez6Y/Teb0QGIu6ghfTyfgf20jFJ2V9G
+# qetjPTtx1Gzx+kSxsYnj2+P/jfXJ5JiIhCMDScrz7YZCdIJ+e9QdoJFXNgIea06Q
+# vZCK4N/bOw3WJw5VIgKUh3trTzCXG2rTGuJWjBEnWH8IoYom+WMUGiC7WB0io9p6
+# 7UlTUSM0+O22e3nbRqgxb/wtPzeAk+LsWwdlDml4YyDt45v5zfb3wTxYRNlq+0a1
+# JTaooVlGbb606qwz4q7mwDjHnCBID9xFa57XPWAzyuoA1WHGzLmPQv570TDXftF2
+# H04ukN0YbS7C8VVSy3Z7fHLXwQ52aKiYdboKskdFUG3hM2iJu06ZMKWKMSGSz8r5
+# 3UqeLucTQVfBMYkM1tDLm0VwnLBgaUm/jkM347BSY41ovkgMfFVLtaCI2Rkbx6ah
+# q/bSpfRUi89mTdFwFk+CF/ZCa+byInDVf1ty48GTExU2fEbYcX6tPHRF3FqvJWD+
+# cYj01Vr9IQmwkJQM9kNmzyx1zfiLJmyWylxf3VjavDq145kInnhudxnOTmhEt5ep
+# MjzXYyF+BIb9bwoLN60IG4tYAg==
 # SIG # End signature block

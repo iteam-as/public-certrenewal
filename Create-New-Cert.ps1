@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.2.0'
+$ScriptVersion = '2.3.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -209,10 +209,33 @@ function Save-SelfUpdateState {
     catch { Write-Log "Could not save self-update state: $($_.Exception.Message)" -Level DEBUG }
 }
 
+function Backup-CertConfig {
+    # Snapshot the current cert-config.json before it is overwritten, so an admin can diff a save and see
+    # what changed (and recover a prior version). Best-effort: writes to <CertRenewalPath>\config-backups\
+    # cert-config.<timestamp>.<reason>.json and prunes to the newest 20. Never throws (a failed backup must
+    # not block the save) and is a no-op when the file does not yet exist (first write).
+    param([string] $Reason = 'config update')
+    try {
+        if (-not (Test-Path -LiteralPath $ConfigPath)) { return }
+        $backupDir = Join-Path $CertRenewalPath 'config-backups'
+        if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+        $slug = ($Reason -replace '[^A-Za-z0-9]+', '-').Trim('-'); if (-not $slug) { $slug = 'save' }
+        $dest = Join-Path $backupDir ('cert-config.{0}.{1}.json' -f (Get-Date -Format 'yyyy-MM-dd-HH_mm_ss_fff'), $slug)
+        Copy-Item -LiteralPath $ConfigPath -Destination $dest -Force
+        Write-Log "Backed up previous cert-config.json -> $dest" -Level DEBUG
+        Get-ChildItem -LiteralPath $backupDir -Filter 'cert-config.*.json' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    catch { Write-Log "Could not back up cert-config.json: $($_.Exception.Message)" -Level DEBUG }
+}
+
 function Save-CertConfig {
-    # Persist the (mutated) config object back to cert-config.json. DryRun-gated; never throws.
+    # Persist the (mutated) config object back to cert-config.json. DryRun-gated; never throws. Snapshots
+    # the previous on-disk file to config-backups\ first (best-effort, see Backup-CertConfig).
     param([Parameter(Mandatory)][object] $Config, [string] $Reason = 'config update')
     if ($DryRun) { Write-Log "[DryRun] WOULD save cert-config.json ($Reason)." -Level INFO; return $true }
+    Backup-CertConfig -Reason $Reason
     try {
         $Config | ConvertTo-Json -Depth 10 | Out-File -FilePath $ConfigPath -Force -Encoding UTF8
         Write-Log "cert-config.json saved ($Reason)." -Level SUCCESS
@@ -934,6 +957,24 @@ function Set-ConfigVersionStamps {
     return $Config
 }
 
+function Sync-ConfigVersionStamps {
+    # After a self-update the running scripts are newer than the CreatorScriptVersion/RenewalScriptVersion
+    # recorded in cert-config.json - those stamps were previously only refreshed on first-run config
+    # creation, the Billing save, and the Add flow, so a [U]/[D]/[Q]-only run (or just re-running after a
+    # self-update) left them stale. Re-stamp on every run and persist if anything changed, so the config
+    # always reflects the installed versions. Best-effort; never throws. Save-CertConfig is DryRun-gated.
+    param([Parameter(Mandatory)][object] $Config)
+    if (-not $Config) { return $Config }
+    $beforeCreator = [string]$Config.CreatorScriptVersion
+    $beforeRenewal = [string]$Config.RenewalScriptVersion
+    $null = Set-ConfigVersionStamps -Config $Config
+    if (([string]$Config.CreatorScriptVersion -ne $beforeCreator) -or ([string]$Config.RenewalScriptVersion -ne $beforeRenewal)) {
+        Write-Log "Refreshing config version stamps (creator $beforeCreator -> $($Config.CreatorScriptVersion), renewal $beforeRenewal -> $($Config.RenewalScriptVersion))." -Level INFO
+        $null = Save-CertConfig -Config $Config -Reason 'version stamp refresh'
+    }
+    return $Config
+}
+
 function New-DefaultCertConfig {
     # The skeleton config written on first run before any domain is added (spec section3 schema).
     $config = [pscustomobject]@{
@@ -1467,19 +1508,27 @@ function Read-DeploymentType {
     # Interactive deployment-Type selection (shared by the Add and Update flows). Loops until a valid
     # Type is chosen: [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS. For Netsh it
     # captures IP:port(s) via Read-NetshBinding (recording them in $KnownBindings for conflict
-    # detection); for FTP it prompts for the site name. -CurrentType, when supplied (Update flow), is
-    # shown so the admin sees what they are changing. Returns @{ Type; Guid; NetshIpPorts }.
+    # detection); for FTP it prompts for the site name. -CurrentType, when supplied (Update flow), is shown
+    # so the admin sees what they are changing AND lets them press Enter to keep the current deployment
+    # unchanged (-CurrentGuid / -CurrentNetshIpPorts are returned verbatim in that case, so an admin who
+    # only wants to tweak a hook does not have to re-pick the type or re-enter every netsh binding).
+    # Returns @{ Type; Guid; NetshIpPorts }.
     param(
         [Parameter(Mandatory)][string] $FQDN,
         [hashtable] $KnownBindings = @{},
-        [string] $CurrentType
+        [string] $CurrentType,
+        [string] $CurrentGuid,
+        [object] $CurrentNetshIpPorts
     )
     $type = $null; $guid = $null; $netshIpPorts = $null
-    $prompt = if ($CurrentType) { "Deployment type (current: $CurrentType) - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS" }
+    $prompt = if ($CurrentType) { "Deployment type (current: $CurrentType) - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS (Enter=keep current)" }
               else { 'Deployment type - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS' }
     $validType = $false
     do {
         $envChoice = (Read-Host $prompt).Trim().ToUpper()
+        if ($envChoice -eq '' -and $CurrentType) {
+            return @{ Type = $CurrentType; Guid = $CurrentGuid; NetshIpPorts = $CurrentNetshIpPorts }
+        }
         switch ($envChoice) {
             'W' { $type = 'IIS Web'; $validType = $true }
             'C' { $type = 'CertStore'; $validType = $true }
@@ -1505,12 +1554,23 @@ function Read-DeploymentType {
 
 function Read-RestartService {
     # Interactive optional post-renewal service-restart capture (shared by the Add and Update flows).
-    # Returns the validated service name, or $null if none. -Current, when supplied (Update flow), is
-    # shown so the admin sees the existing value.
+    # Returns the validated service name, or $null if none. -Current, when supplied (Update flow), is the
+    # existing value: pressing Enter (or [K]eep) preserves it, [R]emove clears it, [C]hange re-captures -
+    # so an admin who just wants to tweak something else does not have to retype it (and Enter never
+    # silently wipes it).
     param([string] $Current)
-    $suffix = if ($Current) { " (current: $Current)" } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($Current)) {
+        $decided = $false
+        while (-not $decided) {
+            $ans = (Read-Host "Restart a Windows service after renewal? Current: '$Current'. [K]eep / [C]hange / [R]emove (Enter=Keep)").Trim().ToUpper()
+            if ($ans -eq '' -or $ans -eq 'K') { return $Current }
+            if ($ans -eq 'R') { return $null }
+            if ($ans -eq 'C') { $decided = $true }   # fall through to capture a new value
+            else { Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING }
+        }
+    }
     $restartService = $null
-    if ((Read-Host "Restart a Windows service after successful renewal?$suffix (Y/N)").Trim().ToUpper() -eq 'Y') {
+    if ((Read-Host "Restart a Windows service after successful renewal? (Y/N)").Trim().ToUpper() -eq 'Y') {
         $svcName = (Read-Host 'Windows service name to restart').Trim()
         if (-not [string]::IsNullOrWhiteSpace($svcName)) {
             $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
@@ -1525,16 +1585,26 @@ function Read-RenewalHook {
     # Issue #13: interactive optional pre/post-renewal hook-script capture (shared by the Add and Update
     # flows), mirroring Read-RestartService. Returns a .ps1 path, or $null if none. The path is validated
     # (exists + .ps1) but - like RestartService - the admin may configure it anyway (it may live on a share
-    # or be created later). The renewal runs it as SYSTEM. -Current, when supplied (Update flow), shows the
-    # existing value.
+    # or be created later). The renewal runs it as SYSTEM. -Current, when supplied (Update flow), is the
+    # existing value: pressing Enter (or [K]eep) preserves it, [R]emove clears it, [C]hange re-captures - so
+    # Enter never silently wipes a configured hook.
     param(
         [Parameter(Mandatory)][ValidateSet('Pre', 'Post')][string] $Phase,
         [string] $Current
     )
-    $when   = if ($Phase -eq 'Pre') { 'BEFORE' } else { 'AFTER' }
-    $suffix = if ($Current) { " (current: $Current)" } else { '' }
+    $when = if ($Phase -eq 'Pre') { 'BEFORE' } else { 'AFTER' }
+    if (-not [string]::IsNullOrWhiteSpace($Current)) {
+        $decided = $false
+        while (-not $decided) {
+            $ans = (Read-Host "Run a custom script $when each renewal? Current: '$Current'. [K]eep / [C]hange / [R]emove (Enter=Keep)").Trim().ToUpper()
+            if ($ans -eq '' -or $ans -eq 'K') { return $Current }
+            if ($ans -eq 'R') { return $null }
+            if ($ans -eq 'C') { $decided = $true }   # fall through to capture a new value
+            else { Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING }
+        }
+    }
     $hook = $null
-    if ((Read-Host "Run a custom script $when each renewal of this cert?$suffix (Y/N)").Trim().ToUpper() -eq 'Y') {
+    if ((Read-Host "Run a custom script $when each renewal of this cert? (Y/N)").Trim().ToUpper() -eq 'Y') {
         $path = (Read-Host 'Full path to the .ps1 to run (runs as SYSTEM)').Trim()
         if (-not [string]::IsNullOrWhiteSpace($path)) {
             if ([System.IO.Path]::GetExtension($path) -ne '.ps1') {
@@ -1865,7 +1935,8 @@ function Invoke-UpdateFlow {
         }
     }
 
-    $deploy = Read-DeploymentType -FQDN ([string]$selected.MainDomain) -KnownBindings $knownNetsh -CurrentType ([string]$selected.Type)
+    $deploy = Read-DeploymentType -FQDN ([string]$selected.MainDomain) -KnownBindings $knownNetsh `
+        -CurrentType ([string]$selected.Type) -CurrentGuid ([string]$selected.Guid) -CurrentNetshIpPorts ($selected.NetshIpPorts)
     $restartService = Read-RestartService -Current ([string]$selected.RestartService)
     $preRenewalScript  = Read-RenewalHook -Phase Pre  -Current ([string]$selected.PreRenewalScript)
     $postRenewalScript = Read-RenewalHook -Phase Post -Current ([string]$selected.PostRenewalScript)
@@ -2016,6 +2087,10 @@ try {
             # (section5) Billing block (the only interactive credential-ish input).
             $config = Read-BillingPrompts -Config $config
 
+            # Keep the config's script-version stamps current with the installed scripts (refreshes them
+            # after a self-update even on a [U]/[D]/[Q]-only run; persists only when they actually change).
+            $config = Sync-ConfigVersionStamps -Config $config
+
             # (section6) Interactive Add/Delete/Update menu. The vault secrets sync runs lazily inside the
             # issuance path (Initialize-VaultSecrets), so non-issuing choices ([U]/[D]/[Q]) skip the Azure
             # round-trip (spec section4: before issuance).
@@ -2050,8 +2125,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA+LEKrhq3kV9kX
-# tZrjLh8HhVR5YgX5i/DwdYpL2vacpaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDHGmsLXDwoyd8A
+# v+XCrSKjSmo0qtg9k4Ju2u3wOTM8z6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2182,31 +2257,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEINo9fnV4amzwY810YXHmqJ2bNNJvoZfVEQE/
-# yTOtKL4gMA0GCSqGSIb3DQEBAQUABIIBgMH9404gc/7CUPhWUu4mtgyUEf8kIFgD
-# 4dKpSNgkp7Z9dDJ/hX6zRQIqQXcfO/KuUizen86jX4PewAinhS9jgjFd/ZAQb+lT
-# Vk5bad61PnmdOmknzPPj3cH1LPu3311JfLWePo6P8SBjKxv/GNjrYOc2bw86dJ08
-# Xh/v063wqGqBCZqhFGhxSHiAxefpNh1tNSFwU2yTA7cJKspEhm1+USxhHx8/npBO
-# jOXTvVoMZyzzqBu94ANCUzIiPR+0M62g9LzARBuvkdQtKNgFbocPVFNE8didJfFx
-# OiEFwuDiQysA5nGesLRwr1DllIyskeUFZ5DeTn/dJlwJnm34AZu59ot8kiS8SFXn
-# Lk6CKHSmc5rmhEEb7E1Wohg4n9kg6Rx+X/1Sh3o6UYeKwXyGBuZrYOLaIjA7ibpN
-# BBD+Uj/d2rabuhWVKi8BG96YmFwnvYUHj4WFfbTpG8REwftU/NW4FfUhGTp3Dnbh
-# ptDgJ2dta5nAawsya5qGRV5D/EpTxtW23qGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGOFKKcKC0bJ5cUfjCsis0809f43MNvL97id
+# glWaB4IgMA0GCSqGSIb3DQEBAQUABIIBgD3p5/gQ4ud0dSxleDKqsN8/bDFUyaaR
+# s9eVRWEdTUgaV5AHCYKDICrgwUE6QnCQKSwdEXMV+oReJkfnTnwCiMPjCxCJgNHq
+# S8ocj71PIdHtriAIEwYHp3aoBYzHZoQDLtMk+DFMDag+fv7lRVQ1BVrAIbOgDsnM
+# cdMIE5h1Q0Bwle4koeV1cIhh4gSRwrdr0m6pUZcnnVtLt+E9y4QSp9i3uF6QjC1O
+# 7akJgWE7X+VCtAUn0m2Okvt+pxncnJWQZx4QJKGFMWmjtGXwEKj15dPGxQfqjuGK
+# qWyGhEO0VjizlJj7xPGys1JePVXIRi1te0ZuTKWyk8fXkyBh5XK7dMlUPQ48uCcq
+# vfibvtiH499yplWxYG99tZeq6lNC9K2BCnCvWMUXpyC4h1lAFq9abDnAuJAxvQBp
+# ZR/1yvEK1ljMuB4r4mK4zrB256UkrRoItMmcYJrUamEDalty4oS1HQ7ZaRm8dPdo
+# 00Qds7sPc+Qj/sg3uLHWjFe4bUYuWTHIpqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjMwNzQyMTJaMC8GCSqGSIb3DQEJBDEiBCBXemgSksKa1RpAwYcMQVor
-# SFSJlkiCn2p2+C1dZLJdPzANBgkqhkiG9w0BAQEFAASCAgClg6jz8Upn/W3rZYlM
-# cjZXSf+boWEzAuOEfNeCwmCcXPpYK00w/r1BAUdl2UCpHbJkQLKKcnII/8yooW/B
-# KtdY5Wn9G+RA7pekSBOqcSeX6c4t3cRENKiRQRSIBrolE14JDslF9RxkcTYYkMiu
-# BmnIXdTEVPrYhClyfZhw4LNtcB8MpjYtzu49+fH9V+AByRjCrN9q0o6AdIu52DoX
-# vqA58eyNF7B01Bdj5eztv/+GvJIZfBeHQry5rFyue63I2666c8VsQQcweHcNOgvt
-# 6bqg71aXSBZ0Dh09P/3ZnHzfzNef/5ldgfHZYI4sc6i3Hx4nvWfYEvU0MYC29QNX
-# jS33s1tQ7p5jQpvGLXHFOJRtIjNtjA4Ed7Omm5eJ+kMhtTHU8R1Q6ccAW5ivLkor
-# 30aCOdq3fBT5zv/DYOj7yYlwLZfFjzqb+82tzdqq+wxg86rIA8JNcufpgxjz6FA0
-# eOFSng1gz1fiq0D8FQWEkUiBOQ01VveWZPFq3uPGO15eu+mQcC8H7Fg58H0Dq+78
-# kLpyQ7Ac7NdisfquH3dhxPLboKAieZA/HYs8q4llYFnHGBZzPVIY2+LHxoO8+BJ6
-# Tne2vn4FjlJqFMtaBOP1/3+RhWzECCHCT1rliA7pPbYHnFe/obXZiGaSC6yEemT2
-# wSIM6JMe3nSH7sUPi9Fz4ccGaA==
+# Fw0yNjA2MjMwODU5MTJaMC8GCSqGSIb3DQEJBDEiBCBHh23vyz4sPAtzuF+U/uor
+# ywqx4Kxgz9BMfO8s9PfNizANBgkqhkiG9w0BAQEFAASCAgCm7I7mnV/h7b1DqwgC
+# 5rZKZR9rguonjxzAbSkw1oKOpmWeEGRuiwXRAzPAOXhKNiBo3SrHp98biZo0gdv2
+# zGWBG3gij6J9aa1WsN3SOwkRpR6vu5C0LXJyou0xhnJ1K3DLm0xdopzMhWBDPdeW
+# Pq7UGvV0RUXk5gpD+hKdga3Y1hnK4ymFQiGZXDgRFfFMULyeQkELCDByIoTmuc/J
+# QPuxntmrIHajj2qDTdx3DVNS4pjw4N+SUBlZpxPLE6TDPh0UoMKo30Ix4MQboenn
+# wVl7G8aPs2RHqRBXsHDcuys+CKz8YNSvYL0m+H6UNI4IBS8HRG7rksLIy3v4ZJel
+# 5p/lu+KyESUBmxzS9TOG7UWbSCZx+yVloHmP+4+Iir3g3I9+QDgWL6Gjx27Go85m
+# xNkWwjRjIMAjUcd0onGQqG3h9X/BTEsMtyANj9eAFzkadPl4M8HmCNBy4ll/MqdZ
+# zqJ54xzBmQUEZiOsgj0/g3Ln9iv3BpyNV1jXz7DIWPzXSdd8DgX4G1sLd0R2VG5B
+# gru2wYFAtwhaVnhs4elkSVnlIQBYzRrDKT52liozF/GafM0ycHbDRzUrPAb5CUWe
+# D7e9PpdYNkVS+z+yu9FWCkZEBss4K/FfB7RcqoDeml5l/2Sf9Iz9SX8M8DVFvUB4
+# 6Os/vF0nYVJB5iJwfM5rakpcNg==
 # SIG # End signature block
