@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.1'
+$ScriptVersion = '2.1.2'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -64,6 +64,7 @@ $LogDir          = Join-Path $CertRenewalPath 'log'
 $SelfPath        = $PSCommandPath        # this script's own path, for the atomic self-replace
 $RenewalTaskName = 'Renew-Cert'
 $SharedPoshAcmeDefault = 'C:\ProgramData\Posh-ACME'
+$DefaultRenewalThresholdDays = 30   # default renewal lead time; per-domain RenewalThresholdDays overrides (matches Renew-Cert.ps1)
 
 # Azure Key Vault holding the 4 shared secrets (spec section4). Built-in default; cert-config.SecretsVault
 # or -VaultName override. SP identity ships as built-in constants so first run (no cert-config yet) can
@@ -1542,6 +1543,27 @@ function Read-RenewalHook {
     return $hook
 }
 
+function Read-RenewalThreshold {
+    # Issue #57: interactive renewal lead-time capture (shared by the Add and Update flows). Returns the
+    # number of days before expiry to renew at, as an [int]. Pressing Enter keeps the default
+    # ($DefaultRenewalThresholdDays = 30). -Current, when supplied (Update flow), is offered as the default
+    # so pressing Enter preserves it. Re-prompts on a non-positive / non-numeric value; warns (but accepts)
+    # a value >= 90 since Let's Encrypt certs live ~90 days, so it would renew on every run.
+    param([int] $Current)
+    $default = if ($PSBoundParameters.ContainsKey('Current') -and $Current -gt 0) { $Current } else { $DefaultRenewalThresholdDays }
+    while ($true) {
+        $answer = (Read-Host "Renew how many days before expiry? (default $default)").Trim()
+        if ($answer -eq '') { return $default }
+        $parsed = 0
+        if (-not [int]::TryParse($answer, [ref]$parsed) -or $parsed -le 0) {
+            Write-Log 'Enter a positive whole number of days.' -Level WARNING
+            continue
+        }
+        if ($parsed -ge 90) { Write-Log "Note: $parsed days is at/above the ~90-day certificate lifetime, so this cert will renew on every run." -Level WARNING }
+        return $parsed
+    }
+}
+
 function Read-DomainsToAdd {
     # Interactive collection of the new certificates to issue (ported from v1 ~856-1153). For each
     # primary FQDN: validate format, optionally collect SANs, pick a deployment Type (IIS Web / IIS FTP
@@ -1599,15 +1621,19 @@ function Read-DomainsToAdd {
         $preRenewalScript  = Read-RenewalHook -Phase Pre
         $postRenewalScript = Read-RenewalHook -Phase Post
 
+        # Renewal lead time (issue #57; shared with the Update flow). Default 30.
+        $renewalThreshold = Read-RenewalThreshold
+
         $collected += [pscustomobject]@{
-            MainDomain        = $fqdn
-            Type              = $type
-            Guid              = $guid
-            SANs              = $sans
-            NetshIpPorts      = $netshIpPorts
-            RestartService    = $restartService
-            PreRenewalScript  = $preRenewalScript
-            PostRenewalScript = $postRenewalScript
+            MainDomain           = $fqdn
+            Type                 = $type
+            Guid                 = $guid
+            SANs                 = $sans
+            NetshIpPorts         = $netshIpPorts
+            RestartService       = $restartService
+            PreRenewalScript     = $preRenewalScript
+            PostRenewalScript    = $postRenewalScript
+            RenewalThresholdDays = $renewalThreshold
         }
         $sanStr = if ($sans.Count -gt 0) { " + SANs: $($sans -join ', ')" } else { '' }
         Write-Log "Queued: $fqdn [$type]$sanStr" -Level INFO
@@ -1618,7 +1644,7 @@ function Read-DomainsToAdd {
 function ConvertTo-DomainConfigObject {
     # Build the cert-config.json Domains[] entry for an issued domain (matches the schema Renew-Cert.ps1
     # consumes: MainDomain/Type/Guid/SANs/Thumbprint/NotAfter + optional NetshIpPorts/RestartService/
-    # PreRenewalScript/PostRenewalScript).
+    # PreRenewalScript/PostRenewalScript/RenewalThresholdDays).
     param([Parameter(Mandatory)][object] $DomainConfig, [object] $Cert)
     $cleanSans = @(); if ($DomainConfig.SANs) { $cleanSans = @($DomainConfig.SANs | Where-Object { $_ }) }
     $obj = [pscustomobject]@{
@@ -1635,6 +1661,11 @@ function ConvertTo-DomainConfigObject {
     if ($DomainConfig.RestartService) { $obj | Add-Member -NotePropertyName 'RestartService' -NotePropertyValue $DomainConfig.RestartService }
     if ($DomainConfig.PreRenewalScript)  { $obj | Add-Member -NotePropertyName 'PreRenewalScript'  -NotePropertyValue $DomainConfig.PreRenewalScript }
     if ($DomainConfig.PostRenewalScript) { $obj | Add-Member -NotePropertyName 'PostRenewalScript' -NotePropertyValue $DomainConfig.PostRenewalScript }
+    # Store the renewal lead time only when it differs from the default, so simple configs stay clean
+    # (an absent field => the script default).
+    if ($DomainConfig.RenewalThresholdDays -and [int]$DomainConfig.RenewalThresholdDays -ne $DefaultRenewalThresholdDays) {
+        $obj | Add-Member -NotePropertyName 'RenewalThresholdDays' -NotePropertyValue ([int]$DomainConfig.RenewalThresholdDays)
+    }
     return $obj
 }
 
@@ -1781,8 +1812,9 @@ function Invoke-DeleteFlow {
 
 function Invoke-UpdateFlow {
     # Issue #24: change how an already-issued cert is DEPLOYED without re-issuing it. The admin picks one
-    # managed domain and reconfigures its deployment Type/bindings (CertStore / IIS Web / IIS FTP / Netsh)
-    # and optional post-renewal service restart; the existing LocalMachine\My certificate is then re-bound
+    # managed domain and reconfigures its deployment Type/bindings (CertStore / IIS Web / IIS FTP / Netsh),
+    # optional post-renewal service restart, pre/post-renewal hooks (#13), and renewal lead time (#57); the
+    # existing LocalMachine\My certificate is then re-bound
     # per the new Type (no New-PACertificate - the domain set is unchanged). The OLD binding is left in
     # place (binding cleanup is the admin's call, same as the Delete flow). SANs / the domain set are not
     # editable here - that would change the cert and is a Delete + Add. Emits an 'update' telemetry event.
@@ -1813,7 +1845,8 @@ function Invoke-UpdateFlow {
     $curRestart = if ($selected.RestartService) { " restart=$($selected.RestartService)" } else { '' }
     $curPre     = if ($selected.PreRenewalScript)  { " pre=$($selected.PreRenewalScript)" } else { '' }
     $curPost    = if ($selected.PostRenewalScript) { " post=$($selected.PostRenewalScript)" } else { '' }
-    Write-Log "Updating $($selected.MainDomain): current Type=$($selected.Type)$curGuid$curNetsh$curRestart$curPre$curPost" -Level INFO
+    $curThresh  = if ($selected.RenewalThresholdDays) { " renewAt=$($selected.RenewalThresholdDays)d" } else { " renewAt=$($DefaultRenewalThresholdDays)d (default)" }
+    Write-Log "Updating $($selected.MainDomain): current Type=$($selected.Type)$curGuid$curNetsh$curRestart$curPre$curPost$curThresh" -Level INFO
 
     # Conflict detection in Read-DeploymentType only considers OTHER domains' netsh ports (re-selecting
     # this domain's own ports is not a conflict with itself).
@@ -1828,6 +1861,7 @@ function Invoke-UpdateFlow {
     $restartService = Read-RestartService -Current ([string]$selected.RestartService)
     $preRenewalScript  = Read-RenewalHook -Phase Pre  -Current ([string]$selected.PreRenewalScript)
     $postRenewalScript = Read-RenewalHook -Phase Post -Current ([string]$selected.PostRenewalScript)
+    $renewalThreshold  = Read-RenewalThreshold -Current ([int]$selected.RenewalThresholdDays)
 
     # Re-deploy the existing store cert per the new Type (no re-issue). If the cert is gone from the
     # store, just save the config - the next renewal deploys with the new Type.
@@ -1869,6 +1903,11 @@ function Invoke-UpdateFlow {
     elseif ($selected.PSObject.Properties['PreRenewalScript']) { $selected.PSObject.Properties.Remove('PreRenewalScript') }
     if ($postRenewalScript) { $selected | Add-Member -NotePropertyName 'PostRenewalScript' -NotePropertyValue $postRenewalScript -Force }
     elseif ($selected.PSObject.Properties['PostRenewalScript']) { $selected.PSObject.Properties.Remove('PostRenewalScript') }
+    # Renewal lead time: store only a non-default override; choosing the default clears it (issue #57).
+    if ($renewalThreshold -and $renewalThreshold -ne $DefaultRenewalThresholdDays) {
+        $selected | Add-Member -NotePropertyName 'RenewalThresholdDays' -NotePropertyValue ([int]$renewalThreshold) -Force
+    }
+    elseif ($selected.PSObject.Properties['RenewalThresholdDays']) { $selected.PSObject.Properties.Remove('RenewalThresholdDays') }
 
     $null = Save-CertConfig -Config $Config -Reason "update $($selected.MainDomain)"
     Write-EventLogEntry $EID.CertUpdated Information "Certificate config updated for $($selected.MainDomain) [$($deploy.Type)]"
@@ -2003,8 +2042,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAQM+RSc1vli1pw
-# q3KRcNia8sBSffSoZHyf7qS+Aiz6H6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCKTrc/BQhFmQN0
+# WyzaFzaDV5AFXpaX+HLRNKrM4MAaoqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2135,31 +2174,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEICwaoaQxEnVyU9PTylcCm2/FMg4E3XRSJrTy
-# kiA4QqCjMA0GCSqGSIb3DQEBAQUABIIBgK3NVzlCBk+zrNNgAhW/x+dkqs5eJfgh
-# J0LLNNlTqNfRl+gaYM6w2U5hAnZes0Y3LhIvfNlMVTcTZu9TZhzail7nu9SascD7
-# SJ+BZfx4qfLCO4KOMoxVYgqXV+x1N+JuZb862iM1gCh/FfhrIom8+VaBg6Dx1989
-# FF+EFOAjt+MYB67BXgrz7HFXR0trGAq0LePvfUjYMzVeK8RHMUe12sBg1FzcK3sw
-# U1vgpjRbVGod24B/zlaPOG+zVo3HqZ6rDkL2OhXzm/EYLKoTqKfdnScyobFFcFrt
-# IDexvUuUQld9QLfpFVxVpOvIdTyIUEa6EPV2LAoGWcVxejX7xC4BITXYlpspHg5s
-# GAHFlj1KuMoMbYFAZenTmVxSD1GrCgumw8urpl/wucgFKTXiAIFRaAZIGPFwQ3sI
-# WO4dMQT+r5ggtqCp5m+xprhlIomBCqXsNBjocIWqtZLJTt16VmGK/4DG45u4A8dX
-# aYTgessuIHp8aPNgtBfLiEqEtEAzs8vxdKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIN9wQMRj2H2cLHsjRBHpUPmgu65iL2/VdvtT
+# zzoCcypIMA0GCSqGSIb3DQEBAQUABIIBgLG5ppm0RzR35H6iC37m9O4w4Z+M+w50
+# EMziAiEj67TY/+sYMtgvkuYWHtlOrvDSy/eKNeuJOWQWaIo/A9DaCJ8oYESZPzNU
+# p6j3eUYE84Wc6k+iQGVRVKwKPf1ZnVK4YDtHTFFW7/O1s9epcUQVQLsvViHFnqf0
+# OkblvS39y1v+pPHfXiCecH95kyY8t5H3l9pmIa52PoasSzrH0Mgm1wMY68rzkFau
+# iC6IiPpz/hXLt9C0PvRU7vBNkPb0j0s434lL8UZF8B4Pn7n7GTCO8r4DQDxmT15P
+# bkw7iMGpBszUI6M1tDV2g/y9vSERVgBTGnGOlaGwjvYZ6yXwyz2loDj4mXCqGxOe
+# ZWMkgxygB9h9P9RZVqQaCv3UqGs8zX73Q/GfdEbLa75HbsH79ctBEDY8l5c0tHX5
+# C0qbboNWuWaBAZQ5ZDmNZWh0jAPCDr+muxqzNcI1+YiYjRgxjwFzzXVQq1GD3JhA
+# lorLTZDLearhu4pQAftRA1bHMB2fG/Jx0aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjIxNDA2NDNaMC8GCSqGSIb3DQEJBDEiBCAeOS8q9LcoyTJfyLFmm4wd
-# PBZPOgHEpoSbT/4AvSOPwTANBgkqhkiG9w0BAQEFAASCAgALO8EjNRnv6GTtuVHl
-# uUPk5+f/4LO6ft566CLWH9nH8/3Q7yh/OvDx7keADuZ21OvnFlb/fbZzu0hS+5t/
-# 9u23hn+5sxxf9+uUGDNtBfMXr6hSG9VouHHyJaijYPf6Bl9bph/2AP8mgSalCfxv
-# TIRkfVHqzV7xzbwPOeCuC/MKzdx7FDXQ2jrZNYeA9Cuu4IQrHQJBXojPbwhHNS0n
-# E3I+bnyP7kIdUwu0sojrcjpQGAgq+vNXxGZ98pohHzNtk36Fv3f2kJ8EYePTjVhD
-# OC45hyeyVcsrqe76zJLSdCqYgPSj+hAIR/zS5WT990gN34WT+hTBa+2PDBytqxWQ
-# GQGY2Nkl7iZWZibaZXuNU24n4uh4C2cUybxFEgfhg5+Xm34f7Uw82D0wVHRjFYWa
-# 4g74hwEAcgMh1AHLrrkOmkNfTxredX+qfT11yJ0IX1ApovdpGcFq8Sfp4D6TKUbD
-# Bh6nES6CYMhd/cgF4g7DWAs5Pr3mdA1nN22xN3LcFSNrxVUPwZfMVkJgAM5WbToP
-# zd4G8QW+jybvnhoMl5lFDNBNMcZw8PFH5kUX/AMAbwE1LCX8KkFzgp9ftfYuVBWN
-# Egt6P8+TGXUpBxuxsQzAKXhsZcrYO6Qg1khGClr+hT1AaJhEjfIGHD1DUEjXF+TI
-# /ti1/XFg8BpUvfp+suhAfgoP/g==
+# Fw0yNjA2MjMwNjM3MjdaMC8GCSqGSIb3DQEJBDEiBCD0jKig+swGVwt/8kKSkEAa
+# E6e7zqbxehoC1WbC3g8XpDANBgkqhkiG9w0BAQEFAASCAgAYp/6vAVV2nznnERtk
+# 5CKyfO+g/Kt/4MEIKWlZQNdsM/k2fHUbzOPEDzU9irCh8KzSArA6f9t/kZNbAXKd
+# Tg9xEjrcSkrov0yFt11zlXcdK4vkK6OTnejgrymAC2+okfv8YvC0NZDLgsDz9vAP
+# T0CQ0mz8VyEA3jfpBDqAP01loC5VY6gX7PYvcdbTMoSZ3B4aouE8b5WcvCfb+zel
+# mSV4ZOLXITJBO4xMYNxhVeaeOScQoPRYfmeV5RLGZvBuYGeaRG/2YSV8orHHSQ21
+# Vll3tZG503lKX1SioAH2JLoZzcndV2gRXQo1QhZ9AQSp3a6OcPoI8AeKEbkX891R
+# 50M0AhZjIn7/jw/SM1JyLNJZ/BHFdWe7tDV+ugODyv7fmpLegrJWnQW4psKmZr5y
+# Zq0ghlqBG+Xm7eiNhPSzHkBGXyULOtR0qyXGstBQG0exMt5zFDGxzjhS71EDPQN3
+# SZ2Vk6Y63m7ky+79v1+KF2FiKS7Zu8nB1RAmjYCFrHpD6OXrIqgzH92zLwU4XB+n
+# zRzi4Rex9Mhz61WF+bV9o5fXHoqMQRNFfWdR9nwI7GKxydZOP63LGD/m6W63hIeU
+# Q/aQOdkNREtpOP7yFsoKPg78iLg6HSCEIswOt6UB0rdUpa/nru6bCZbrmhxKBx4O
+# Qwthm2/xoVJmU9oq5k8XwrBa0Q==
 # SIG # End signature block

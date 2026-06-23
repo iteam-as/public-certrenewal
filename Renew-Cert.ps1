@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.1'
+$ScriptVersion = '2.1.2'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1416,14 +1416,26 @@ function Invoke-RenewalCore {
             # --- Expiry check + renewal ---
             $expiryDate = $cert.NotAfter
             $daysToExpiry = ($expiryDate - (Get-Date)).Days
-            Write-Log "Certificate expires $expiryDate ($daysToExpiry days)" -Level INFO
+            # Per-domain renewal lead time (config.RenewalThresholdDays), else the script default. Tolerant
+            # of a hand-edited config: a non-numeric / <=0 value falls back to the default with a warning.
+            $threshold = $RenewalThresholdDays
+            if ($domainConfig.PSObject.Properties['RenewalThresholdDays']) {
+                $parsedThreshold = 0
+                if ([int]::TryParse([string]$domainConfig.RenewalThresholdDays, [ref]$parsedThreshold) -and $parsedThreshold -gt 0) {
+                    $threshold = $parsedThreshold
+                }
+                else {
+                    Write-Log "Ignoring invalid RenewalThresholdDays '$($domainConfig.RenewalThresholdDays)' for $domain; using default $RenewalThresholdDays." -Level WARNING
+                }
+            }
+            Write-Log "Certificate expires $expiryDate ($daysToExpiry days; renew at <= $threshold days)" -Level INFO
 
-            if (-not $Force -and $daysToExpiry -gt $RenewalThresholdDays) {
+            if (-not $Force -and $daysToExpiry -gt $threshold) {
                 Write-Log "Certificate for $domain is still valid ($daysToExpiry days remaining). No renewal needed." -Level INFO
                 continue
             }
-            if ($Force -and $daysToExpiry -gt $RenewalThresholdDays) {
-                Write-Log "Force: renewing $domain now despite $daysToExpiry days remaining (threshold $RenewalThresholdDays)." -Level WARNING
+            if ($Force -and $daysToExpiry -gt $threshold) {
+                Write-Log "Force: renewing $domain now despite $daysToExpiry days remaining (threshold $threshold)." -Level WARNING
             }
 
             if ($DryRun) {
@@ -1439,8 +1451,8 @@ function Invoke-RenewalCore {
                 continue
             }
 
-            if (-not ($Force -and $daysToExpiry -gt $RenewalThresholdDays)) {
-                Write-Log "Certificate expires in $RenewalThresholdDays days or less. Initiating renewal..." -Level WARNING
+            if (-not ($Force -and $daysToExpiry -gt $threshold)) {
+                Write-Log "Certificate expires in $threshold days or less. Initiating renewal..." -Level WARNING
             }
             # Pre-renewal hook (config.PreRenewalScript) - best-effort; a failure never blocks the renewal.
             if ($domainConfig.PSObject.Properties['PreRenewalScript'] -and $domainConfig.PreRenewalScript) {
@@ -1448,14 +1460,16 @@ function Invoke-RenewalCore {
                     -Thumbprint $cert.Thumbprint -NotAfter ($cert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
             }
             try {
-                # Submit renewal with retry. If the ACME server has pruned stale authorizations for
-                # the existing order (common when ARI signals "renew AS SOON AS POSSIBLE"),
-                # Submit-Renewal fails with "Cannot bind argument to parameter 'AuthURLs' because it
-                # is null." Recover by retrying with -Force, which forwards to New-PACertificate
-                # -Force and creates a fresh order with new authorizations while preserving stored
-                # plugin args and DnsAlias.
+                # Submit renewal with retry. The script -Force forwards to Submit-Renewal -Force so the
+                # cert is re-issued even when ARI says it is not in the renewal window yet (genuine forced
+                # rotation, not just bypassing our local threshold). If the ACME server has pruned stale
+                # authorizations for the existing order (common when ARI signals "renew AS SOON AS
+                # POSSIBLE"), Submit-Renewal fails with "Cannot bind argument to parameter 'AuthURLs'
+                # because it is null." Recover by retrying with -Force, which forwards to New-PACertificate
+                # -Force and creates a fresh order with new authorizations while preserving stored plugin
+                # args and DnsAlias.
                 Invoke-WithRetry -OperationName "Certificate renewal for $domain" -MaxRetries 3 -InitialDelaySeconds 10 -ScriptBlock {
-                    try { Submit-Renewal -MainDomain $domain }
+                    try { Submit-Renewal -MainDomain $domain -Force:$Force }
                     catch {
                         if ($_.Exception.Message -match 'AuthURLs|Authorization not found|No such authorization') {
                             Write-Log "Stale authorization state detected for $domain. Retrying with -Force to create a fresh order..." -Level WARNING
@@ -1521,7 +1535,7 @@ function Invoke-RenewalCore {
                         if ($oldCert.Thumbprint -eq $newCert.Thumbprint) { continue }
                         $oldDays = ($oldCert.NotAfter - (Get-Date)).Days
                         try {
-                            if ($oldDays -le $RenewalThresholdDays) {
+                            if ($oldDays -le $threshold) {
                                 Write-Log "Removing old certificate $($oldCert.Thumbprint) (expires $($oldCert.NotAfter), $oldDays days)" -Level INFO
                                 Remove-Item -Path "Cert:\LocalMachine\My\$($oldCert.Thumbprint)" -Force -ErrorAction Stop
                             }
@@ -1726,8 +1740,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDHs7HPjz/zu/2T
-# OHHH0JZWvIyRp8SWpbe0DbL+8u86jKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBTw7QLAXK58TtM
+# +5l3vUtAJJ22DcUx6+LEU4A/Dc0bqKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1858,31 +1872,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIOWUAEaYIy35MwJWTHvcg+zFKt8XYfbYvByP
-# 5o6rLud0MA0GCSqGSIb3DQEBAQUABIIBgA32ZO7AT5mOVH2A7xN0rppjN1zLbhTt
-# bB4R+q/U9vtoQEt9lQTb1yQytP13ODsgaZ9/Z1wSS3k6lJo2gK01R9YrBuV0xXBv
-# oIBrnj13sR2CR7I2ed5riYcxeIEADzD/oDxNNvDzlnFXa+uTyOkhZfrbqHjl1lee
-# KyqNr09skn9ImGwsoOFy7vbgm+fbKWZAsxVK7Wg2XRv3ZSehIbtyCLon5qSsGZ5Z
-# IgA1cGMbV1LIakrvPS9YeaTS+F5StRuqtUi2W+37md+1u+0nDq1wHplYchfkboD4
-# NYqpaPQr8N+qaWbISFuhGf9XFNhdkvW4csbxbgW/dwxq/40CMvyo9UpFESQ+RIon
-# /c31sdOB72pVDk7Q3+V/iDp9QqIaF74NfQQMrf3H5gHINM2dNKoTmAa+wcMeiidj
-# 9at4r1IUsCJFnwTMbU0dRxeMwmfqOgnWEAkpW4EsJ7U6mhLDuBNcDc7HR0kKj1lV
-# OpjhgkO50xxXdOH71qOxxpd7Zzzq59SwXKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEy/GJrMozanCOCC8F77BbTxmGgJ3jaKmf0B
+# fvcAAigoMA0GCSqGSIb3DQEBAQUABIIBgDNP/QgxzFFd4R7YqzfxDiI4jvzX/McZ
+# v6sZ01YPcdny4Cklk+MAiQi4qt5j6WAYUEoa+3F9yCzeGsIyTwotVcCDKfQzZOHs
+# Tc9XkMPHpLTIkA1OYnxqYFfXTDXNw0Yh5gM2QPiI8yO5Rx959Z0RpDso6kMV/zFU
+# rCZQJCFWH9SK4o46WO7ze9YldT9p28y3FQzKoEpQX7QDatQyTo7grRymjoCC9Ciu
+# cZ/yp5xR47I5LHOuPBraq12Y6dtR7v/bj9WFDtXPmNXrKoQZHndi5C2tpiKAmMsh
+# kfc024VGReVzBoOAnJ3p9k3W2mOON/t8/2myW4jumYG+99qslAc2aVfsSUwdMlIo
+# kksSB29gDX91xQgYd8TpTLq0Pzf1iIqkTHUPwtsiBfJIG5C1hH00Oy0Q5P550BGh
+# SDJ6sorFx9VxmEjM+r0CKr+f1vFHx43qX/Dmit6WoSamDjwprCIEtcv2LoPV4Cnr
+# IIqw03mw8LXcSnemy8GMClgxbo+BDx6h3aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjIxNDA2NDRaMC8GCSqGSIb3DQEJBDEiBCDQ0ZElXhmvTVu9mrUd1ENL
-# MKuiDFA+Yi+xr9kO+R4/7DANBgkqhkiG9w0BAQEFAASCAgBGwR7auBaN950Wo7xr
-# OYhCJ6BMw4R6sVK8ZTvHQemgGGU3ZDGQZVeAQackrYsKV31QstXQhvHS3xKIUt/X
-# IrN2TsY0mJsEQJqgSo6WZqDZbZh0o1YJJNkBkMcOUBCGcABGp42pmp2weQN6yxu/
-# Q0bAHrsbUVGCVx6xcWVFj4CaHSJFZab9haKnlZw+xelaw22rTvvnO0K+XnZ+UqYH
-# tAKKr2trbfJ7VEw6/JF/beM63+/GIUZx0zxFsBkvkBpw62NgAviXm6AA7HrIjmI1
-# 3Fc01h/jsaRdiXiKHsSnkXenZlCK0vGU2gso5ny2joGv5fQA0krz8NDGc4wH6qIR
-# l5W/P4GL6e05Z6GWO58X1XnlVdevbEPyxEA4TbcWFrMYczcIpNBWdgPYLD3VUhM0
-# J1RVgBrgAmGA+ICGPWlyo4qhaxEX1X8jxlb2GibFZPqOkViRj3cyrVRuxEj+2r0k
-# 5yNk4QOs5yZ0xc44zNOiAbAS2rKLPsTuMEQGVaClpB8NHdcBK0om7bbF8Gb2OH7u
-# evNvm7I6MQLvMoZYI/fwUJPvHmzkPPhyoXKWPTVIvJ0t6uUTZMPa5S2gr/jGb4aR
-# ph4QKsTcGBID5Lb2wWcXTPvVlPc2ESSy02LRGqmJ991ti77fPLW+G1XQAoL6RlSs
-# 4ty5voWeg/bz98AA6PwygjBL+w==
+# Fw0yNjA2MjMwNjM3MjhaMC8GCSqGSIb3DQEJBDEiBCDK1mnYBzbSLEOb9M20ePBo
+# DaRr6KpejSrNe8t0UsS6lzANBgkqhkiG9w0BAQEFAASCAgDIZmmlP/5B0PNmLGOl
+# 6cbaKpsGPUNjuSwqNcTvsUinZ+K9o07AnZBN3Ps/6rIHIhyi5584dfU5FlawkKMS
+# ptOEAdFYu/uDheHl4W7kMzfEL5xzPISYg28kYpGhxl/bhvBzfh2J/N5kjQlq7IDi
+# T+HBoRYpB4Y7aRUV7Jtqbaf7ae0vPu6PlIe+1tn48tCG8lAB4Do8hxCQgHtJdXhB
+# 7hPBJeTN1teWTycvlqJsU3wA8L6MZbYj5JtE1ifFLTiLqt7xc0sq54lxR3zBl7eK
+# R7QCGyhR14oNrQ5N+43tVhZlzhaVwQ1NxPHOGx9oa2wy5CLRgYqnJeCkVshIN2Dx
+# h4gMYGHRO8pE846ppTLduaRy8e81Pqu27ky+/OaxGvzedlglWvobRtrFU/gVc39p
+# FERAiNuGIxtnbvxSVCUWLRoRKNF6NbaWSMawAVtUAp/Yg9fY/YMGVnlw+HoGV7qS
+# CpD/+2VbfaG6kyfd4bPdhPki4Vxbi4s51ww28uXGNwsElqvDys2zuHg6TthpwGWn
+# lIbFgPsCgJw1u7+pRaNIipzQmnQ3eDWCePwuwC6NpyiYnBwsIamkDomcSt3qXJ/4
+# wAHLQm2uHsWvwYszYsnq1NedLVczqAGEsJDSu6wNTXYPJ+di4cty7L/n7doDKWE9
+# FyZG7QYehoQvJfmxFth2eiw02w==
 # SIG # End signature block
