@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.3'
+$ScriptVersion = '2.2.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -292,17 +292,21 @@ function Get-TelemetryAccessToken {
 }
 
 function Send-Telemetry {
-    # One structured event per run to the Azure Monitor Logs Ingestion API -> CertRenewal_CL
+    # One batched POST per call to the Azure Monitor Logs Ingestion API -> CertRenewal_CL
     # (docs/telemetry-log-analytics-setup.md section 2/4). This is the fleet liveness/inventory/billing
     # signal (no periodic Teams heartbeat). BEST-EFFORT: any failure (no Telemetry config, missing cert,
     # token/POST error) logs locally and returns - it never throws and never blocks the caller, mirroring
     # the Teams "never block" rule. DryRun -> log only, no POST. SP identity + DCR coordinates come from the
     # cert-config.Telemetry block (written by bootstrap); skipped cleanly if absent/disabled.
-    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule): $Outcome.Action
-    # names the event (renew/create/delete/secrets-sync/self-update/bootstrap/migrate/...); renewal omits it
-    # (defaults to 'renew'). Renewal-only fields (CertCount/Certificates/NextExpiry*) and $SelfUpdateStatus
-    # default cleanly when a caller doesn't set them.
-    param([object] $Config, [object] $Outcome)
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule). $Outcome is one OR
+    # many event objects (PowerShell auto-wraps a single object); one CertRenewal_CL row is built per event
+    # and ALL are sent in a single POST. $o.Action names the event (renew/create/delete/secrets-sync/
+    # self-update/bootstrap/migrate/cert-renewed/service-restarted/pre-hook/post-hook/...); when omitted it
+    # defaults to 'renew'. Renewal-only fields (CertCount/Certificates/NextExpiry*/Domain) and
+    # $SelfUpdateStatus default cleanly when a caller doesn't set them. $o.TimeGenerated, when set,
+    # preserves the event's real time (the renewal stamps each work-event when it happens); otherwise the
+    # row is stamped at send time.
+    param([object] $Config, [object[]] $Outcome)
 
     $t = $Config.Telemetry
     if (-not $t -or -not $t.Enabled) { Write-Log 'Telemetry not enabled (no cert-config.Telemetry block); skipping.' -Level DEBUG; return }
@@ -310,46 +314,69 @@ function Send-Telemetry {
         if ([string]::IsNullOrWhiteSpace([string]$t.$f)) { Write-Log "Telemetry block missing '$f'; skipping telemetry." -Level WARNING; return }
     }
 
-    $billing       = $Config.Billing
-    $action        = if ($Outcome.Action) { [string]$Outcome.Action } else { 'renew' }
-    $nextExpiryUtc = $null
-    if ($Outcome.NextExpiry) { try { $nextExpiryUtc = ([datetime]$Outcome.NextExpiry).ToUniversalTime().ToString('o') } catch { } }
-
-    $row = [ordered]@{
-        TimeGenerated    = (Get-Date).ToUniversalTime().ToString('o')
-        ServerName       = $env:COMPUTERNAME
-        Abr              = [string]$billing.Abr
-        CustomerName     = [string]$billing.CustomerName
-        CustomerNr       = [string]$billing.CustomerNr
-        InvoiceCode      = [string]$billing.InvoiceCode
-        Service          = 'CertRenewal'
-        Action           = $action
-        ScriptVersion    = $ScriptVersion
-        RunOutcome       = [string]$Outcome.RunOutcome
-        SelfUpdateStatus = [string]$SelfUpdateStatus
-        CertCount        = [int]$Outcome.CertCount
-        NextExpiryUtc    = $nextExpiryUtc
-        NextExpiryDomain = [string]$Outcome.NextExpiryDomain
-        Certificates     = @($Outcome.Certificates | Where-Object { $_ })
-        Message          = [string]$Outcome.Message
+    $billing = $Config.Billing
+    $rows = foreach ($o in $Outcome) {
+        $action        = if ($o.Action) { [string]$o.Action } else { 'renew' }
+        $nextExpiryUtc = $null
+        if ($o.NextExpiry) { try { $nextExpiryUtc = ([datetime]$o.NextExpiry).ToUniversalTime().ToString('o') } catch { } }
+        $stamp         = if ($o.TimeGenerated) { [string]$o.TimeGenerated } else { (Get-Date).ToUniversalTime().ToString('o') }
+        [ordered]@{
+            TimeGenerated    = $stamp
+            ServerName       = $env:COMPUTERNAME
+            Abr              = [string]$billing.Abr
+            CustomerName     = [string]$billing.CustomerName
+            CustomerNr       = [string]$billing.CustomerNr
+            InvoiceCode      = [string]$billing.InvoiceCode
+            Service          = 'CertRenewal'
+            Action           = $action
+            ScriptVersion    = $ScriptVersion
+            RunOutcome       = [string]$o.RunOutcome
+            SelfUpdateStatus = [string]$SelfUpdateStatus
+            CertCount        = [int]$o.CertCount
+            NextExpiryUtc    = $nextExpiryUtc
+            NextExpiryDomain = [string]$o.NextExpiryDomain
+            Certificates     = @($o.Certificates | Where-Object { $_ })
+            Domain           = [string]$o.Domain
+            Message          = [string]$o.Message
+        }
     }
+    $rows = @($rows)
 
     if ($DryRun) {
-        Write-Log ("[DryRun] WOULD emit telemetry: action={0} server={1} outcome={2} certs={3}" -f `
-            $row.Action, $row.ServerName, $row.RunOutcome, $row.CertCount) -Level INFO
+        Write-Log ("[DryRun] WOULD emit telemetry: {0} event(s): {1}" -f `
+            $rows.Count, (($rows | ForEach-Object { $_.Action }) -join ', ')) -Level INFO
         return
     }
 
     try {
         $token = Get-TelemetryAccessToken -TenantId $t.TenantId -AppClientId $t.AppClientId -CertThumbprint $t.CertThumbprint
-        $body  = ConvertTo-Json @($row) -Depth 6
+        $body  = ConvertTo-Json @($rows) -Depth 6
         $uri   = "$($t.EndpointUri)/dataCollectionRules/$($t.DcrImmutableId)/streams/$($t.Stream)?api-version=2023-01-01"
         $resp  = Invoke-WebRequest -Method Post -Uri $uri -UseBasicParsing -TimeoutSec 20 `
             -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body $body
-        if ($resp.StatusCode -eq 204) { Write-Log "Telemetry event accepted (204, action=$($row.Action))." -Level SUCCESS }
+        if ($resp.StatusCode -eq 204) { Write-Log ("Telemetry accepted (204, {0} event(s))." -f $rows.Count) -Level SUCCESS }
         else { Write-Log ("Telemetry POST returned unexpected status {0}." -f $resp.StatusCode) -Level WARNING }
     }
     catch { Write-Log "Telemetry send failed (non-fatal): $($_.Exception.Message)" -Level WARNING }
+}
+
+function New-TelemetryEvent {
+    # RENEWAL-ONLY helper (NOT part of the shared/diff-able set - the creator/bootstrap emit single events
+    # directly). Builds one pre-stamped work-event consumed by Send-Telemetry's per-event loop so the LA
+    # timeline reflects when the work actually happened (TimeGenerated stamped here, at the event).
+    param(
+        [Parameter(Mandatory)][string] $Action,
+        [string] $Domain,
+        [string] $RunOutcome,
+        [string] $Message
+    )
+    [pscustomobject]@{
+        Action        = $Action
+        Domain        = $Domain
+        RunOutcome    = $RunOutcome
+        Message       = $Message
+        TimeGenerated = (Get-Date).ToUniversalTime().ToString('o')
+    }
 }
 
 function Invoke-SelfUpdate {
@@ -1106,6 +1133,9 @@ function Invoke-RenewalHook {
     # a failed Post hook rolls nothing back). -DryRun => log WOULD + no-op. Only non-secret cert metadata
     # is exported/logged. The hook runs as SYSTEM (the renewal task identity) - operations-guide documents
     # that the .ps1 must therefore live somewhere only admins can write.
+    # RETURNS a status string ('Ran' | 'Failed' | 'Skipped' | 'DryRun') so the caller can emit a telemetry
+    # event - callers MUST capture it. Hook stdout/stderr is routed to the DEBUG log so it can never leak
+    # into the renewal output stream (PS implicit-output trap) and corrupt the run outcome.
     param(
         [Parameter(Mandatory)][string] $ScriptPath,
         [Parameter(Mandatory)][ValidateSet('Pre', 'Post')][string] $Phase,
@@ -1120,12 +1150,12 @@ function Invoke-RenewalHook {
         [System.IO.Path]::GetExtension($ScriptPath) -ne '.ps1') {
         Write-Log "Skipping $label for ${domain}: '$ScriptPath' is not an existing .ps1 file." -Level WARNING
         Write-EventLogEntry $EID.HookFailed Warning "$label skipped for ${domain}: '$ScriptPath' not found or not a .ps1"
-        return
+        return 'Skipped'
     }
 
     if ($DryRun) {
         Write-Log "[DryRun] WOULD run $label '$ScriptPath' for $domain." -Level INFO
-        return
+        return 'DryRun'
     }
 
     Write-Log "Running $label '$ScriptPath' for $domain..." -Level INFO
@@ -1136,12 +1166,18 @@ function Invoke-RenewalHook {
         CERTRENEWAL_HOOK_THUMBPRINT = [string]$Thumbprint
         CERTRENEWAL_HOOK_NOTAFTER   = [string]$NotAfter
     }
+    $status = 'Ran'
     try {
         foreach ($k in $hookVars.Keys) { Set-Item -Path "Env:$k" -Value $hookVars[$k] }
         $global:LASTEXITCODE = 0
-        & $ScriptPath
+        # Capture hook stdout/stderr into a local (then DEBUG-log it) so it can never leak into this
+        # function's output stream and corrupt $outcome upstream (PS implicit-output trap). Assigning the
+        # invocation (rather than piping) keeps $LASTEXITCODE reliably the hook's own exit code.
+        $hookOutput = & $ScriptPath 2>&1
         $exit = $LASTEXITCODE
+        foreach ($line in $hookOutput) { Write-Log "  [$label] $line" -Level DEBUG }
         if ($exit) {
+            $status = 'Failed'
             Write-Log "$label '$ScriptPath' for $domain exited with code $exit." -Level WARNING
             Write-EventLogEntry $EID.HookFailed Warning "$label for ${domain} exited with code $exit ('$ScriptPath')"
         }
@@ -1150,12 +1186,14 @@ function Invoke-RenewalHook {
         }
     }
     catch {
+        $status = 'Failed'
         Write-Log "$label '$ScriptPath' for ${domain} failed: $($_.Exception.Message)" -Level WARNING
         Write-EventLogEntry $EID.HookFailed Warning "$label for ${domain} failed: $($_.Exception.Message)"
     }
     finally {
         foreach ($k in $hookVars.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
     }
+    return $status
 }
 
 function Invoke-RenewalCore {
@@ -1172,6 +1210,9 @@ function Invoke-RenewalCore {
     $renewedDomains = @()
     $criticalError = $null
     $webhook = $Secrets.TeamsWebhookUrl
+    # Discrete per-domain work-events (cert-renewed / service-restarted / pre-hook / post-hook), each
+    # stamped when it happens; sent alongside the summary 'renew' row in one batched POST (issue #61).
+    $renewalEvents = [System.Collections.Generic.List[object]]::new()
 
     try {
         # --- Posh-ACME environment (shared store, spec section1/section3) ---
@@ -1456,8 +1497,9 @@ function Invoke-RenewalCore {
             }
             # Pre-renewal hook (config.PreRenewalScript) - best-effort; a failure never blocks the renewal.
             if ($domainConfig.PSObject.Properties['PreRenewalScript'] -and $domainConfig.PreRenewalScript) {
-                Invoke-RenewalHook -ScriptPath $domainConfig.PreRenewalScript -Phase Pre -DomainConfig $domainConfig `
+                $hookStatus = Invoke-RenewalHook -ScriptPath $domainConfig.PreRenewalScript -Phase Pre -DomainConfig $domainConfig `
                     -Thumbprint $cert.Thumbprint -NotAfter ($cert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
+                $renewalEvents.Add((New-TelemetryEvent -Action 'pre-hook' -Domain $domain -RunOutcome $hookStatus -Message ([string]$domainConfig.PreRenewalScript)))
             }
             # Heal a v1-migrated order whose DnsVariant was serialized empty by an older Posh-ACME: the newer
             # module's Submit-Renewal/New-PACertificate reject '' (ValidateSet dns-01,dns-account-01) and the
@@ -1500,6 +1542,9 @@ function Invoke-RenewalCore {
                 Write-Log 'Certificate installed to LocalMachine\My.' -Level SUCCESS
                 $renewedCount++
                 $renewedDomains += $domain
+                $forcedNote = if ($Force) { ', forced' } else { '' }
+                $renewalEvents.Add((New-TelemetryEvent -Action 'cert-renewed' -Domain $domain -RunOutcome 'Renewed' `
+                    -Message ("{0} -> {1} ({2}d to expiry{3})" -f $cert.Thumbprint, $newCert.Thumbprint, $daysToExpiry, $forcedNote)))
 
                 $bindingSuccess = $false
 
@@ -1571,6 +1616,7 @@ function Invoke-RenewalCore {
                 # Optional service restart (config.RestartService)
                 if ($domainConfig.PSObject.Properties['RestartService'] -and $domainConfig.RestartService) {
                     $serviceName = $domainConfig.RestartService
+                    $svcStatus = 'Ok'
                     Write-Log "Restarting Windows service: $serviceName..." -Level INFO
                     try {
                         $svc = Get-Service -Name $serviceName -ErrorAction Stop
@@ -1581,17 +1627,20 @@ function Invoke-RenewalCore {
                             Write-Log "Service '$serviceName' restarted after renewal of $domain (Status: Running)" -Level SUCCESS
                         }
                         else {
+                            $svcStatus = 'Unexpected'
                             Write-Log "Service '$serviceName' restarted but status is $($svc.Status) after renewal of $domain" -Level WARNING
                         }
                     }
-                    catch { Write-Log "Failed to restart service '$serviceName' after renewal of ${domain}: $($_.Exception.Message)" -Level ERROR }
+                    catch { $svcStatus = 'Failed'; Write-Log "Failed to restart service '$serviceName' after renewal of ${domain}: $($_.Exception.Message)" -Level ERROR }
+                    $renewalEvents.Add((New-TelemetryEvent -Action 'service-restarted' -Domain $domain -RunOutcome $svcStatus -Message ([string]$serviceName)))
                 }
 
                 # Optional post-renewal hook (config.PostRenewalScript) - best-effort; runs after a
                 # successful renew + deploy, with the NEW thumbprint/expiry in the environment.
                 if ($domainConfig.PSObject.Properties['PostRenewalScript'] -and $domainConfig.PostRenewalScript) {
-                    Invoke-RenewalHook -ScriptPath $domainConfig.PostRenewalScript -Phase Post -DomainConfig $domainConfig `
+                    $hookStatus = Invoke-RenewalHook -ScriptPath $domainConfig.PostRenewalScript -Phase Post -DomainConfig $domainConfig `
                         -Thumbprint $newCert.Thumbprint -NotAfter ($newCert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
+                    $renewalEvents.Add((New-TelemetryEvent -Action 'post-hook' -Domain $domain -RunOutcome $hookStatus -Message ([string]$domainConfig.PostRenewalScript)))
                 }
 
                 # Persist new certificate details
@@ -1679,6 +1728,7 @@ function Invoke-RenewalCore {
         NextExpiryDomain = $nextExpiryDomain
         Certificates     = $certificates
         Message          = $message
+        RenewalEvents    = @($renewalEvents)   # discrete work-events, sent with the summary in one POST
     }
 }
 
@@ -1731,7 +1781,9 @@ try {
         if ($outcome.RunOutcome -eq 'Success') { Write-EventLogEntry $EID.RenewSuccess Information 'Renewal run succeeded' }
         elseif ($outcome.Failures.Count -gt 0)  { Write-EventLogEntry $EID.RenewFailure Error "Renewal run had $($outcome.Failures.Count) failure(s)" }
 
-        Send-Telemetry -Config $config -Outcome $outcome   # best-effort liveness/inventory/billing event
+        # Best-effort liveness/inventory/billing event (the 'renew' summary) + the discrete per-domain
+        # work-events, all in one batched POST. The summary defaults Action='renew' and carries no Domain.
+        Send-Telemetry -Config $config -Outcome (@($outcome) + @($outcome.RenewalEvents))
 
         # Exit-code policy (spec section10): 0 even on partial/total renewal failure - Teams + telemetry are the signal.
         Write-Log "=== Renew-Cert finished (outcome=$($outcome.RunOutcome)) ===" -Level SUCCESS
@@ -1754,8 +1806,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA8Gpx8+pfMJ+76
-# XuyW5sDGPLn9411F/5A1Fg+2eeedMKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCuzltxqBpYAwqh
+# QbMGaGNfEGdr3neq8VZGru787K6626CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1886,31 +1938,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIB/lb4PJ0Q0jKqUiVSJNbssDU3a+MELx6pC7
-# IRwbHIi6MA0GCSqGSIb3DQEBAQUABIIBgJSSCMbKYz1n7XTs4fNG0aOOJ6dm+KJN
-# BNnimU0fCYioqKswdnOU2a60e3xNNm3SIr0zqSIpttobD9a8oRyyznm/LRtFVaTT
-# oSnPUSZqG6Lu3MD8VCN4l6X5OxVM8Uo5nnjrYfWYK2puLOB94r0gG+xV+ZBaH5mb
-# J1xdTt8LdSJJG7tfZLEcp7dWYJf72aX/fDaaAHhf+LM56AgBoDlUQY+tyfoa7Ti7
-# tVJ6ik+H8RTkO0bHAz9JG3ghFJhkxDRBjGLMh1u2IgMIp3tcyu4piS6w/pruoo5L
-# 0KAk/GG35R+X24LkeWep4jv/G5grDbOmGz6pa1n4oMBr/SEgKHH1NhZsth2PCUog
-# +AR2wEPW0DA6LhxgMXmki3ErHBHEJ20OZFUE28aLCoILmiVzJnuYziVVzGmvoUzK
-# ovL+nO8m5rZo8eAFQVzEQGITpjF0RVtpTIGlGfs+dDHkmneJoAWvr9wwJQPxydsg
-# CUo0vuY3dqoEkF24p9l/hQd00/JcPZdyvKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFH536JaMofm5i11jd1ZNYtzZ/UBPCCLKdmS
+# EBMZi8NAMA0GCSqGSIb3DQEBAQUABIIBgA8ECI8Db9VTKyKOyMhf68pl53l2cluo
+# JosJ0LmT6PCTCMMeTD1GquWkjw+QS2qgRIq2tZQFM1lPSIhi0UQA3Ql2++4c0kay
+# TevpsAb9r/6jVZ/BeuavyQVqVCl6nIOy2D183tadcSgubJmLovLyHYrkzsD5KhAy
+# Km2JcYrtEmTf9lVxGeZwPmSm3t7xN8B5Rkt7/s1R4kH6zYR30FlsXKd3uE2ZFfWL
+# SZclAhgl7Z2YrrmMLqK3QFTzYrXmCeIDwKCIMaLkjTxrBf77ZjLIff1GmKPpWIYk
+# 8Sl4E8i9JK0u9AuGaOYOCGgRitvO+NmkMpHrQ9kB3X5fIN+hTNJEu+50pTa4l2Ek
+# UdXivJPDeLarDLhjCkztQh5o57YbildFwLcvtf87JjnQapSm+HUHq1e4e0xceh0w
+# 8jJSMloY426cZFhSXZpDflWxC1wmhuaPBXfjX+3F3mWI4XmNKme9OD8bOI/a/ejG
+# 0pEamOCHayNMB6oAeZaowaS+oaWeODykhKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjMwNzE0NTlaMC8GCSqGSIb3DQEJBDEiBCC5esZR8TwZ+cA8gyxDgqLc
-# DydQahdeN8pChQReDYJi2DANBgkqhkiG9w0BAQEFAASCAgBEuUmRjWVzlvOnvVwR
-# vg8/0dkaDOeEQ2dTXyRZupM3pKShFXoEoj5Tfrs7nZesAnHXaLi2WApNGPY3da13
-# Myn+RfkExWndDi8bs75+HCdE7LfU+E7JqyXAniW1PR1E4/Vs7cvoS5Yed2zUx9UA
-# x/coyjbC+AIDH0jzo8is6LV8KUAPcYdUbDw6No3p4Gd72gYdGFd9/lIHIaIj+hJO
-# 5QTcRh/y0NLGtBXwPGzEFie64q2ytnpCeoNh8thS0nf+oOZiIYmPSPo2eEmMJuJV
-# j69FpiSrkz26PTITZP0VCsL3joH0xd/b2pPTjsIHnjVhyY9ApVB0Slg3H3T7pL/s
-# VYjc48thIkAdKgjh6Ks16yD9YiCdQrWmSXuurvbjdZVUlrmv8CZT2UdNGQj2IW2L
-# hYm8XW+JL3I1rknPtEHB5vi9UqWzDxAUgzphIBsYDf0cc9tgzxXK2suhOzjCeOgv
-# 6c4rWaKuImcWSxqr/ShUpWk9L00xFwrqerAJQ49fjtVV4DEE4VQu0hM+3/9G3KnC
-# VBAl7wlWzBDv+4IEG4zc3Jo7znQcqSvkJZ9L8s/5hahN1WI835dxz2c9h6K1IoJM
-# jwzyzOiDpHYr+aJ04x9ymIKQx68Y18yPlXGYEaxMORPU3333t9vhqy+30K6t4TIE
-# mh4faslBCEoUWm/tIoQQa6xqYg==
+# Fw0yNjA2MjMwNzQyMTRaMC8GCSqGSIb3DQEJBDEiBCDc5OrSpMekgMA1ZyyPc3UO
+# 8///fdv0vBQFaN2y44C55zANBgkqhkiG9w0BAQEFAASCAgC5iz99mreie/2cYDOc
+# 7ul77SXckemNhw+XrxmDrANRl/idfXoQatCxWqwnlxLacxWPPNmCtnAp8aqr0zHi
+# kwaj/r9AIzB5fNXpFv43+r8PcqlYk049p+Dtey7n3WvnNrHqaXUaBoL5ionIPNO9
+# QOKPHaH9EkWWeU/qe3dXmZ2T7Sm1za6/9OjMzZuq3tvdDe3d4x7dbR/l3TJmNEUr
+# DS1DMZFDT6Y7/RD20IbdGCScZ31O544Bkjr5T9hNFZV1NVzqa4SwMJdJNqotVfeA
+# Wf1G75yo5DW4dywWJ+JO5B/YZ7Cabsnurn4y4u30Cy03ZGGYig24gqRMk2vZNU5E
+# K0NbA2/EYApbYDC+T4lHZDRG/ZJ2/KuajODK1cHr3mVU0mSCWv5YvbMDiCrknnDC
+# ZIiSxQfU6tilvjJGKJQ+tEURvX/x9MSvAcSFIlzGWPA/RLmYvrnTFDsiWZEjOoY7
+# FAq+hIj4sI6T1/jVnE63kLNGh7h6S7OvMpv2WzyqjTEsP1mfOWWYPZ7Np3ojj55r
+# ryz501USO3F9gvoElnVwpSAEHKiVoNfY3MzBuik7AnWfsVF9dDLILh1bfrTY2lUQ
+# Bcdo0X45503LuzHx9tJfKTUmQ9+9nlaBX4/UCOtMcEzdU4rhnk/uB3vu4AjHK748
+# AormqAYMzxjPff2eee+UKK/ajQ==
 # SIG # End signature block

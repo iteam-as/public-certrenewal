@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.3'
+$ScriptVersion = '2.2.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -324,17 +324,21 @@ function Get-TelemetryAccessToken {
 }
 
 function Send-Telemetry {
-    # One structured event per run to the Azure Monitor Logs Ingestion API -> CertRenewal_CL
+    # One batched POST per call to the Azure Monitor Logs Ingestion API -> CertRenewal_CL
     # (docs/telemetry-log-analytics-setup.md section 2/4). This is the fleet liveness/inventory/billing
     # signal (no periodic Teams heartbeat). BEST-EFFORT: any failure (no Telemetry config, missing cert,
     # token/POST error) logs locally and returns - it never throws and never blocks the caller, mirroring
     # the Teams "never block" rule. DryRun -> log only, no POST. SP identity + DCR coordinates come from the
     # cert-config.Telemetry block (written by bootstrap); skipped cleanly if absent/disabled.
-    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule): $Outcome.Action
-    # names the event (renew/create/delete/secrets-sync/self-update/bootstrap/migrate/...); renewal omits it
-    # (defaults to 'renew'). Renewal-only fields (CertCount/Certificates/NextExpiry*) and $SelfUpdateStatus
-    # default cleanly when a caller doesn't set them.
-    param([object] $Config, [object] $Outcome)
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule). $Outcome is one OR
+    # many event objects (PowerShell auto-wraps a single object); one CertRenewal_CL row is built per event
+    # and ALL are sent in a single POST. $o.Action names the event (renew/create/delete/secrets-sync/
+    # self-update/bootstrap/migrate/cert-renewed/service-restarted/pre-hook/post-hook/...); when omitted it
+    # defaults to 'renew'. Renewal-only fields (CertCount/Certificates/NextExpiry*/Domain) and
+    # $SelfUpdateStatus default cleanly when a caller doesn't set them. $o.TimeGenerated, when set,
+    # preserves the event's real time (the renewal stamps each work-event when it happens); otherwise the
+    # row is stamped at send time.
+    param([object] $Config, [object[]] $Outcome)
 
     $t = $Config.Telemetry
     if (-not $t -or -not $t.Enabled) { Write-Log 'Telemetry not enabled (no cert-config.Telemetry block); skipping.' -Level DEBUG; return }
@@ -342,43 +346,47 @@ function Send-Telemetry {
         if ([string]::IsNullOrWhiteSpace([string]$t.$f)) { Write-Log "Telemetry block missing '$f'; skipping telemetry." -Level WARNING; return }
     }
 
-    $billing       = $Config.Billing
-    $action        = if ($Outcome.Action) { [string]$Outcome.Action } else { 'renew' }
-    $nextExpiryUtc = $null
-    if ($Outcome.NextExpiry) { try { $nextExpiryUtc = ([datetime]$Outcome.NextExpiry).ToUniversalTime().ToString('o') } catch { } }
-
-    $row = [ordered]@{
-        TimeGenerated    = (Get-Date).ToUniversalTime().ToString('o')
-        ServerName       = $env:COMPUTERNAME
-        Abr              = [string]$billing.Abr
-        CustomerName     = [string]$billing.CustomerName
-        CustomerNr       = [string]$billing.CustomerNr
-        InvoiceCode      = [string]$billing.InvoiceCode
-        Service          = 'CertRenewal'
-        Action           = $action
-        ScriptVersion    = $ScriptVersion
-        RunOutcome       = [string]$Outcome.RunOutcome
-        SelfUpdateStatus = [string]$SelfUpdateStatus
-        CertCount        = [int]$Outcome.CertCount
-        NextExpiryUtc    = $nextExpiryUtc
-        NextExpiryDomain = [string]$Outcome.NextExpiryDomain
-        Certificates     = @($Outcome.Certificates | Where-Object { $_ })
-        Message          = [string]$Outcome.Message
+    $billing = $Config.Billing
+    $rows = foreach ($o in $Outcome) {
+        $action        = if ($o.Action) { [string]$o.Action } else { 'renew' }
+        $nextExpiryUtc = $null
+        if ($o.NextExpiry) { try { $nextExpiryUtc = ([datetime]$o.NextExpiry).ToUniversalTime().ToString('o') } catch { } }
+        $stamp         = if ($o.TimeGenerated) { [string]$o.TimeGenerated } else { (Get-Date).ToUniversalTime().ToString('o') }
+        [ordered]@{
+            TimeGenerated    = $stamp
+            ServerName       = $env:COMPUTERNAME
+            Abr              = [string]$billing.Abr
+            CustomerName     = [string]$billing.CustomerName
+            CustomerNr       = [string]$billing.CustomerNr
+            InvoiceCode      = [string]$billing.InvoiceCode
+            Service          = 'CertRenewal'
+            Action           = $action
+            ScriptVersion    = $ScriptVersion
+            RunOutcome       = [string]$o.RunOutcome
+            SelfUpdateStatus = [string]$SelfUpdateStatus
+            CertCount        = [int]$o.CertCount
+            NextExpiryUtc    = $nextExpiryUtc
+            NextExpiryDomain = [string]$o.NextExpiryDomain
+            Certificates     = @($o.Certificates | Where-Object { $_ })
+            Domain           = [string]$o.Domain
+            Message          = [string]$o.Message
+        }
     }
+    $rows = @($rows)
 
     if ($DryRun) {
-        Write-Log ("[DryRun] WOULD emit telemetry: action={0} server={1} outcome={2} certs={3}" -f `
-            $row.Action, $row.ServerName, $row.RunOutcome, $row.CertCount) -Level INFO
+        Write-Log ("[DryRun] WOULD emit telemetry: {0} event(s): {1}" -f `
+            $rows.Count, (($rows | ForEach-Object { $_.Action }) -join ', ')) -Level INFO
         return
     }
 
     try {
         $token = Get-TelemetryAccessToken -TenantId $t.TenantId -AppClientId $t.AppClientId -CertThumbprint $t.CertThumbprint
-        $body  = ConvertTo-Json @($row) -Depth 6
+        $body  = ConvertTo-Json @($rows) -Depth 6
         $uri   = "$($t.EndpointUri)/dataCollectionRules/$($t.DcrImmutableId)/streams/$($t.Stream)?api-version=2023-01-01"
         $resp  = Invoke-WebRequest -Method Post -Uri $uri -UseBasicParsing -TimeoutSec 20 `
             -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body $body
-        if ($resp.StatusCode -eq 204) { Write-Log "Telemetry event accepted (204, action=$($row.Action))." -Level SUCCESS }
+        if ($resp.StatusCode -eq 204) { Write-Log ("Telemetry accepted (204, {0} event(s))." -f $rows.Count) -Level SUCCESS }
         else { Write-Log ("Telemetry POST returned unexpected status {0}." -f $resp.StatusCode) -Level WARNING }
     }
     catch { Write-Log "Telemetry send failed (non-fatal): $($_.Exception.Message)" -Level WARNING }
@@ -994,8 +1002,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBVckxYcbGGCcvU
-# ZHLhNZOYcmAttyu6rv58bP6xnfsrPqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBoxUwBO4Uh4LaL
+# zHq/bcyyVGgHetnMDak5KIjCSy/C96CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1126,31 +1134,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIE3i0EHM+SpPi0eRxDDUq5wJ1acUR0bvJezV
-# Nq1TRFQuMA0GCSqGSIb3DQEBAQUABIIBgKOAWAiNbhRk7j6AEEjxGtSj+EIOb8gY
-# cLNb4rv2GpU8ATYxT/FukLkMgEepbYFE/y2tFOh4a+dAWsuwHerbtLotGisXLN7G
-# P02EVJnqTBER1ZdtnXXelt7NTSrSfFxdQe1By7autOafXMnCeyv91tJK3Eqk9vua
-# Q7HW1iU2BNqwrJ99oT97vkwh/KLj2br1qSqxpaJlEaoYYAmzqTkNOZbshLPOU04G
-# jDm1tw62aUyWleMr3S5yvUd9f+rFjjHRGQYqiK2y1WeKoDIdOdpxJBnpIZu5JoUA
-# ymV1ZnI6ar0t4dJi/JjP7Vhz0LZAn8FOlBxPc0a9EAMnw3mvmTLRipGuQ1uLRDTN
-# HO+zM+m9pJmzhL6gG/fOkQBHn96J7TEWQF/yWHsuMutROFyVOH741Xg4m1OLEc4i
-# s7TKeKtRTFREhmVU3f/uN84aNjCHcvIWRHyOmuIWk/2o4ptbG5p4WNbn3KRmUgns
-# q4eUGln0jYnqyM8AVLaT+ueCHF4DLg2PcaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEdIZ7E5O6zEWRCeyWllJQPW/C6FscQxQ9zz
+# /5yv28M1MA0GCSqGSIb3DQEBAQUABIIBgJQyXq57typdw6vJ8MYzm/bNWthBCKXS
+# TDzJ7A15ECnxWEv5wfYNSCq5ezaee2sO8kPlFIzJNiGcNvUEQM469HKXqmScpnJd
+# drzQKj5581AWY50m9so7DE5w/3rxWa45DMhiptULh0pcrYHYBnrPH9sortgxdnKw
+# +YGrTotnDlJqaqJwq2a4mq7P3mHSjXbvCvrsHsdsMl1wYzK6qIZkFdC4kBmNBkNw
+# aF2tneqGGknC0hTb1ojkqOuSYVRiCg1AEl6GNdzIYfIDNzlyfCX6P1HIBxGFug6G
+# Pm5yp+qM416O+5Vf/wIh5m3te1TMswh9xc/8nUsn0SMyqPExfPARQMYwuQjiNuPH
+# 5vBtDLP4pc922HKhlqhW8xvVP/RUwC24cL8Pk59GIFrCsOYW77MEmd7BxBRuSxvO
+# /PFNt8p5TcVHrbQCDuK1E34EHZ3gxsWZbfwaE7ogVpR8R/skIZjFHWWG4+nujMSG
+# r5M20hhn7pth2/M2sGmyVfGNkqN4t2mp66GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjMwNzE0NTdaMC8GCSqGSIb3DQEJBDEiBCDZ9jEkvw09wNwExRgIF2+T
-# MgkhvuA+/DMpcNbJn5KYADANBgkqhkiG9w0BAQEFAASCAgBDuA02pbCxEYMl5BDK
-# 70nmOOboujELRVlHOyajH7waXGYLrjE/Z4SLRe217GJnTkeQTB4HvNBKsQDlLPGp
-# C5Bl+06ut+o1sBoCnsOnx75sKMadXFOOLogyTHNh12iZMgTW01IY3ePrF/96zLJg
-# owcZarba9NjF0lY7bVnGu7EqFFNl4JPHYEm1J3rnYWPf8+yLu/HHlRVWPmTYJ1Wo
-# P91XU6JOcPVwZWOG58fw/9imE3Pq2WLx0jBFZNejoqFb80v5DQjqhTrq/enwoJDD
-# ucnFubMxbjCOLW9Q0PuA5qw85ADtyN9WsF8mMn13EWt1z2BtLXHbnvcAje03RA5B
-# U3bRgdSAMtIAC9JLeFRoKNt9iCDPCxxOFAOCEmws3/xa3y+/UIgwqWEKF5Wtgxpr
-# woMJpiK5khu85Y3NV3e4eG6m7cikWnxx7bDYfruVqTQs+tatw/mDYjJpMFZwVIjg
-# OZWq5sAP6PiDSiDv+IdtkazTidYRRjT0kc0jKFBYrFEv34GGXKmtG3m1ujVm0JCG
-# c1Gk+EkRJ4jD7n8Qgjj42EDbCKgUbx0D4fpjPyfufrH9+tjH4yd3+CmL3fULb8vJ
-# igyJVyzNwytPtVx2okxOo3qEfGgqPmd2nECYxp6Xlw/1CjFV2OrKWI/WGxz6VHU5
-# BqMt/JMApFvAuK6h0AeRgFEbyw==
+# Fw0yNjA2MjMwNzQyMTFaMC8GCSqGSIb3DQEJBDEiBCDNxZlXefuWmAo8pm83BCJJ
+# SpdL6GbenCHqV50+GTl/kTANBgkqhkiG9w0BAQEFAASCAgCg+vucauWPSSn1+Lkc
+# VMS/cLs6EMq01PLk93DlXP5nG1TXRxi73Arkgf77Vxr+xu+1eoIORS7H/3oPOOK/
+# bP1ftd/eyNpkXWgS3Q4Szvbj0XkxMiLn9Zx9kzr2qpx6hGLSUCST82OKs96M0frD
+# 4tikwMhxIvHLKA/Vf/zREXKdk2OR24bFWOK7wWKGBpHyvWvvD4kGu2CujSXibGME
+# 53Qg56Hbs7eC+p/wvd11x2qgUpqh9Zz5ZLyfTSNLi/H2Nq+WE8cXZVGgL6yQ4cZm
+# DsMfnnQwBdpYP9R5z43SeyXn4/6cJCmleY7/2EE2Crzt4FK2+kGPFKKByDTo7/Uf
+# dHkuvpFSXFzMlkJkxs0y7gAuW6DKyaPuCaM6PdxfHEUqq/D9BUtitEGwHmtIcX3u
+# u/iJM7g2FHfdZn2OSE/LFh4KvwTvlDWhmxWyYv8yvBNUr2XYxemKGegxHI5GNb9/
+# sFdZHjfV70okIXDorZXygSjdwecmZMOJ3nkJ66IVjwwLGcmIbT4q83mbCzJv/acn
+# 17G2iO0RwFmeO7aBGrIbu9WR0pSZcfYIZpZMxiBpkcllOwxo/0NGFKL8XC9+wAmQ
+# RKWG+3oz/pBIe9e5ukQca/2bDkTZYcSvd1RLy4kuXEJudGy8nlmDOZ7EfBIh2JWj
+# SLu7MYWcVYkqtxO75TZMFuel4A==
 # SIG # End signature block
