@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.1.2'
+$ScriptVersion = '2.1.3'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1459,6 +1459,20 @@ function Invoke-RenewalCore {
                 Invoke-RenewalHook -ScriptPath $domainConfig.PreRenewalScript -Phase Pre -DomainConfig $domainConfig `
                     -Thumbprint $cert.Thumbprint -NotAfter ($cert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
             }
+            # Heal a v1-migrated order whose DnsVariant was serialized empty by an older Posh-ACME: the newer
+            # module's Submit-Renewal/New-PACertificate reject '' (ValidateSet dns-01,dns-account-01) and the
+            # renewal would otherwise fail (issue #59). Best-effort, version-guarded (no-op on a module
+            # without DnsVariant), idempotent (only acts when empty).
+            try {
+                $paOrder = Get-PAOrder -MainDomain $domain -ErrorAction SilentlyContinue
+                if ($paOrder -and $paOrder.PSObject.Properties['DnsVariant'] -and
+                    [string]::IsNullOrWhiteSpace([string]$paOrder.DnsVariant) -and
+                    (Get-Command Set-PAOrder -ErrorAction SilentlyContinue).Parameters.ContainsKey('DnsVariant')) {
+                    Write-Log "Healing empty DnsVariant on the saved order for $domain (-> dns-01)." -Level INFO
+                    Set-PAOrder -MainDomain $domain -DnsVariant 'dns-01' -ErrorAction Stop
+                }
+            }
+            catch { Write-Log "Could not heal DnsVariant for ${domain}: $($_.Exception.Message)" -Level WARNING }
             try {
                 # Submit renewal with retry. The script -Force forwards to Submit-Renewal -Force so the
                 # cert is re-issued even when ARI says it is not in the renewal window yet (genuine forced
@@ -1740,8 +1754,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBTw7QLAXK58TtM
-# +5l3vUtAJJ22DcUx6+LEU4A/Dc0bqKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA8Gpx8+pfMJ+76
+# XuyW5sDGPLn9411F/5A1Fg+2eeedMKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1872,31 +1886,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEy/GJrMozanCOCC8F77BbTxmGgJ3jaKmf0B
-# fvcAAigoMA0GCSqGSIb3DQEBAQUABIIBgDNP/QgxzFFd4R7YqzfxDiI4jvzX/McZ
-# v6sZ01YPcdny4Cklk+MAiQi4qt5j6WAYUEoa+3F9yCzeGsIyTwotVcCDKfQzZOHs
-# Tc9XkMPHpLTIkA1OYnxqYFfXTDXNw0Yh5gM2QPiI8yO5Rx959Z0RpDso6kMV/zFU
-# rCZQJCFWH9SK4o46WO7ze9YldT9p28y3FQzKoEpQX7QDatQyTo7grRymjoCC9Ciu
-# cZ/yp5xR47I5LHOuPBraq12Y6dtR7v/bj9WFDtXPmNXrKoQZHndi5C2tpiKAmMsh
-# kfc024VGReVzBoOAnJ3p9k3W2mOON/t8/2myW4jumYG+99qslAc2aVfsSUwdMlIo
-# kksSB29gDX91xQgYd8TpTLq0Pzf1iIqkTHUPwtsiBfJIG5C1hH00Oy0Q5P550BGh
-# SDJ6sorFx9VxmEjM+r0CKr+f1vFHx43qX/Dmit6WoSamDjwprCIEtcv2LoPV4Cnr
-# IIqw03mw8LXcSnemy8GMClgxbo+BDx6h3aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIB/lb4PJ0Q0jKqUiVSJNbssDU3a+MELx6pC7
+# IRwbHIi6MA0GCSqGSIb3DQEBAQUABIIBgJSSCMbKYz1n7XTs4fNG0aOOJ6dm+KJN
+# BNnimU0fCYioqKswdnOU2a60e3xNNm3SIr0zqSIpttobD9a8oRyyznm/LRtFVaTT
+# oSnPUSZqG6Lu3MD8VCN4l6X5OxVM8Uo5nnjrYfWYK2puLOB94r0gG+xV+ZBaH5mb
+# J1xdTt8LdSJJG7tfZLEcp7dWYJf72aX/fDaaAHhf+LM56AgBoDlUQY+tyfoa7Ti7
+# tVJ6ik+H8RTkO0bHAz9JG3ghFJhkxDRBjGLMh1u2IgMIp3tcyu4piS6w/pruoo5L
+# 0KAk/GG35R+X24LkeWep4jv/G5grDbOmGz6pa1n4oMBr/SEgKHH1NhZsth2PCUog
+# +AR2wEPW0DA6LhxgMXmki3ErHBHEJ20OZFUE28aLCoILmiVzJnuYziVVzGmvoUzK
+# ovL+nO8m5rZo8eAFQVzEQGITpjF0RVtpTIGlGfs+dDHkmneJoAWvr9wwJQPxydsg
+# CUo0vuY3dqoEkF24p9l/hQd00/JcPZdyvKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjMwNjM3MjhaMC8GCSqGSIb3DQEJBDEiBCDK1mnYBzbSLEOb9M20ePBo
-# DaRr6KpejSrNe8t0UsS6lzANBgkqhkiG9w0BAQEFAASCAgDIZmmlP/5B0PNmLGOl
-# 6cbaKpsGPUNjuSwqNcTvsUinZ+K9o07AnZBN3Ps/6rIHIhyi5584dfU5FlawkKMS
-# ptOEAdFYu/uDheHl4W7kMzfEL5xzPISYg28kYpGhxl/bhvBzfh2J/N5kjQlq7IDi
-# T+HBoRYpB4Y7aRUV7Jtqbaf7ae0vPu6PlIe+1tn48tCG8lAB4Do8hxCQgHtJdXhB
-# 7hPBJeTN1teWTycvlqJsU3wA8L6MZbYj5JtE1ifFLTiLqt7xc0sq54lxR3zBl7eK
-# R7QCGyhR14oNrQ5N+43tVhZlzhaVwQ1NxPHOGx9oa2wy5CLRgYqnJeCkVshIN2Dx
-# h4gMYGHRO8pE846ppTLduaRy8e81Pqu27ky+/OaxGvzedlglWvobRtrFU/gVc39p
-# FERAiNuGIxtnbvxSVCUWLRoRKNF6NbaWSMawAVtUAp/Yg9fY/YMGVnlw+HoGV7qS
-# CpD/+2VbfaG6kyfd4bPdhPki4Vxbi4s51ww28uXGNwsElqvDys2zuHg6TthpwGWn
-# lIbFgPsCgJw1u7+pRaNIipzQmnQ3eDWCePwuwC6NpyiYnBwsIamkDomcSt3qXJ/4
-# wAHLQm2uHsWvwYszYsnq1NedLVczqAGEsJDSu6wNTXYPJ+di4cty7L/n7doDKWE9
-# FyZG7QYehoQvJfmxFth2eiw02w==
+# Fw0yNjA2MjMwNzE0NTlaMC8GCSqGSIb3DQEJBDEiBCC5esZR8TwZ+cA8gyxDgqLc
+# DydQahdeN8pChQReDYJi2DANBgkqhkiG9w0BAQEFAASCAgBEuUmRjWVzlvOnvVwR
+# vg8/0dkaDOeEQ2dTXyRZupM3pKShFXoEoj5Tfrs7nZesAnHXaLi2WApNGPY3da13
+# Myn+RfkExWndDi8bs75+HCdE7LfU+E7JqyXAniW1PR1E4/Vs7cvoS5Yed2zUx9UA
+# x/coyjbC+AIDH0jzo8is6LV8KUAPcYdUbDw6No3p4Gd72gYdGFd9/lIHIaIj+hJO
+# 5QTcRh/y0NLGtBXwPGzEFie64q2ytnpCeoNh8thS0nf+oOZiIYmPSPo2eEmMJuJV
+# j69FpiSrkz26PTITZP0VCsL3joH0xd/b2pPTjsIHnjVhyY9ApVB0Slg3H3T7pL/s
+# VYjc48thIkAdKgjh6Ks16yD9YiCdQrWmSXuurvbjdZVUlrmv8CZT2UdNGQj2IW2L
+# hYm8XW+JL3I1rknPtEHB5vi9UqWzDxAUgzphIBsYDf0cc9tgzxXK2suhOzjCeOgv
+# 6c4rWaKuImcWSxqr/ShUpWk9L00xFwrqerAJQ49fjtVV4DEE4VQu0hM+3/9G3KnC
+# VBAl7wlWzBDv+4IEG4zc3Jo7znQcqSvkJZ9L8s/5hahN1WI835dxz2c9h6K1IoJM
+# jwzyzOiDpHYr+aJ04x9ymIKQx68Y18yPlXGYEaxMORPU3333t9vhqy+30K6t4TIE
+# mh4faslBCEoUWm/tIoQQa6xqYg==
 # SIG # End signature block
