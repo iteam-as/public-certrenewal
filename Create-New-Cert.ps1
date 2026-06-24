@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.3.0'
+$ScriptVersion = '2.4.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -83,7 +83,7 @@ $SecretNameMap = [ordered]@{
 # Windows Event Log (source shared with renewal; creator owns 1100-1150, renewal owns 1000-1050).
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
-$EID = @{ Start = 1100; SecretsWritten = 1110; CertIssued = 1120; CertDeleted = 1130; CertUpdated = 1135; TaskRegistered = 1140; SelfUpdate = 1150 }
+$EID = @{ Start = 1100; SecretsWritten = 1110; CertIssued = 1120; CertDeleted = 1130; CertUpdated = 1135; BillingUpdated = 1136; TaskRegistered = 1140; SelfUpdate = 1150 }
 
 # Read by the shared Send-Telemetry (SelfUpdateStatus column). The creator reports its own self-update via
 # the 'self-update' event's RunOutcome; this default keeps the field defined for its other events.
@@ -124,6 +124,90 @@ function Write-EventLogEntry {
         Write-Log "Event Log write skipped (id $EventId): $($_.Exception.Message)" -Level DEBUG
     }
 }
+
+#region Console UI ------------------------------------------------------------
+# A small presentation layer for the interactive overview / menu / Update / Billing screens. The goal is a
+# consistent grammar so an admin can tell apart, at a glance:
+#   information (current state)  - Write-UiField / Write-UiSetting, no marker, dim labels
+#   the choices available        - Write-UiOption, the [X] keys called out
+#   a question you must answer    - Read-UiInput, always prefixed ' > ' ("type something now")
+#   inline feedback after answer  - Write-UiResult ( ok / removed / note )
+#   section boundaries            - Write-UiHeader / Write-UiRule
+# Rules/glyphs use Unicode on a UTF-8 console and fall back to ASCII elsewhere ($script:UiUnicode is set in
+# Main; absent under unit tests => ASCII). Colour is best-effort via Write-Host -ForegroundColor (ignored
+# when redirected). None of this goes to the Event Log; the transcript still captures it. This layer wraps
+# only the menu/Update/Billing screens - the Add and Delete prompts are intentionally left as-is.
+
+function Get-UiGlyph {
+    param([Parameter(Mandatory)][ValidateSet('Rule', 'Ok', 'Arrow', 'Dot')][string] $Name)
+    $uni = ($script:UiUnicode -eq $true)
+    switch ($Name) {
+        'Rule'  { if ($uni) { [string][char]0x2500 } else { '-' } }
+        'Ok'    { if ($uni) { [string][char]0x2713 } else { '[ok]' } }
+        'Arrow' { if ($uni) { [string][char]0x2192 } else { '->' } }
+        'Dot'   { if ($uni) { [string][char]0x00B7 } else { '-' } }
+    }
+}
+
+function Write-UiRule {
+    param([int] $Width = 64)
+    Write-Host (' ' + ((Get-UiGlyph Rule) * $Width)) -ForegroundColor DarkCyan
+}
+
+function Write-UiHeader {
+    param([Parameter(Mandatory)][string] $Title)
+    Write-Host ''
+    Write-Host " $Title" -ForegroundColor Cyan
+    Write-UiRule
+}
+
+function Write-UiField {
+    # Aligned 'label ...... value' information row; the value column is fixed so values line up regardless of
+    # label length. Empty value renders as (none).
+    param([Parameter(Mandatory)][string] $Label, [string] $Value, [int] $LabelWidth = 20)
+    if ([string]::IsNullOrEmpty($Value)) { $Value = '(none)' }
+    $leader = "{0} {1}" -f $Label, ('.' * [Math]::Max(3, ($LabelWidth - $Label.Length)))
+    Write-Host ("   {0} " -f $leader.PadRight($LabelWidth + 2)) -ForegroundColor DarkGray -NoNewline
+    Write-Host $Value -ForegroundColor White
+}
+
+function Write-UiSetting {
+    # Sub-heading naming the thing being decided; -Current (when bound) shows the existing value.
+    param([Parameter(Mandatory)][string] $Name, [string] $Current)
+    Write-Host ''
+    if ($PSBoundParameters.ContainsKey('Current')) {
+        $shown = if ([string]::IsNullOrWhiteSpace($Current)) { 'none' } else { $Current }
+        Write-Host " $Name" -ForegroundColor White -NoNewline
+        Write-Host "   (current: $shown)" -ForegroundColor DarkGray
+    }
+    else { Write-Host " $Name" -ForegroundColor White }
+}
+
+function Write-UiOption {
+    # The available choices for the current question (keys called out).
+    param([Parameter(Mandatory)][string] $Text)
+    Write-Host "   $Text" -ForegroundColor DarkYellow
+}
+
+function Write-UiResult {
+    # Inline feedback after an answer: Ok (check), Note (arrow, dim), Warn (arrow, yellow).
+    param([Parameter(Mandatory)][string] $Text, [ValidateSet('Ok', 'Note', 'Warn')][string] $Kind = 'Note')
+    switch ($Kind) {
+        'Ok'   { Write-Host ("   {0} {1}" -f (Get-UiGlyph Ok), $Text) -ForegroundColor Green }
+        'Warn' { Write-Host ("   {0} {1}" -f (Get-UiGlyph Arrow), $Text) -ForegroundColor Yellow }
+        default { Write-Host ("   {0} {1}" -f (Get-UiGlyph Arrow), $Text) -ForegroundColor DarkGray }
+    }
+}
+
+function Read-UiInput {
+    # The single question primitive: ' > ' marks "type something now". -Default (when non-empty) is shown in
+    # brackets. Returns the raw string (callers trim/parse). Goes through Read-Host so prompts stay mockable.
+    param([Parameter(Mandatory)][string] $Prompt, [string] $Default)
+    $label = if ($PSBoundParameters.ContainsKey('Default') -and $Default -ne '') { "$Prompt [$Default]" } else { $Prompt }
+    return (Read-Host " >  $label")
+}
+
+#endregion Console UI ----------------------------------------------------------
 
 function Unprotect-Dpapi {
     # Decrypt a base64 DPAPI-LocalMachine blob (as written by bootstrap/creator) to a UTF-8 string.
@@ -991,38 +1075,78 @@ function New-DefaultCertConfig {
     return (Set-ConfigVersionStamps -Config $config)
 }
 
+function Read-BillingField {
+    # One Billing field with keep-on-Enter: blank input keeps -Current (when set), else returns what was
+    # typed (trimmed). The default is shown in brackets so the admin sees what Enter will keep.
+    param([Parameter(Mandatory)][string] $Label, [string] $Current)
+    $ans = (Read-UiInput $Label -Default $Current).Trim()
+    if ($ans -eq '' -and $Current) { return $Current }
+    return $ans
+}
+
+function Read-BillingBlock {
+    # Capture the five Billing fields (plaintext customer identifiers, not secrets). -Existing, when supplied,
+    # is offered as the per-field default so pressing Enter keeps each value. Returns an ordered pscustomobject.
+    param([object] $Existing)
+    $abr  = Read-BillingField 'Abbreviation (Abr)' ([string]$Existing.Abr)
+    $name = Read-BillingField 'Customer name'      ([string]$Existing.CustomerName)
+    $nr   = Read-BillingField 'Customer number'    ([string]$Existing.CustomerNr)
+    $inv  = Read-BillingField 'Invoice code'       ([string]$Existing.InvoiceCode)
+    $svcCur = if ($Existing.Services) { (@($Existing.Services) -join ', ') } else { '' }
+    $svcRaw = (Read-UiInput 'Services (comma-separated)' -Default $(if ($svcCur) { $svcCur } else { 'CertRenewal' })).Trim()
+    $services = if ($svcRaw -eq '' -and $svcCur) { @($Existing.Services) }
+                elseif ($svcRaw -eq '') { @('CertRenewal') }
+                else { @($svcRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    return [pscustomobject][ordered]@{
+        Abr = $abr; CustomerName = $name; CustomerNr = $nr; InvoiceCode = $inv; Services = $services
+    }
+}
+
 function Read-BillingPrompts {
-    # spec section5 - the only interactive credential-ish input. Prompts for the per-install Billing block
-    # (plaintext customer identifiers, not secrets) and persists it. Idempotent: a complete existing block
-    # is shown and kept unless the admin chooses to update it. Returns the (possibly new) config object.
+    # spec section5 - per-install Billing block (plaintext customer identifiers). Called at startup: a
+    # COMPLETE block is left untouched (manage it via the [U]pdate menu -> [B]); only an absent/incomplete
+    # block prompts here, since the Add flow needs it for Teams/telemetry stamping. Returns the config object.
     param([object] $Config)
 
     if (-not $Config) { $Config = New-DefaultCertConfig }
 
     $existing = $Config.Billing
     $complete = $existing -and $existing.Abr -and $existing.CustomerName -and $existing.CustomerNr -and $existing.InvoiceCode
-    if ($complete) {
-        Write-Log "Billing block present (Customer: $($existing.CustomerName), Nr: $($existing.CustomerNr), Invoice: $($existing.InvoiceCode))." -Level INFO
-        if ($DryRun) { return $Config }
-        if ((Read-Host 'Update the Billing block? (y/N)').Trim().ToUpper() -ne 'Y') { return $Config }
-    }
+    if ($complete -or $DryRun) { return $Config }
 
-    Write-Log 'Enter the Billing block (customer identifiers stamped on Teams cards / telemetry):' -Level INFO
-    $abr      = (Read-Host 'Abbreviation (Abr)').Trim()
-    $custName = (Read-Host 'Customer name').Trim()
-    $custNr   = (Read-Host 'Customer number').Trim()
-    $invoice  = (Read-Host 'Invoice code').Trim()
-    $svcRaw   = Read-Host 'Services (comma-separated) [CertRenewal]'
-    $services = if ([string]::IsNullOrWhiteSpace($svcRaw)) { @('CertRenewal') }
-                else { @($svcRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-
-    $billing = [pscustomobject][ordered]@{
-        Abr = $abr; CustomerName = $custName; CustomerNr = $custNr; InvoiceCode = $invoice; Services = $services
-    }
+    Write-UiHeader 'Billing block'
+    Write-Host ' Customer identifiers stamped on Teams cards / telemetry.' -ForegroundColor DarkGray
+    Write-Host ''
+    $billing = Read-BillingBlock
     $Config | Add-Member -NotePropertyName 'Billing' -NotePropertyValue $billing -Force
     $null = Set-ConfigVersionStamps -Config $Config
     $null = Save-CertConfig -Config $Config -Reason 'Billing block'
     return $Config
+}
+
+function Invoke-BillingUpdate {
+    # [U]pdate -> [B]: show the current Billing block, then re-capture each field with keep-on-Enter. Persists
+    # only the Billing block (no cert/task changes). DryRun-gated; emits the billing-updated event (1136).
+    param([object] $Config)
+
+    $e = $Config.Billing
+    Write-UiHeader 'Billing block'
+    Write-Host ' Current' -ForegroundColor White
+    Write-UiField 'Abbreviation'    ([string]$e.Abr)
+    Write-UiField 'Customer name'   ([string]$e.CustomerName)
+    Write-UiField 'Customer number' ([string]$e.CustomerNr)
+    Write-UiField 'Invoice code'    ([string]$e.InvoiceCode)
+    Write-UiField 'Services'        $(if ($e.Services) { (@($e.Services) -join ', ') } else { '' })
+    Write-UiRule
+    Write-Host ' Press Enter at a field to keep its current value.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $billing = Read-BillingBlock -Existing $e
+    if ($DryRun) { Write-Log '[DryRun] WOULD save cert-config.json (Billing update).' -Level INFO; return }
+    $Config | Add-Member -NotePropertyName 'Billing' -NotePropertyValue $billing -Force
+    $null = Save-CertConfig -Config $Config -Reason 'Billing update'
+    Write-EventLogEntry $EID.BillingUpdated Information "Billing block updated (Customer: $($billing.CustomerName), Nr: $($billing.CustomerNr))"
+    Write-UiResult 'billing updated' -Kind Ok
 }
 
 function Register-RenewalTask {
@@ -1521,12 +1645,16 @@ function Read-DeploymentType {
         [object] $CurrentNetshIpPorts
     )
     $type = $null; $guid = $null; $netshIpPorts = $null
-    $prompt = if ($CurrentType) { "Deployment type (current: $CurrentType) - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS (Enter=keep current)" }
-              else { 'Deployment type - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS' }
+    $update = [bool]$CurrentType
+    if ($update) {
+        Write-UiSetting 'Deployment type' -Current $CurrentType
+        Write-UiOption '[W] IIS Web   [F] IIS FTP   [C] CertStore only   [N] Netsh HTTP.SYS'
+    }
     $validType = $false
     do {
-        $envChoice = (Read-Host $prompt).Trim().ToUpper()
-        if ($envChoice -eq '' -and $CurrentType) {
+        $envChoice = if ($update) { (Read-UiInput 'Type, or Enter to keep' -Default $CurrentType).Trim().ToUpper() }
+                     else { (Read-Host 'Deployment type - [W] IIS Web / [F] IIS FTP / [C] CertStore only / [N] Netsh HTTP.SYS').Trim().ToUpper() }
+        if ($envChoice -eq '' -and $update) {
             return @{ Type = $CurrentType; Guid = $CurrentGuid; NetshIpPorts = $CurrentNetshIpPorts }
         }
         switch ($envChoice) {
@@ -1559,16 +1687,30 @@ function Read-RestartService {
     # so an admin who just wants to tweak something else does not have to retype it (and Enter never
     # silently wipes it).
     param([string] $Current)
-    if (-not [string]::IsNullOrWhiteSpace($Current)) {
-        $decided = $false
-        while (-not $decided) {
-            $ans = (Read-Host "Restart a Windows service after renewal? Current: '$Current'. [K]eep / [C]hange / [R]emove (Enter=Keep)").Trim().ToUpper()
-            if ($ans -eq '' -or $ans -eq 'K') { return $Current }
-            if ($ans -eq 'R') { return $null }
-            if ($ans -eq 'C') { $decided = $true }   # fall through to capture a new value
-            else { Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING }
+
+    # Update flow (-Current bound): framed UI. A current value offers [K]eep/[C]hange/[R]emove; an empty one
+    # asks to configure. Add flow (no -Current): the original single Y/N prompt, left unchanged.
+    if ($PSBoundParameters.ContainsKey('Current')) {
+        Write-UiSetting 'Post-renewal service restart' -Current $Current
+        if (-not [string]::IsNullOrWhiteSpace($Current)) {
+            Write-UiOption '[K] keep   [C] change   [R] remove'
+            while ($true) {
+                $ans = (Read-UiInput 'Choice' -Default 'K').Trim().ToUpper()
+                if ($ans -eq '' -or $ans -eq 'K') { return $Current }
+                if ($ans -eq 'R') { Write-UiResult 'service restart removed'; return $null }
+                if ($ans -eq 'C') { break }   # fall through to capture a new value
+                Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING
+            }
         }
+        elseif ((Read-UiInput 'Configure a service to restart after renewal? (y/N)').Trim().ToUpper() -ne 'Y') { return $null }
+        $svcName = (Read-UiInput 'Windows service name to restart').Trim()
+        if ([string]::IsNullOrWhiteSpace($svcName)) { return $null }
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc) { Write-UiResult "service '$svcName' found ($($svc.Status))" -Kind Ok; return $svcName }
+        if ((Read-UiInput "Service '$svcName' not found here. Configure it anyway? (y/N)").Trim().ToUpper() -eq 'Y') { return $svcName }
+        return $null
     }
+
     $restartService = $null
     if ((Read-Host "Restart a Windows service after successful renewal? (Y/N)").Trim().ToUpper() -eq 'Y') {
         $svcName = (Read-Host 'Windows service name to restart').Trim()
@@ -1593,16 +1735,31 @@ function Read-RenewalHook {
         [string] $Current
     )
     $when = if ($Phase -eq 'Pre') { 'BEFORE' } else { 'AFTER' }
-    if (-not [string]::IsNullOrWhiteSpace($Current)) {
-        $decided = $false
-        while (-not $decided) {
-            $ans = (Read-Host "Run a custom script $when each renewal? Current: '$Current'. [K]eep / [C]hange / [R]emove (Enter=Keep)").Trim().ToUpper()
-            if ($ans -eq '' -or $ans -eq 'K') { return $Current }
-            if ($ans -eq 'R') { return $null }
-            if ($ans -eq 'C') { $decided = $true }   # fall through to capture a new value
-            else { Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING }
+
+    # Update flow (-Current bound): framed UI with [K]eep/[C]hange/[R]emove (or configure when empty). Add
+    # flow (no -Current): the original Y/N + path prompts, left unchanged.
+    if ($PSBoundParameters.ContainsKey('Current')) {
+        $label = if ($Phase -eq 'Pre') { 'Pre-renewal hook' } else { 'Post-renewal hook' }
+        Write-UiSetting $label -Current $Current
+        if (-not [string]::IsNullOrWhiteSpace($Current)) {
+            Write-UiOption '[K] keep   [C] change   [R] remove'
+            while ($true) {
+                $ans = (Read-UiInput 'Choice' -Default 'K').Trim().ToUpper()
+                if ($ans -eq '' -or $ans -eq 'K') { return $Current }
+                if ($ans -eq 'R') { Write-UiResult 'hook removed'; return $null }
+                if ($ans -eq 'C') { break }   # fall through to capture a new value
+                Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING
+            }
         }
+        elseif ((Read-UiInput "Configure a script to run $when each renewal? (y/N)").Trim().ToUpper() -ne 'Y') { return $null }
+        $path = (Read-UiInput 'Full path to the .ps1 (runs as SYSTEM)').Trim()
+        if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+        if ([System.IO.Path]::GetExtension($path) -ne '.ps1') { Write-UiResult "'$path' is not a .ps1 - not configured" -Kind Warn; return $null }
+        if (Test-Path -LiteralPath $path -PathType Leaf) { Write-UiResult "found: $path" -Kind Ok; return $path }
+        if ((Read-UiInput "'$path' not found here. Configure it anyway? (y/N)").Trim().ToUpper() -eq 'Y') { return $path }
+        return $null
     }
+
     $hook = $null
     if ((Read-Host "Run a custom script $when each renewal of this cert? (Y/N)").Trim().ToUpper() -eq 'Y') {
         $path = (Read-Host 'Full path to the .ps1 to run (runs as SYSTEM)').Trim()
@@ -1628,9 +1785,15 @@ function Read-RenewalThreshold {
     # so pressing Enter preserves it. Re-prompts on a non-positive / non-numeric value; warns (but accepts)
     # a value >= 90 since Let's Encrypt certs live ~90 days, so it would renew on every run.
     param([int] $Current)
-    $default = if ($PSBoundParameters.ContainsKey('Current') -and $Current -gt 0) { $Current } else { $DefaultRenewalThresholdDays }
+    $update  = $PSBoundParameters.ContainsKey('Current')
+    $default = if ($update -and $Current -gt 0) { $Current } else { $DefaultRenewalThresholdDays }
+    if ($update) {
+        $cur = if ($Current -gt 0) { "$Current days" } else { "$DefaultRenewalThresholdDays days (default)" }
+        Write-UiSetting 'Renew before expiry' -Current $cur
+    }
     while ($true) {
-        $answer = (Read-Host "Renew how many days before expiry? (default $default)").Trim()
+        $answer = if ($update) { (Read-UiInput 'Days before expiry, or Enter to keep' -Default ([string]$default)).Trim() }
+                  else { (Read-Host "Renew how many days before expiry? (default $default)").Trim() }
         if ($answer -eq '') { return $default }
         $parsed = 0
         if (-not [int]::TryParse($answer, [ref]$parsed) -or $parsed -le 0) {
@@ -1899,32 +2062,47 @@ function Invoke-UpdateFlow {
     param([object] $Config)
 
     $domains = @(); if ($Config -and $Config.Domains) { $domains = @($Config.Domains) }
-    if ($domains.Count -eq 0) { Write-Log 'No managed domains to update.' -Level INFO; return }
 
+    # Target picker: the managed certs plus the Billing block (issue: billing now lives under [U]pdate).
+    Write-UiHeader 'Update - what would you like to change?'
     for ($i = 0; $i -lt $domains.Count; $i++) {
         $d = $domains[$i]
-        $sans = if ($d.SANs) { " + SANs: $($d.SANs -join ', ')" } else { '' }
-        Write-Log "  [$($i + 1)] $($d.MainDomain) [$($d.Type)]$sans" -Level INFO
+        $sans = if ($d.SANs -and @($d.SANs).Count) { "   + SANs: $((@($d.SANs)) -join ', ')" } else { '' }
+        Write-Host ("   {0,2}   " -f ($i + 1)) -ForegroundColor Yellow -NoNewline
+        Write-Host ("{0,-32}{1}{2}" -f $d.MainDomain, $d.Type, $sans) -ForegroundColor White
     }
+    $billNote = if ($Config.Billing -and $Config.Billing.CustomerName) {
+        "{0} {1} {2}" -f $Config.Billing.CustomerName, (Get-UiGlyph Dot), $Config.Billing.CustomerNr
+    } else { '(not set)' }
+    Write-Host '    B   ' -ForegroundColor Yellow -NoNewline
+    Write-Host ("{0,-32}{1}" -f 'Billing block', $billNote) -ForegroundColor White
+    Write-UiRule
 
     $selected = $null
     while ($true) {
-        $pick = (Read-Host 'Enter a number to update (or press Enter to cancel)').Trim()
+        $pick = (Read-UiInput 'Number, [B] for billing, or Enter to cancel').Trim()
         if ($pick -eq '') { Write-Log 'Update cancelled.' -Level INFO; return }
+        if ($pick.ToUpper() -eq 'B') { Invoke-BillingUpdate -Config $Config; return }
+        if ($domains.Count -eq 0) { Write-Log 'No managed certificates to update - choose [B] or press Enter.' -Level WARNING; continue }
         $idx = 0
-        if (-not [int]::TryParse($pick, [ref]$idx)) { Write-Log 'Enter a numeric value.' -Level WARNING; continue }
+        if (-not [int]::TryParse($pick, [ref]$idx)) { Write-Log 'Enter a number, B, or Enter to cancel.' -Level WARNING; continue }
         $idx--
         if ($idx -lt 0 -or $idx -ge $domains.Count) { Write-Log "Enter a number between 1 and $($domains.Count)." -Level WARNING; continue }
         $selected = $domains[$idx]; break
     }
 
-    $curGuid    = if ($selected.Guid) { " guid=$($selected.Guid)" } else { '' }
-    $curNetsh   = if ($selected.NetshIpPorts) { " ports=$(@($selected.NetshIpPorts) -join ', ')" } else { '' }
-    $curRestart = if ($selected.RestartService) { " restart=$($selected.RestartService)" } else { '' }
-    $curPre     = if ($selected.PreRenewalScript)  { " pre=$($selected.PreRenewalScript)" } else { '' }
-    $curPost    = if ($selected.PostRenewalScript) { " post=$($selected.PostRenewalScript)" } else { '' }
-    $curThresh  = if ($selected.RenewalThresholdDays) { " renewAt=$($selected.RenewalThresholdDays)d" } else { " renewAt=$($DefaultRenewalThresholdDays)d (default)" }
-    Write-Log "Updating $($selected.MainDomain): current Type=$($selected.Type)$curGuid$curNetsh$curRestart$curPre$curPost$curThresh" -Level INFO
+    # Current configuration of the selected cert (information block).
+    Write-UiHeader ("Update certificate {0} {1}" -f (Get-UiGlyph Dot), $selected.MainDomain)
+    Write-Host ' Current configuration' -ForegroundColor White
+    Write-UiField 'Type'              ([string]$selected.Type)
+    Write-UiField 'SANs'              $(if ($selected.SANs -and @($selected.SANs).Count) { (@($selected.SANs) -join ', ') } else { '' })
+    Write-UiField 'Restart service'   ([string]$selected.RestartService)
+    Write-UiField 'Pre-renewal hook'  ([string]$selected.PreRenewalScript)
+    Write-UiField 'Post-renewal hook' ([string]$selected.PostRenewalScript)
+    Write-UiField 'Renew before'      $(if ($selected.RenewalThresholdDays) { "$($selected.RenewalThresholdDays) days" } else { "$DefaultRenewalThresholdDays days (default)" })
+    Write-UiField 'Thumbprint'        ([string]$selected.Thumbprint)
+    Write-UiField 'Expires'           ([string]$selected.NotAfter)
+    Write-UiRule
 
     # Conflict detection in Read-DeploymentType only considers OTHER domains' netsh ports (re-selecting
     # this domain's own ports is not a conflict with itself).
@@ -1946,6 +2124,7 @@ function Invoke-UpdateFlow {
     # store, just save the config - the next renewal deploys with the new Type.
     # Load the IIS:\ provider so Deploy-Certificate can rebind IIS Web/FTP sites (issue #54 - the Add and
     # renewal paths import this, the Update flow previously did not -> "Cannot find drive 'IIS'").
+    if (-not $DryRun) { Write-UiHeader 'Applying changes' }
     if (Get-Module -ListAvailable -Name WebAdministration) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
     $cert = Get-StoreCertificateForDomain -Domain ([string]$selected.MainDomain)
     if ($cert) {
@@ -1994,6 +2173,45 @@ function Invoke-UpdateFlow {
     Write-Log "Update flow complete: $($selected.MainDomain) is now Type=$($deploy.Type)." -Level SUCCESS
 }
 
+function Write-ConfigOverview {
+    # The at-a-glance state screen shown above the main menu: install path, installed script versions,
+    # telemetry on/off, the Billing customer, and the managed certificates with their key per-cert details.
+    param([object] $Config)
+    $domains    = @(); if ($Config -and $Config.Domains) { $domains = @($Config.Domains) }
+    $renewalVer = Get-OnDiskScriptVersion -Path $RenewalScript
+    $dot        = Get-UiGlyph Dot
+    $tele       = if ($Config.Telemetry -and $Config.Telemetry.Enabled) { 'enabled' } else { 'disabled' }
+    $bill       = if ($Config.Billing -and $Config.Billing.CustomerName) {
+        "{0} {1} {2} {1} invoice {3}" -f $Config.Billing.CustomerName, $dot, $Config.Billing.CustomerNr, $Config.Billing.InvoiceCode
+    } else { '(not set - configure via [U]pdate -> [B])' }
+
+    Write-UiHeader ("cert-renewal {0} Create-New-Cert v{1}" -f $dot, $ScriptVersion)
+    Write-UiField 'Install'   $CertRenewalPath
+    Write-UiField 'Scripts'   ("creator {0} {1} renewal {2}" -f $ScriptVersion, $dot, $(if ($renewalVer) { $renewalVer } else { 'absent' }))
+    Write-UiField 'Telemetry' $tele
+    Write-UiField 'Billing'   $bill
+    Write-UiRule
+    Write-Host (" Managed certificates ({0})" -f $domains.Count) -ForegroundColor White
+    Write-Host ''
+    for ($i = 0; $i -lt $domains.Count; $i++) {
+        $d = $domains[$i]
+        Write-Host ("   {0,2}   " -f ($i + 1)) -ForegroundColor Yellow -NoNewline
+        Write-Host ("{0,-32}{1}" -f $d.MainDomain, $d.Type) -ForegroundColor White
+        $bits = @()
+        if ($d.NotAfter) {
+            $exp = "expires $($d.NotAfter)"
+            try { $exp += " ({0} days)" -f [int]((([datetime]$d.NotAfter) - (Get-Date)).TotalDays) } catch { }
+            $bits += $exp
+        }
+        if ($d.SANs -and @($d.SANs).Count)  { $bits += "SANs $((@($d.SANs)) -join ', ')" }
+        if ($d.RestartService)              { $bits += "restart $($d.RestartService)" }
+        if ($d.PreRenewalScript)            { $bits += 'pre-hook' }
+        if ($d.PostRenewalScript)           { $bits += 'post-hook' }
+        if ($bits.Count) { Write-Host ("        " + ($bits -join "  $dot ")) -ForegroundColor DarkGray }
+    }
+    Write-UiRule
+}
+
 function Invoke-CreatorMenu {
     # spec section6 top-level control flow. Returns { SelfReplaced; Failed } so Main can halt for a
     # re-run (SelfReplaced) or exit non-zero on a task-registration failure (Failed).
@@ -2009,14 +2227,14 @@ function Invoke-CreatorMenu {
         return $result
     }
 
-    Write-Log "Existing managed domains ($($domains.Count)):" -Level INFO
-    foreach ($d in $domains) {
-        $sans = if ($d.SANs) { " + SANs: $($d.SANs -join ', ')" } else { '' }
-        Write-Log "  $($d.MainDomain) [$($d.Type)]$sans" -Level INFO
-    }
+    Write-ConfigOverview -Config $Config
 
     while ($true) {
-        $choice = (Read-Host 'Choose an option ([A]dd / [U]pdate / [D]elete / [Q]uit)').Trim().ToUpper()
+        Write-Host ''
+        Write-Host ' What would you like to do?' -ForegroundColor White
+        Write-UiOption '[A] Add a certificate     [U] Update a certificate or billing'
+        Write-UiOption '[D] Delete a certificate  [Q] Quit'
+        $choice = (Read-UiInput 'Choice' -Default 'Q').Trim().ToUpper()
         switch ($choice) {
             'A' { Invoke-AddFlow -Config $Config; return $result }
             'U' { Invoke-UpdateFlow -Config $Config; return $result }
@@ -2043,6 +2261,8 @@ $transcriptPath = Join-Path $LogDir ("cert-create-{0}.log" -f (Get-Date -Format 
 try { Start-Transcript -Path $transcriptPath -Append | Out-Null } catch { }
 
 $exitCode = 0
+# Console-UI glyphs: Unicode rules/marks on a UTF-8 console, ASCII elsewhere (see the Console UI region).
+try { $script:UiUnicode = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { $script:UiUnicode = $false }
 try {
     Write-Log "=== Create-New-Cert v$ScriptVersion starting (DryRun=$DryRun, CheckOnly=$CheckOnly, SkipSelfUpdate=$SkipSelfUpdate) ===" -Level INFO
     Write-EventLogEntry $EID.Start Information "Create-New-Cert v$ScriptVersion starting"
@@ -2125,8 +2345,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDHGmsLXDwoyd8A
-# v+XCrSKjSmo0qtg9k4Ju2u3wOTM8z6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBurUpqcyMD4JEH
+# YUYCb3r4vzWyXA31q55dm0S+sSVqkqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2257,31 +2477,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGOFKKcKC0bJ5cUfjCsis0809f43MNvL97id
-# glWaB4IgMA0GCSqGSIb3DQEBAQUABIIBgD3p5/gQ4ud0dSxleDKqsN8/bDFUyaaR
-# s9eVRWEdTUgaV5AHCYKDICrgwUE6QnCQKSwdEXMV+oReJkfnTnwCiMPjCxCJgNHq
-# S8ocj71PIdHtriAIEwYHp3aoBYzHZoQDLtMk+DFMDag+fv7lRVQ1BVrAIbOgDsnM
-# cdMIE5h1Q0Bwle4koeV1cIhh4gSRwrdr0m6pUZcnnVtLt+E9y4QSp9i3uF6QjC1O
-# 7akJgWE7X+VCtAUn0m2Okvt+pxncnJWQZx4QJKGFMWmjtGXwEKj15dPGxQfqjuGK
-# qWyGhEO0VjizlJj7xPGys1JePVXIRi1te0ZuTKWyk8fXkyBh5XK7dMlUPQ48uCcq
-# vfibvtiH499yplWxYG99tZeq6lNC9K2BCnCvWMUXpyC4h1lAFq9abDnAuJAxvQBp
-# ZR/1yvEK1ljMuB4r4mK4zrB256UkrRoItMmcYJrUamEDalty4oS1HQ7ZaRm8dPdo
-# 00Qds7sPc+Qj/sg3uLHWjFe4bUYuWTHIpqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGElSDbzzAq4idhZ2o+xz7asItQVV4HY6A0l
+# LXJ4UV6lMA0GCSqGSIb3DQEBAQUABIIBgM5YdtVgxW7odt2lTc3vZKyZF2RFRhAT
+# W256FfX/xcnBP93/eb2/CSMzR9FEocnUCl+gBzsnMCcvKW3+blcaLInyYZ4COWjm
+# EtybeMNcGZo19xOtyY/kJXuqSwEJf+3xWG6ptAWhmI04oEJ5mKB8quSx1gzEuAAD
+# 5eaCw24kRO9MauFEJpFIaoh05jYm+2vtMqgctVFRDXybgaqjZlYSej1Yt0FXPF5X
+# yWmgzlFNpgP0WIz0wpJI2PcR2PQhqXSYm2hhcUiBdwafE8A0u5dtHAdvqF1wMd+u
+# OAuTHSt6KTUQKaqEF+dH40fSt/iiSeVcHP0oY5LKi5l/NiiP1SeJPzU7t9KHrPZA
+# HHpYlblFyqNaZfEm98mkKsOkiIeF83XWZ11NyQSSUKjxNif5rKYOETSdVVqhbz3z
+# R99DIguWrhw1ZjCY4FH6Clz4BHnBhKUCoZ7AjHgr7zFbVjdSwqycsYRnudhlB11r
+# /paD6PZBPwn93WquXVBCGocqsEc88fE8MKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjMwODU5MTJaMC8GCSqGSIb3DQEJBDEiBCBHh23vyz4sPAtzuF+U/uor
-# ywqx4Kxgz9BMfO8s9PfNizANBgkqhkiG9w0BAQEFAASCAgCm7I7mnV/h7b1DqwgC
-# 5rZKZR9rguonjxzAbSkw1oKOpmWeEGRuiwXRAzPAOXhKNiBo3SrHp98biZo0gdv2
-# zGWBG3gij6J9aa1WsN3SOwkRpR6vu5C0LXJyou0xhnJ1K3DLm0xdopzMhWBDPdeW
-# Pq7UGvV0RUXk5gpD+hKdga3Y1hnK4ymFQiGZXDgRFfFMULyeQkELCDByIoTmuc/J
-# QPuxntmrIHajj2qDTdx3DVNS4pjw4N+SUBlZpxPLE6TDPh0UoMKo30Ix4MQboenn
-# wVl7G8aPs2RHqRBXsHDcuys+CKz8YNSvYL0m+H6UNI4IBS8HRG7rksLIy3v4ZJel
-# 5p/lu+KyESUBmxzS9TOG7UWbSCZx+yVloHmP+4+Iir3g3I9+QDgWL6Gjx27Go85m
-# xNkWwjRjIMAjUcd0onGQqG3h9X/BTEsMtyANj9eAFzkadPl4M8HmCNBy4ll/MqdZ
-# zqJ54xzBmQUEZiOsgj0/g3Ln9iv3BpyNV1jXz7DIWPzXSdd8DgX4G1sLd0R2VG5B
-# gru2wYFAtwhaVnhs4elkSVnlIQBYzRrDKT52liozF/GafM0ycHbDRzUrPAb5CUWe
-# D7e9PpdYNkVS+z+yu9FWCkZEBss4K/FfB7RcqoDeml5l/2Sf9Iz9SX8M8DVFvUB4
-# 6Os/vF0nYVJB5iJwfM5rakpcNg==
+# Fw0yNjA2MjQxMDMzNTRaMC8GCSqGSIb3DQEJBDEiBCDIRGtSYlz3uPFZs0hR62/c
+# DGY0vQiEixjlz1OlexUjNTANBgkqhkiG9w0BAQEFAASCAgCJGstyvHOdV2NOy5sD
+# KPOBJNxqebv9E1NtDiQITaaWqLWg6t4YIaxVBMm+qB8co+HfnkxVBth/aShI5dKn
+# Ot4y0BCydjCQWHj/0hR0rruWAUnt6UERGXB2artK4O4f47mguKswFFtBXb/tfRH+
+# HhulYTC9go4zhGHxNFmzYG2Dp/QM2MD8w9TZzZlV+17xTf9oFqg7R/WSnkjIX3+A
+# flRyaV2GaUDc93O4lyUFiiKecLmSxFrcM800RBLxlcHmRPTR9rDNIX+0bcPLRVCI
+# cBWvWc9ZF6jy6zAHx7TktjF0vx4MTitpU7MmbTrMHPc86ScSNkv8mwkfRHRngzKv
+# K2GiftaSlUPZ5aOSiGlX6GbbgSsVLTerqRM/azxsDbtXFHm3BzIr4P1vEIHM9jWf
+# 9KFH0wPZN5yyQEBRpgw3fq7biSMnKCNWW5DPtG27tAxfHA3xATJ1P9El+CoR5Xus
+# EAfL0j68OA+C6+MtVT2D6/cCJWSvZN2BejNWLVoDxTx10t72G5pgNr27F4afSGgm
+# pE2bthnGlyMYbTPS+URDKLP0b2DuVsnjZ/Dhr50Yfdns+HkVpxUcKUv0gKIUI4L6
+# RXapIskJue4GYwUE9Ql9IPaRi15OtArsPoDNpeIwBkKKmFlUEKIrex8zV84ToTX+
+# zQKKScQBpJumtRnEORRz/rUaAg==
 # SIG # End signature block
