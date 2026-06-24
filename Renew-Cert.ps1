@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.4.0'
+$ScriptVersion = '2.5.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -88,6 +88,12 @@ $EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; R
 # Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
 # Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
 $SelfUpdateStatus = 'Skipped'
+
+# Schema-v2 telemetry run identity (read by Send-Telemetry). The renewal runs unattended as the SYSTEM
+# scheduled task, so there is no accountable human: RunMode is always 'automatic' and OperatorEmail is null.
+$RunId         = [guid]::NewGuid().ToString()
+$RunMode       = 'automatic'
+$OperatorEmail = $null
 
 #region Helpers ---------------------------------------------------------------
 
@@ -291,6 +297,54 @@ function Get-TelemetryAccessToken {
         }).access_token
 }
 
+function Get-RuntimeInfo {
+    # OS / PowerShell / account identity for telemetry (schema v2). Cross-platform: works on Windows
+    # PowerShell 5.1 AND PowerShell 7+ (incl. Linux). Best-effort - any probe that fails leaves its field ''.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule).
+    $platform = 'Windows'; $osVersion = ''; $arch = ''; $account = ''
+    try { if ($PSVersionTable.PSVersion.Major -ge 6) { if ($IsLinux) { $platform = 'Linux' } elseif ($IsMacOS) { $platform = 'macOS' } } } catch { }
+    try { $arch = [string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture } catch { }
+    if ($platform -eq 'Windows') {
+        try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop; $osVersion = "$($os.Caption) (build $($os.BuildNumber))" }
+        catch { try { $osVersion = [string][System.Environment]::OSVersion.Version } catch { } }
+        try { $account = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { }
+    }
+    else {
+        try { $osVersion = (((Get-Content '/etc/os-release' -ErrorAction Stop) | Where-Object { $_ -like 'PRETTY_NAME=*' } | Select-Object -First 1) -replace '^PRETTY_NAME=', '' -replace '"', '').Trim() } catch { }
+        if (-not $osVersion) { try { $osVersion = [string][System.Runtime.InteropServices.RuntimeInformation]::OSDescription } catch { } }
+        try { $account = if ($env:USER) { $env:USER } else { [string]$env:USERNAME } } catch { }
+    }
+    [pscustomobject]@{
+        Platform = $platform; OSVersion = $osVersion; Arch = $arch
+        PSVersion = [string]$PSVersionTable.PSVersion; PSEdition = [string]$PSVersionTable.PSEdition; Account = $account
+    }
+}
+
+function Get-MachineId {
+    # Stable per-host id for telemetry correlation (schema v2). Windows: registry MachineGuid; Linux:
+    # /etc/machine-id. Best-effort, '' if unavailable. Not a secret. SHARED VERBATIM (diff-able rule).
+    try { if ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows) { return [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid } } catch { }
+    try { if (Test-Path '/etc/machine-id') { return ((Get-Content '/etc/machine-id' -Raw -ErrorAction Stop).Trim()) } } catch { }
+    try { if (Test-Path '/var/lib/dbus/machine-id') { return ((Get-Content '/var/lib/dbus/machine-id' -Raw -ErrorAction Stop).Trim()) } } catch { }
+    return ''
+}
+
+function Get-ConfigHash {
+    # SHA-256 of the config's canonical (compact) JSON, for drift detection and config-update diff anchoring
+    # (schema v2). Round-trips through the same ConvertTo-Json so write N's hash equals write N+1's "before".
+    # Best-effort -> '' on failure. SHARED VERBATIM (diff-able rule).
+    param([object] $Config)
+    $sha = $null
+    try {
+        $json  = $Config | ConvertTo-Json -Depth 10 -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $sha   = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    }
+    catch { return '' }
+    finally { if ($sha) { $sha.Dispose() } }
+}
+
 function Send-Telemetry {
     # One batched POST per call to the Azure Monitor Logs Ingestion API -> CertRenewal_CL
     # (docs/telemetry-log-analytics-setup.md section 2/4). This is the fleet liveness/inventory/billing
@@ -315,29 +369,68 @@ function Send-Telemetry {
     }
 
     $billing = $Config.Billing
+    # Schema-v2 common fields, computed once per call (after the enabled check so disabled telemetry stays
+    # cheap). $script:RunId/$script:RunMode/$script:OperatorEmail are set in each script's Main (RunMode is
+    # 'automatic' for the renewal task, 'interactive' for creator/bootstrap; OperatorEmail is null on
+    # automatic runs); they read as '' here when unset (e.g. unit tests).
+    $rt         = Get-RuntimeInfo
+    $machineId  = Get-MachineId
+    $configHash = Get-ConfigHash -Config $Config
+    $acmeEnv    = if ($Config.AcmeServer) { [string]$Config.AcmeServer } else { 'LE_PROD' }
+
     $rows = foreach ($o in $Outcome) {
         $action        = if ($o.Action) { [string]$o.Action } else { 'renew' }
         $nextExpiryUtc = $null
         if ($o.NextExpiry) { try { $nextExpiryUtc = ([datetime]$o.NextExpiry).ToUniversalTime().ToString('o') } catch { } }
         $stamp         = if ($o.TimeGenerated) { [string]$o.TimeGenerated } else { (Get-Date).ToUniversalTime().ToString('o') }
+        # Normalized severity for the Monitor Log (explicit $o.Severity wins; else derive from RunOutcome).
+        $severity      = if ($o.Severity) { [string]$o.Severity } else {
+            switch -regex ([string]$o.RunOutcome) { '(?i)partial' { 'Warning'; break } '(?i)fail|refused' { 'Error'; break } '(?i)unexpected' { 'Warning'; break } default { 'Info' } }
+        }
+        # Days-until-expiry: explicit value wins, else derived from NextExpiry; left $null when neither.
+        $days = $null
+        if ($null -ne $o.DaysUntilExpiry -and [string]$o.DaysUntilExpiry -ne '') { $days = [int]$o.DaysUntilExpiry }
+        elseif ($o.NextExpiry) { try { $days = [int]((([datetime]$o.NextExpiry) - (Get-Date)).TotalDays) } catch { } }
         [ordered]@{
-            TimeGenerated    = $stamp
-            ServerName       = $env:COMPUTERNAME
-            Abr              = [string]$billing.Abr
-            CustomerName     = [string]$billing.CustomerName
-            CustomerNr       = [string]$billing.CustomerNr
-            InvoiceCode      = [string]$billing.InvoiceCode
-            Service          = 'CertRenewal'
-            Action           = $action
-            ScriptVersion    = $ScriptVersion
-            RunOutcome       = [string]$o.RunOutcome
-            SelfUpdateStatus = [string]$SelfUpdateStatus
-            CertCount        = [int]$o.CertCount
-            NextExpiryUtc    = $nextExpiryUtc
-            NextExpiryDomain = [string]$o.NextExpiryDomain
-            Certificates     = @($o.Certificates | Where-Object { $_ })
-            Domain           = [string]$o.Domain
-            Message          = [string]$o.Message
+            TimeGenerated        = $stamp
+            ServerName           = $env:COMPUTERNAME
+            Abr                  = [string]$billing.Abr
+            CustomerName         = [string]$billing.CustomerName
+            CustomerNr           = [string]$billing.CustomerNr
+            InvoiceCode          = [string]$billing.InvoiceCode
+            Service              = 'CertRenewal'
+            Action               = $action
+            ScriptVersion        = $ScriptVersion
+            RunOutcome           = [string]$o.RunOutcome
+            SelfUpdateStatus     = [string]$SelfUpdateStatus
+            CertCount            = [int]$o.CertCount
+            NextExpiryUtc        = $nextExpiryUtc
+            NextExpiryDomain     = [string]$o.NextExpiryDomain
+            Certificates         = @($o.Certificates | Where-Object { $_ })
+            Domain               = [string]$o.Domain
+            Message              = [string]$o.Message
+            # --- schema v2 ---
+            PayloadSchemaVersion = 2
+            RunId                = [string]$script:RunId
+            MachineId            = $machineId
+            RunMode              = [string]$script:RunMode
+            OperatorEmail        = [string]$script:OperatorEmail
+            OperatorAccount      = $rt.Account
+            OSPlatform           = $rt.Platform
+            OSVersion            = $rt.OSVersion
+            OSArchitecture       = $rt.Arch
+            PSVersion            = $rt.PSVersion
+            PSEdition            = $rt.PSEdition
+            Severity             = $severity
+            ErrorDetail          = [string]$o.ErrorDetail
+            AcmeEnvironment      = $acmeEnv
+            DaysUntilExpiry      = $days
+            Component            = [string]$o.Component
+            VersionBefore        = [string]$o.VersionBefore
+            VersionAfter         = [string]$o.VersionAfter
+            ConfigHash           = $configHash
+            ConfigHashBefore     = [string]$o.ConfigHashBefore
+            Config               = $o.Config
         }
     }
     $rows = @($rows)
@@ -350,7 +443,7 @@ function Send-Telemetry {
 
     try {
         $token = Get-TelemetryAccessToken -TenantId $t.TenantId -AppClientId $t.AppClientId -CertThumbprint $t.CertThumbprint
-        $body  = ConvertTo-Json @($rows) -Depth 6
+        $body  = ConvertTo-Json @($rows) -Depth 10
         $uri   = "$($t.EndpointUri)/dataCollectionRules/$($t.DcrImmutableId)/streams/$($t.Stream)?api-version=2023-01-01"
         $resp  = Invoke-WebRequest -Method Post -Uri $uri -UseBasicParsing -TimeoutSec 20 `
             -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body $body
@@ -697,10 +790,21 @@ function Save-CertConfig {
     # the previous on-disk file to config-backups\ first (best-effort, see Backup-CertConfig).
     param([Parameter(Mandatory)][object] $Config, [string] $Reason = 'config update')
     if ($DryRun) { Write-Log "[DryRun] WOULD save cert-config.json ($Reason)." -Level INFO; return $true }
+    # Hash of the pre-write config (schema v2): anchors the config-update diff; absent => this is the
+    # first write (baseline) and the event is a config-snapshot instead.
+    $beforeHash = $null
+    if (Test-Path -LiteralPath $ConfigPath) { try { $beforeHash = Get-ConfigHash -Config (Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json) } catch { } }
     Backup-CertConfig -Reason $Reason
     try {
         $Config | ConvertTo-Json -Depth 10 | Out-File -FilePath $ConfigPath -Force -Encoding UTF8
         Write-Log "cert-config.json saved ($Reason)." -Level SUCCESS
+        # Best-effort config telemetry (Decision A): every persisted change ships the resulting config so the
+        # audit log can diff it. First write (no prior hash) is the baseline snapshot. Never throws.
+        try {
+            $configAction = if ($beforeHash) { 'config-update' } else { 'config-snapshot' }
+            Send-Telemetry -Config $Config -Outcome ([pscustomobject]@{ Action = $configAction; RunOutcome = 'Saved'; Message = $Reason; Config = $Config; ConfigHashBefore = $beforeHash })
+        }
+        catch { }
         return $true
     }
     catch {
@@ -1829,8 +1933,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA1Llbaj/47iYVw
-# T0dFvqnWjMBhhKGNZ7EJ27oxxL7wAaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDyJFOH6eHfq3MT
+# QW/bpPtWUKojGX4WpMKI8AcIyRQaE6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1961,31 +2065,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIB9N+4HbUfe0yeGfbBw6nXtrdi6fKrG/w5GH
-# f5TzLJTvMA0GCSqGSIb3DQEBAQUABIIBgJZ91ZTPxRUn/Qh41N6+3LVItUQS1Kuy
-# 77q7y7csJY+YLx7g/r+OdS8ROmo7NmA/Wq43TXx7oTZAlYmQ46+zCHUUN0iqybLG
-# 7B/WrWOiJyfhB/xEMrdGdDFjgj72h7UDMFyKRm6envdp0YdmrqSAtBtESx0+YGCZ
-# LJHjq3ARPs4mTiDmLfetk4Yf25usI1+6cjAGoDymRWQ3GljNMc+iNnl/S+0Hywza
-# G4LttqRAS4twNfWnNzUyRLAJw8p2fmtRwVgkCQE9Y9sAeNaRxUUQDg472M/lHYC0
-# NmTcVTbG6U7Xl+DdHGi7zJF9Z9mtILjpPHxlVMUwOl49DsuGJvcyqiVAh6l4IpXU
-# dWeWUZOZ4qlgDVPEuHXIJKL6J8p7GthNvPkwoEKHmYaRXtJ3awlmMCdZgoMPiPaS
-# wpo/xKcuig17mr5MLoy89RZbhjCnLu1/4T6oMoYnytc5pJOuu71MCs6BNk9gj6kg
-# 4fOaf4bLhIeh86lQT00m2fVb0qcxylrE76GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIAJUN+1fAZnirQXTHRZtTrKV2M+tgypvji7O
+# s7FGJnZVMA0GCSqGSIb3DQEBAQUABIIBgDAF034RZPK1NLK1Pb615XXQkYqroIjM
+# dj7bepaGOBmfaNfRIajAdScX4ynCqzLydKPz9o8MahrcEAf/SVQ1C8rW5trxH+u1
+# krL8krQzW220EuMn8JvnA42rfu5TNqN6JVhFQ8FeyCldNh2GIt8H8WErWlCzHUtx
+# K/O/YXIscQARDjRyt1f40WTQVWXKXKRxiUisc8YLLnrUCDhpIFR9CLJuXeIVsRYB
+# qJAZWillKAFo1H7TqZqWzj2qN1XYQsxIgo8ag8RZd7EUvUuLLKaH+wNpQVEYaTRn
+# 8EdBPsj5qEgXPwCXpQ/PYhrD35g5gNK09z52N/5C/VclgYmuLLx8YdcfdJiDL71G
+# Kk5aDvZ00LALAVfuw2gW/poCcIrpfqkhKNS314mtmNitK6T2YD0lzz28eI8DXJly
+# Ft4ErhZz6kxRleTbQT8pbs5gVfXgQTPEtYkni/u6h/JyLyy4TTu4by4rCSzcx7tl
+# X0rnUJ7UHM7/kuRywCEwekdYJJyOOMAEgKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjQxMDMzNTVaMC8GCSqGSIb3DQEJBDEiBCDEmPqwybBTSwA7sjMBCY7u
-# WQszitiDDNxfbdj5PZvmgzANBgkqhkiG9w0BAQEFAASCAgAOmhBCGoIkdre0ha7W
-# T8MfGzP7GBxhPOYcjKJLGk2e2lg0qkcioU63N09M/ryo4HiobxtR0ybCNn5QnFrj
-# 68eeJ7AxZFmT49ryoOUk3kd140YTY87P3W8cLMpsI+qdpjcNJxHQXqvon0o5RQil
-# sgc1T9tc9gzbBBrL4pZb2W2aMhoDWurLD1Twd0KZi1f+DJ134N5HWQfSiOSFnm91
-# CNzXvtVlo5cW6dEuTAgzETddsR0kwccoibpSEB3LF/Gmkcbw5wEPCoa9Dmounj/F
-# ism5KfELEGgN3MxuIEHJxVczeXbWZ4NtZfQSDHahI9YgoWQrsg675BrMEfBP1ACx
-# bJFtmZW4UFes/WuZnMrlIOU543Jcm+77Iei3rpEa6fUiuBeG6cU7+Vcrgl0RDVz9
-# phx+HIIzpeoVk9rj7MVU2MZtFHGAZOyjxSmrLDW+M0fkk0MlZlS/c7RgVn5rI7Bo
-# IaQOpUkv7CTXDE7ZLGl/nsDZuZjcIYvAkCAacO/Wa8kVZ9OUmq5sXGqb2EoQGD1v
-# pzYxUzs+QFGuFtUDvdDPNWHZGgBQQEzYZkQzyEG5ZmwOonKBz7wlJRJY/P6BgdcF
-# akl689ME9IXugSip5knBLVwgcTpLrdL6sULWBZ3uG1w4vDCuXFrOh5qFFWAntgi1
-# bfyLV8RlLkbhlC09FxO26M18vw==
+# Fw0yNjA2MjQxMzAzNTFaMC8GCSqGSIb3DQEJBDEiBCBkdgCH9SCkfBLN8MSQ6Ic3
+# KkKZx6SjjsrXWyZ01x6gqzANBgkqhkiG9w0BAQEFAASCAgBiQD0NeBmWDoaL3qVU
+# AFnv0csB4P7iOJuEETyi2EbPWLXNY8LClb0LzZKxPPbDCfbtQMyirX4i/soO+xUF
+# Mol2z5q/fQ2jpRfJB2GoWjOr3SoW+DSQkbURgIZoES1OrMX6XmM+ykfgWMdR/YxQ
+# TnxHsEJnAt/xLDUwbxyf7wkf5YrUvQjoBZYmvWlqrUFJ7dbOqAgG9VaFnDsF/0P7
+# x9R9kUd23erVJWnNpf6VpZtizLQkSJT8eCA+R3mE9MmDELPPfr4ZUaCaQ24HjLkl
+# o5yOKZiZYp+O1u1TA/tsQdb2aAc8nQT0pWsZfAX4FIeloLRgVAgxc0sYjKeBojOT
+# 0W2c1at1Auvxa+JupuK7izAYYr379ZAuYAJwXn9eX0UXYLSWCsnF8VqCFXcR+RqV
+# IsK5QyKC2dq/L1iYj+tl+jEsvR6Jtkq3DrojUhTHB/0WGzZS3a2CUHwCunLroYQh
+# EiD9SSunyYQJGO4lb+pAUz9MwOamLPIfboVwQlJjOxBO+vjqB+CsW78WQxktWjM8
+# Ex96q5MXG6eKqw3Y66es4HKVL/ss0Q1B+gVgA2XtpKH40TE10Lz95a+pmbmPZN6L
+# GEwneL/oM9EB63zdSSVLYTWT8930r1LFlseZ0KoT0uC9IR5uRsVOzXAu4sbLYQnK
+# ZPwStAz5FAm/v6tzLTFAn8Wp7w==
 # SIG # End signature block
