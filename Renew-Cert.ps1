@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.5.0'
+$ScriptVersion = '2.5.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -457,18 +457,23 @@ function New-TelemetryEvent {
     # RENEWAL-ONLY helper (NOT part of the shared/diff-able set - the creator/bootstrap emit single events
     # directly). Builds one pre-stamped work-event consumed by Send-Telemetry's per-event loop so the LA
     # timeline reflects when the work actually happened (TimeGenerated stamped here, at the event).
+    # -DaysUntilExpiry (optional) stamps the DaysUntilExpiry column on this event (e.g. the newly-issued
+    # cert's remaining life on a cert-renewed event); left $null when not supplied so Send-Telemetry leaves
+    # the column empty.
     param(
         [Parameter(Mandatory)][string] $Action,
         [string] $Domain,
         [string] $RunOutcome,
-        [string] $Message
+        [string] $Message,
+        [object] $DaysUntilExpiry = $null
     )
     [pscustomobject]@{
-        Action        = $Action
-        Domain        = $Domain
-        RunOutcome    = $RunOutcome
-        Message       = $Message
-        TimeGenerated = (Get-Date).ToUniversalTime().ToString('o')
+        Action          = $Action
+        Domain          = $Domain
+        RunOutcome      = $RunOutcome
+        Message         = $Message
+        DaysUntilExpiry = $DaysUntilExpiry
+        TimeGenerated   = (Get-Date).ToUniversalTime().ToString('o')
     }
 }
 
@@ -1670,7 +1675,10 @@ function Invoke-RenewalCore {
                 $renewedCount++
                 $renewedDomains += $domain
                 $forcedNote = if ($Force) { ', forced' } else { '' }
-                $renewalEvents.Add((New-TelemetryEvent -Action 'cert-renewed' -Domain $domain -RunOutcome 'Renewed' `
+                # DaysUntilExpiry stamps the NEW cert's remaining life (what is now deployed), so the Monitor
+                # Log's "expiring soon" view is consistent with the renew summary's NextExpiry-derived value.
+                $newDaysToExpiry = try { [int](($newCert.NotAfter - (Get-Date)).TotalDays) } catch { $null }
+                $renewalEvents.Add((New-TelemetryEvent -Action 'cert-renewed' -Domain $domain -RunOutcome 'Renewed' -DaysUntilExpiry $newDaysToExpiry `
                     -Message ("{0} -> {1} ({2}d to expiry{3})" -f $cert.Thumbprint, $newCert.Thumbprint, $daysToExpiry, $forcedNote)))
 
                 $bindingSuccess = $false
@@ -1933,8 +1941,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDyJFOH6eHfq3MT
-# QW/bpPtWUKojGX4WpMKI8AcIyRQaE6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCnA8x/6Ni0wbng
+# NNkL/J8DXFegqG402q8TPusqLygIN6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2065,31 +2073,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIAJUN+1fAZnirQXTHRZtTrKV2M+tgypvji7O
-# s7FGJnZVMA0GCSqGSIb3DQEBAQUABIIBgDAF034RZPK1NLK1Pb615XXQkYqroIjM
-# dj7bepaGOBmfaNfRIajAdScX4ynCqzLydKPz9o8MahrcEAf/SVQ1C8rW5trxH+u1
-# krL8krQzW220EuMn8JvnA42rfu5TNqN6JVhFQ8FeyCldNh2GIt8H8WErWlCzHUtx
-# K/O/YXIscQARDjRyt1f40WTQVWXKXKRxiUisc8YLLnrUCDhpIFR9CLJuXeIVsRYB
-# qJAZWillKAFo1H7TqZqWzj2qN1XYQsxIgo8ag8RZd7EUvUuLLKaH+wNpQVEYaTRn
-# 8EdBPsj5qEgXPwCXpQ/PYhrD35g5gNK09z52N/5C/VclgYmuLLx8YdcfdJiDL71G
-# Kk5aDvZ00LALAVfuw2gW/poCcIrpfqkhKNS314mtmNitK6T2YD0lzz28eI8DXJly
-# Ft4ErhZz6kxRleTbQT8pbs5gVfXgQTPEtYkni/u6h/JyLyy4TTu4by4rCSzcx7tl
-# X0rnUJ7UHM7/kuRywCEwekdYJJyOOMAEgKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIA+XpO50ZtMjSPISmNuIblSvjzdXDMi5KjOe
+# qYhMDj68MA0GCSqGSIb3DQEBAQUABIIBgLVgH6Ml+b0PdsWhJS2+pCQxVBP2o+lZ
+# AkM9uIQQCeDKq8Cl1Qnw18F2EyZsmkrd2EbBnqB9bjQpvJqMIt+q2oEsaJ1Nb31X
+# 8rHVKeHcUWxBp7dvwshwPwIa6EJ06NJJMmnLDRJhlD9F8IJeqTtfyqaBMITPEdo7
+# rewj5kGjW1DqquFp4B4w8YJwVnEtFO8eO8qCoq0qjpKFjwvr9gUn+OGoSMDORLCQ
+# Mypm4TMSWcvCX8b/sf9erZr3CxXrrSG70pbkRjPRGzFeDlx4ZGQ5chnzk7m72PeI
+# eL6Ix/g/Df66tYvM4VgQG9IJo4+fJAUMZfPzXsiBGFscjUJrgcXcEUQL0svyKb4E
+# fknyhmp4l3cr00XuCxY9ljAggiatSZUcCPLMuWkkSX0CUmn0AUcAL8Zn9mQoo/3M
+# GL4D7UBO2E6rtnedCEdPJdRUk+4fSt2WHq2iDVmiJMcLuTFzSiqC8+MsmwrjCyN/
+# 5AhrtIqTVJVY4hiCKEg7DSe6gLnmn3nx3aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjQxMzAzNTFaMC8GCSqGSIb3DQEJBDEiBCBkdgCH9SCkfBLN8MSQ6Ic3
-# KkKZx6SjjsrXWyZ01x6gqzANBgkqhkiG9w0BAQEFAASCAgBiQD0NeBmWDoaL3qVU
-# AFnv0csB4P7iOJuEETyi2EbPWLXNY8LClb0LzZKxPPbDCfbtQMyirX4i/soO+xUF
-# Mol2z5q/fQ2jpRfJB2GoWjOr3SoW+DSQkbURgIZoES1OrMX6XmM+ykfgWMdR/YxQ
-# TnxHsEJnAt/xLDUwbxyf7wkf5YrUvQjoBZYmvWlqrUFJ7dbOqAgG9VaFnDsF/0P7
-# x9R9kUd23erVJWnNpf6VpZtizLQkSJT8eCA+R3mE9MmDELPPfr4ZUaCaQ24HjLkl
-# o5yOKZiZYp+O1u1TA/tsQdb2aAc8nQT0pWsZfAX4FIeloLRgVAgxc0sYjKeBojOT
-# 0W2c1at1Auvxa+JupuK7izAYYr379ZAuYAJwXn9eX0UXYLSWCsnF8VqCFXcR+RqV
-# IsK5QyKC2dq/L1iYj+tl+jEsvR6Jtkq3DrojUhTHB/0WGzZS3a2CUHwCunLroYQh
-# EiD9SSunyYQJGO4lb+pAUz9MwOamLPIfboVwQlJjOxBO+vjqB+CsW78WQxktWjM8
-# Ex96q5MXG6eKqw3Y66es4HKVL/ss0Q1B+gVgA2XtpKH40TE10Lz95a+pmbmPZN6L
-# GEwneL/oM9EB63zdSSVLYTWT8930r1LFlseZ0KoT0uC9IR5uRsVOzXAu4sbLYQnK
-# ZPwStAz5FAm/v6tzLTFAn8Wp7w==
+# Fw0yNjA2MjQxMzM1NDlaMC8GCSqGSIb3DQEJBDEiBCAUj7raTeYnFM+J/tcf5J3C
+# gK96yBdFmKWGLlQu/RU9ITANBgkqhkiG9w0BAQEFAASCAgBWsz3eisR0cYDD8dIK
+# o5a9mlcWh6q8/nEQVCNc675Npxirjyu/M03yjyYy83KIQJx1q337is3lKXRfT5w/
+# E5AZZ98wRqgrMDFUrXRDAkJSooQj8iPbdwq2y0LzMyjJ6NC83UmNhTt5FGAFtNFR
+# zQbKs5RZe13QnDs2qyVFhm/odIVsNuE8tY2/K0vIENijKF0Kszv6QKAuCcXCF3Ui
+# g6w/8FYh5hanHYhvH1nnjOj9WAutiR/sURLCl0WJY2HzYyZ3ZafG6Z6wcrSZaRR9
+# kx+ir5CoFpeVG19uBNawsfW1hNh5C/eOXPEj0NmgV6YQq8BvLm/gVdturhLcsPhA
+# SgIcDADQHjZQb4tH8hCzGKmthgSL3GOV1uxMqcCwNLcvRTxpslhOdXVR3GFVmYcb
+# Alc7xkxejM8mL4ktotnzmSjkIlg+J3YPa5p1Wv5/4L5xpq52VlnUpFanLx+V/UtA
+# 20aC+8dj1D4zExBJp6BEXwcTXxGHCC/Zk2RpyIpQ96bWjvMCi+ZD3xUOThzLxkDr
+# Yw+LqVYKmClhyJpnTIc4dJ8in/8r7Een8v0/+vSLr23WG5EjYzt2g1oFz9Tlo5h1
+# ORjU0lO7NnmVUakx5P+MH+EEgle1eVkfze7xyGdBB7H6PZN3l3jeLLpeL52Vnzdj
+# 6yMu/B45Kai3VNzX0DGzGad8HQ==
 # SIG # End signature block
