@@ -1,19 +1,19 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-06-24T13:35:51Z",
+  "updatedAt": "2026-06-25T08:13:16Z",
   "creator": {
-    "version": "2.5.1",
+    "version": "2.6.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/Create-New-Cert.ps1",
-    "sha256": "27f474c735ad774e3c5df8e9ed1413d955da495c52bd53523330726404a786ee"
+    "sha256": "56b125f30758f295df244d47ab2ed840ec61140be3820c1805848916fa70ce59"
   },
   "renewal": {
-    "version": "2.5.1",
+    "version": "2.6.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/Renew-Cert.ps1",
-    "sha256": "70a15c2e9c7356460c533a92907a1fea5b57c456f12241fbc170ca74befdbf0a"
+    "sha256": "0dbab21ba40eae46af57a0669fd7ec84da1ddf419b9370c269fbae45986cf3cb"
   },
   "bootstrap": {
-    "version": "2.5.1",
+    "version": "2.6.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/bootstrap.ps1",
-    "sha256": "497ca80b017d5fd184568b7edce0046eac30fb8a5ae6cf24dd2ec2137eac8f2a"
+    "sha256": "3a37104c835ec2452170528d94a7fa56f7b8707808510652b93ac554f09e3e9c"
   }
 }

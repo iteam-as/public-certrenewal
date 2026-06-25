@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.5.1'
+$ScriptVersion = '2.6.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1342,6 +1342,10 @@ function Invoke-RenewalCore {
     $renewedDomains = @()
     $criticalError = $null
     $webhook = $Secrets.TeamsWebhookUrl
+    # Post-renewal action problems on a cert that DID renew (service restart not coming back, pre/post
+    # hook erroring). The renewal itself succeeded so the run summary stays Success, but an operator must
+    # still be told - these drive a separate warning-severity Teams card after the loop (issue #76).
+    $postActionIssues = @()
     # Discrete per-domain work-events (cert-renewed / service-restarted / pre-hook / post-hook), each
     # stamped when it happens; sent alongside the summary 'renew' row in one batched POST (issue #61).
     $renewalEvents = [System.Collections.Generic.List[object]]::new()
@@ -1632,6 +1636,7 @@ function Invoke-RenewalCore {
                 $hookStatus = Invoke-RenewalHook -ScriptPath $domainConfig.PreRenewalScript -Phase Pre -DomainConfig $domainConfig `
                     -Thumbprint $cert.Thumbprint -NotAfter ($cert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
                 $renewalEvents.Add((New-TelemetryEvent -Action 'pre-hook' -Domain $domain -RunOutcome $hookStatus -Message ([string]$domainConfig.PreRenewalScript)))
+                if ($hookStatus -eq 'Failed') { $postActionIssues += @{ Domain = $domain; Action = 'Pre-renewal hook failed'; Detail = [string]$domainConfig.PreRenewalScript } }
             }
             # Heal a v1-migrated order whose DnsVariant was serialized empty by an older Posh-ACME: the newer
             # module's Submit-Renewal/New-PACertificate reject '' (ValidateSet dns-01,dns-account-01) and the
@@ -1768,6 +1773,7 @@ function Invoke-RenewalCore {
                     }
                     catch { $svcStatus = 'Failed'; Write-Log "Failed to restart service '$serviceName' after renewal of ${domain}: $($_.Exception.Message)" -Level ERROR }
                     $renewalEvents.Add((New-TelemetryEvent -Action 'service-restarted' -Domain $domain -RunOutcome $svcStatus -Message ([string]$serviceName)))
+                    if ($svcStatus -ne 'Ok') { $postActionIssues += @{ Domain = $domain; Action = "Service restart $svcStatus"; Detail = [string]$serviceName } }
                 }
 
                 # Optional post-renewal hook (config.PostRenewalScript) - best-effort; runs after a
@@ -1776,6 +1782,7 @@ function Invoke-RenewalCore {
                     $hookStatus = Invoke-RenewalHook -ScriptPath $domainConfig.PostRenewalScript -Phase Post -DomainConfig $domainConfig `
                         -Thumbprint $newCert.Thumbprint -NotAfter ($newCert.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'))
                     $renewalEvents.Add((New-TelemetryEvent -Action 'post-hook' -Domain $domain -RunOutcome $hookStatus -Message ([string]$domainConfig.PostRenewalScript)))
+                    if ($hookStatus -eq 'Failed') { $postActionIssues += @{ Domain = $domain; Action = 'Post-renewal hook failed'; Detail = [string]$domainConfig.PostRenewalScript } }
                 }
 
                 # Persist new certificate details
@@ -1804,6 +1811,19 @@ function Invoke-RenewalCore {
             $facts['Failed Certificates'] = $renewalFailures.Count
             Send-TeamsNotification -WebhookUrl $webhook -Title 'Certificate Renewal Failed' `
                 -Message $failureMessage -Severity attention -Facts $facts
+        }
+
+        # Post-renewal action card - the cert renewed but a service restart didn't come back, or a
+        # pre/post hook errored. The run summary stays Success (the cert is fine), so this is the ONLY
+        # operator-facing signal for these; raise a warning-severity card (issue #76). Sent separately
+        # from the renewal-failure card so the two severities/meanings stay distinct.
+        if ($postActionIssues.Count -gt 0) {
+            Write-Log "=== $($postActionIssues.Count) post-renewal action issue(s) detected - sending Teams notification ===" -Level WARNING
+            $warnMessage = (@($postActionIssues | ForEach-Object { "- **$($_.Domain)**: $($_.Action) (``$($_.Detail)``)" }) -join "`n`n")
+            $facts = Get-TeamsFacts -Config $Config
+            $facts['Post-Renewal Issues'] = $postActionIssues.Count
+            Send-TeamsNotification -WebhookUrl $webhook -Title 'Certificate Renewed - Post-Renewal Action Failed' `
+                -Message $warnMessage -Severity warning -Facts $facts
         }
         Write-Log 'All renewal checks completed.' -Level INFO
     }
@@ -1941,8 +1961,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCnA8x/6Ni0wbng
-# NNkL/J8DXFegqG402q8TPusqLygIN6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBw5cUXLJzpwVf6
+# 4uHMbDCBTuDvXEeff4PC/a3hemeGQ6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2073,31 +2093,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIA+XpO50ZtMjSPISmNuIblSvjzdXDMi5KjOe
-# qYhMDj68MA0GCSqGSIb3DQEBAQUABIIBgLVgH6Ml+b0PdsWhJS2+pCQxVBP2o+lZ
-# AkM9uIQQCeDKq8Cl1Qnw18F2EyZsmkrd2EbBnqB9bjQpvJqMIt+q2oEsaJ1Nb31X
-# 8rHVKeHcUWxBp7dvwshwPwIa6EJ06NJJMmnLDRJhlD9F8IJeqTtfyqaBMITPEdo7
-# rewj5kGjW1DqquFp4B4w8YJwVnEtFO8eO8qCoq0qjpKFjwvr9gUn+OGoSMDORLCQ
-# Mypm4TMSWcvCX8b/sf9erZr3CxXrrSG70pbkRjPRGzFeDlx4ZGQ5chnzk7m72PeI
-# eL6Ix/g/Df66tYvM4VgQG9IJo4+fJAUMZfPzXsiBGFscjUJrgcXcEUQL0svyKb4E
-# fknyhmp4l3cr00XuCxY9ljAggiatSZUcCPLMuWkkSX0CUmn0AUcAL8Zn9mQoo/3M
-# GL4D7UBO2E6rtnedCEdPJdRUk+4fSt2WHq2iDVmiJMcLuTFzSiqC8+MsmwrjCyN/
-# 5AhrtIqTVJVY4hiCKEg7DSe6gLnmn3nx3aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBoOvx6f+HMvfdl1z6EB4SZ935VjFYkMNwFw
+# j2ceNNWwMA0GCSqGSIb3DQEBAQUABIIBgJ+23lbhlBR4oxYnQ7PG7YDYnJPNTeJE
+# MGO6yu/OSBH4+WDZR9r7gUcZVNkdjHZqFGaUosXgP5z8ZB6Y/+D7eQ8FMbz5Qq5C
+# A7pl37Nxjw+2qvdjxHux9kduosD5bzmoqC1ynZXg4T1BgKEDVyz260Ypx0rsMMCr
+# mYR7ihmDwLkveElT4YHZAbcdfSKRRoTShIVSroATISxaAca917t4FKkgQWrpEP+d
+# EkHQ7iWOr3KtL7rcHR3SJbyBYudR0Z2ahrGUdQ3nlm03pN1dnRqtkOSKBCuV3HfW
+# 4lc6tzUPCdfpHuxvShAqgjcJTc3Aguw+xTPHWJ6tyKhWPvZcgJ0YOBsoynPgdDRi
+# Ztu1xKY7zW/cq3v87fdtbPbUJKpjbtJhBK9lN5orCwj/1ByWhS8zoH+8VV+Ww3aI
+# r/LD2z6i618gmw0R/IIqzw0GLn/14WS0wSNv8yip7k0Cyvrh8WTwe+oDjcn+TiHP
+# /HLAi1GWundDJyZLXlcseHOPOur82i/+f6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjQxMzM1NDlaMC8GCSqGSIb3DQEJBDEiBCAUj7raTeYnFM+J/tcf5J3C
-# gK96yBdFmKWGLlQu/RU9ITANBgkqhkiG9w0BAQEFAASCAgBWsz3eisR0cYDD8dIK
-# o5a9mlcWh6q8/nEQVCNc675Npxirjyu/M03yjyYy83KIQJx1q337is3lKXRfT5w/
-# E5AZZ98wRqgrMDFUrXRDAkJSooQj8iPbdwq2y0LzMyjJ6NC83UmNhTt5FGAFtNFR
-# zQbKs5RZe13QnDs2qyVFhm/odIVsNuE8tY2/K0vIENijKF0Kszv6QKAuCcXCF3Ui
-# g6w/8FYh5hanHYhvH1nnjOj9WAutiR/sURLCl0WJY2HzYyZ3ZafG6Z6wcrSZaRR9
-# kx+ir5CoFpeVG19uBNawsfW1hNh5C/eOXPEj0NmgV6YQq8BvLm/gVdturhLcsPhA
-# SgIcDADQHjZQb4tH8hCzGKmthgSL3GOV1uxMqcCwNLcvRTxpslhOdXVR3GFVmYcb
-# Alc7xkxejM8mL4ktotnzmSjkIlg+J3YPa5p1Wv5/4L5xpq52VlnUpFanLx+V/UtA
-# 20aC+8dj1D4zExBJp6BEXwcTXxGHCC/Zk2RpyIpQ96bWjvMCi+ZD3xUOThzLxkDr
-# Yw+LqVYKmClhyJpnTIc4dJ8in/8r7Een8v0/+vSLr23WG5EjYzt2g1oFz9Tlo5h1
-# ORjU0lO7NnmVUakx5P+MH+EEgle1eVkfze7xyGdBB7H6PZN3l3jeLLpeL52Vnzdj
-# 6yMu/B45Kai3VNzX0DGzGad8HQ==
+# Fw0yNjA2MjUwODEzMTVaMC8GCSqGSIb3DQEJBDEiBCDs4VkvcaCmKnKlFW+p+4RR
+# y9Jo+5VAlL7zczx9auMnKDANBgkqhkiG9w0BAQEFAASCAgBrjTNE8lP/sP90UC1D
+# j6Up0nEO/DODIdV8VgoeWazKkmX8FJrRV185vW6S2/TOLnBqBRCfQHo1poK0E5f7
+# 9p19lP1TNxSFnqC7vPhEjesRdlDTsDG3O0WePKZKcy6ZV39895+mnECKTyPsHrrD
+# j7cdtnFE7Gz742S1BzhTaoyiZkFnZyVXYD8/dHAH1DE57RPCeEQlAqW7ex9/YvQ8
+# qBoGK4XUsp4H7HiBGDwuMT3h1QtS2C+4DbwEL1eWJgwyRxG+fBb7dZWVMxQnq6JC
+# SSlZZTwm0PwLKdfy6VaLO3wFstCphrHKCLirfq5N4J1Bxz4O8w2CHJ1Akd0p8P18
+# 5RqeXY44tpd1IRNrt+yah5KMOgs7mChGzEW0ZWsSj97kCRY5eKHF/oJH1KtbZbGy
+# 5Wfh2Q67Gg3A43JywtnyV5ZQ3aw6lViDcy7k7AYh1c1p7fV2So/SPSFeHV7jOyvq
+# boMz3IBtftNO04yeZ5wHAkm4/X8gtEUNHJaK6e3DraLEMMU0DztrJwGHMKgPQ1FH
+# XiLcedb2jUv4F7ilPIRNAhzgkkwF9ndNA/LCiZItrVrzv8j9p9/x+3YA/ok3GyLj
+# mg4yNOR7etj5j2cslQfqNsF+x8xy2GT6d4NQMOOMKVnxkKhdWJtu+3LMGtA4+wpI
+# 0We1TF5GWh2MZJ/AVehzYuZ7EQ==
 # SIG # End signature block
