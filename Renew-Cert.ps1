@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.6.0'
+$ScriptVersion = '2.7.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -83,7 +83,7 @@ $SelfPath        = $PSCommandPath        # this script's own path, for the atomi
 # Windows Event Log
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
-$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; SigRefused = 1040; SecretsRefreshed = 1045; Breaker = 1050 }
+$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; AppProxyUpdated = 1032; AppProxyFailed = 1033; AppProxyAuthCertRenewed = 1034; SigRefused = 1040; SecretsRefreshed = 1045; Breaker = 1050 }
 
 # Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
 # Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
@@ -295,6 +295,60 @@ function Get-TelemetryAccessToken {
             client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
             client_assertion      = $jwt
         }).access_token
+}
+
+function Get-GraphAccessToken {
+    # Client-certificate assertion (RS256 JWT, no secret) -> AAD token for the Microsoft Graph scope
+    # https://graph.microsoft.com/.default. The App Proxy cert sync (issue #64) talks to Graph rather than
+    # the Monitor ingestion endpoint, so this is a sibling of Get-TelemetryAccessToken that differs ONLY in
+    # scope - KEPT IN SYNC with it (same JWT/x5t/RSA-PKCS1 flow). Throws on any failure; the best-effort
+    # callers (Invoke-AppProxySyncPass / the creator app-picker) swallow it.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert (diff-able rule).
+    param(
+        [Parameter(Mandatory)][string] $TenantId,
+        [Parameter(Mandatory)][string] $AppClientId,
+        [Parameter(Mandatory)][string] $CertThumbprint
+    )
+    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $CertThumbprint } | Select-Object -First 1
+    if (-not $cert)               { throw "App Proxy auth cert (thumbprint $CertThumbprint) not found in LocalMachine\My" }
+    if (-not $cert.HasPrivateKey) { throw "App Proxy auth cert $CertThumbprint has no private key" }
+
+    $now    = [DateTimeOffset]::UtcNow
+    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = ConvertTo-Base64Url -Bytes $cert.GetCertHash() } | ConvertTo-Json -Compress
+    $claims = @{
+        aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        iss = $AppClientId; sub = $AppClientId
+        jti = [Guid]::NewGuid().ToString()
+        nbf = $now.ToUnixTimeSeconds(); exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+    } | ConvertTo-Json -Compress
+    $toSign = (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($header))) + '.' +
+              (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($claims)))
+    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $sig = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($toSign),
+        [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    $jwt = $toSign + '.' + (ConvertTo-Base64Url -Bytes $sig)
+
+    try {
+        return (Invoke-RestMethod -Method Post `
+            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 20 `
+            -Body @{
+                client_id             = $AppClientId
+                scope                 = 'https://graph.microsoft.com/.default'
+                grant_type            = 'client_credentials'
+                client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                client_assertion      = $jwt
+            }).access_token
+    }
+    catch {
+        # Surface the AAD error body (the AADSTSxxxxx code + description) - a bare "(400) Bad Request" hides
+        # the real reason (bad cert/assertion, missing consent, wrong tenant, ...). Invoke-RestMethod stashes
+        # the response body in $_.ErrorDetails.Message on PS 5.1 and 7.
+        $detail = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "Graph token request failed: $detail"
+    }
 }
 
 function Get-RuntimeInfo {
@@ -1328,6 +1382,227 @@ function Invoke-RenewalHook {
     return $status
 }
 
+#region App Proxy certificate sync (issue #64) --------------------------------
+# Folds the standalone AdHoc App Proxy updater into the renewal: when our renewal swaps a cert, push the
+# new cert into the Entra Application Proxy app that publishes it, inline (no second scheduled task, no
+# poller - we already have the new thumbprint in hand). One pass after the renewal loop handles BOTH the
+# post-renewal push AND a per-run drift reconcile (push only when Entra's registered thumbprint != local),
+# closing the gap where a push failed but the cert won't renew again for ~60 days (spec section3). All of
+# it is best-effort / fail-open (golden rule): any Graph/token/PATCH failure logs WARNING + event + a
+# failed telemetry event and NEVER throws - renewal still exits 0 and a failed push never rolls back the
+# (successful) local renewal. The executor + helpers below live ONLY here (diff-able rule); the creator
+# wires the per-domain target, Setup-AppProxy.ps1 registers the shared Entra app.
+
+function Get-AppProxyRegisteredThumbprint {
+    # Best-effort GET of the cert thumbprint currently registered on an App Proxy app
+    # (.../onPremisesPublishing -> verifiedCustomDomainCertificatesMetadata[].thumbprint). Returns the
+    # normalized (uppercase, separators stripped) thumbprint, or $null if none / unavailable. Drives the
+    # per-run reconcile (push only on mismatch). Never throws.
+    param([Parameter(Mandatory)][string] $AccessToken, [Parameter(Mandatory)][string] $AppObjectId)
+    $headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json' }
+    $uri = "https://graph.microsoft.com/beta/applications/$AppObjectId/onPremisesPublishing"
+    try {
+        $pub  = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -TimeoutSec 30
+        $meta = $pub.verifiedCustomDomainCertificatesMetadata
+        if (-not $meta) { return $null }
+        $items = if ($meta -is [System.Collections.IEnumerable] -and $meta -isnot [string]) { $meta } else { @($meta) }
+        foreach ($i in $items) {
+            $tp = if ($i.thumbprint) { $i.thumbprint } elseif ($i.Thumbprint) { $i.Thumbprint } else { $null }
+            if ($tp) { return ($tp -replace '[:\s-]', '').ToUpper() }
+        }
+        return $null
+    }
+    catch { Write-Log "Could not read App Proxy registered cert for ${AppObjectId}: $($_.Exception.Message)" -Level DEBUG; return $null }
+}
+
+function Get-CertificatePfxForGraph {
+    # Build the { Base64; Password } pair the Graph onPremisesPublishing PATCH needs, from a Posh-ACME
+    # PACertificate object. Reads the on-disk PFX (cert + private key + chain) Posh-ACME already wrote and
+    # decodes its SecureString password. PORTABLE (file read + .NET only - no cert-store export, no
+    # Windows-only crypto) so it runs unchanged under PS 5.1 today and PS 7/Linux later (spec section8).
+    param([Parameter(Mandatory)][object] $Certificate)
+    $pfxPath =
+        if ($Certificate.PfxFullChain -and (Test-Path -LiteralPath $Certificate.PfxFullChain)) { $Certificate.PfxFullChain }
+        elseif ($Certificate.PfxFile -and (Test-Path -LiteralPath $Certificate.PfxFile)) { $Certificate.PfxFile }
+        else { $null }
+    if (-not $pfxPath) { throw "Posh-ACME PFX file not found for '$($Certificate.Subject)' (PfxFullChain/PfxFile missing or absent on disk)" }
+    $bytes = [System.IO.File]::ReadAllBytes($pfxPath)
+    $password = ''
+    if ($Certificate.PfxPass) {
+        if ($Certificate.PfxPass -is [System.Security.SecureString]) {
+            $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Certificate.PfxPass)
+            try { $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+        }
+        else { $password = [string]$Certificate.PfxPass }
+    }
+    return @{ Base64 = [Convert]::ToBase64String($bytes); Password = $password }
+}
+
+function Set-AppProxyCertificate {
+    # The ONLY executor of the App Proxy push (lives only in Renew-Cert.ps1, diff-able rule). PATCHes a
+    # renewed cert (PFX + password) into an Entra Application Proxy app's onPremisesPublishing via Graph
+    # (verifiedCustomDomainKeyCredential = X509CertAndPassword, the same shape the AdHoc tool used).
+    # PORTABLE: Graph REST over Invoke-RestMethod only, no Windows-only crypto, so it runs under PS 5.1 now
+    # and PS 7/Linux later unchanged (spec section8). Returns $true on success / $false on a Graph failure
+    # (the caller treats $false as a failed push: WARNING + AppProxyFailed event); never throws.
+    param(
+        [Parameter(Mandatory)][string] $AccessToken,
+        [Parameter(Mandatory)][string] $AppObjectId,
+        [Parameter(Mandatory)][string] $PfxBase64,
+        [string] $PfxPassword,
+        [string] $DisplayName
+    )
+    $headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json' }
+    $uri  = "https://graph.microsoft.com/beta/applications/$AppObjectId"
+    $body = @{
+        onPremisesPublishing = @{
+            verifiedCustomDomainKeyCredential      = @{ type = 'X509CertAndPassword'; value = $PfxBase64 }
+            verifiedCustomDomainPasswordCredential = @{ value = $PfxPassword }
+        }
+    } | ConvertTo-Json -Depth 10
+    try {
+        Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -Body $body -TimeoutSec 30 | Out-Null
+        return $true
+    }
+    catch {
+        Write-Log "App Proxy PATCH failed for '$DisplayName': $($_.Exception.Message)" -Level WARNING
+        return $false
+    }
+}
+
+function Update-AppProxyAuthCertificate {
+    # Best-effort SYSTEM self-renewal of the shared App Proxy AUTH cert (the credential the renewal uses to
+    # talk to Graph), preserving the AdHoc tool's zero-touch property. When the cert is <= 30 days from
+    # expiry: mint a fresh 2-year self-signed cert in LocalMachine\My, upload its PUBLIC key to the Entra
+    # app (APPEND - keeps the old key for overlap), repoint AppProxyAuth.AuthCertThumbprint, persist the
+    # config. Authenticates the upload with the OLD (still-valid) cert; this run keeps using the old cert,
+    # the next run uses the new one. Windows-only (mints a machine cert) - the push (Set-AppProxyCertificate)
+    # stays portable, the auth-cert mint does not (spec section8). -DryRun => WOULD + no-op. May throw
+    # (Graph/cert errors); the caller (Invoke-AppProxySyncPass) wraps it so the run never blocks.
+    param([Parameter(Mandatory)][object] $Config, [string] $Webhook, $RenewalEvents)
+    $auth     = $Config.AppProxyAuth
+    $oldThumb = [string]$auth.AuthCertThumbprint
+    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $oldThumb } | Select-Object -First 1
+    if (-not $cert) { Write-Log "App Proxy auth cert $oldThumb not found in LocalMachine\My; cannot self-renew (re-run Setup-AppProxy.ps1)." -Level WARNING; return }
+    $days = ($cert.NotAfter - (Get-Date)).Days
+    if ($days -gt 30) { Write-Log "App Proxy auth cert valid for $days more days; no self-renewal needed." -Level DEBUG; return }
+
+    if ($DryRun) { Write-Log "[DryRun] WOULD self-renew the App Proxy auth cert ($days days left): mint a new 2-year cert + upload its public key to Entra app $($auth.ClientId)." -Level INFO; return }
+
+    Write-Log "App Proxy auth cert expires in $days days; self-renewing (zero-touch)..." -Level WARNING
+    $appName = if ($auth.ApplicationName) { [string]$auth.ApplicationName } else { 'AppProxy-Certificate-Updater' }
+    $newCert = New-SelfSignedCertificate -Subject "CN=$appName-Auth" -CertStoreLocation 'Cert:\LocalMachine\My' `
+        -KeyExportPolicy NonExportable -KeySpec Signature -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256 `
+        -NotAfter (Get-Date).AddYears(2) -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.2') `
+        -Provider 'Microsoft Enhanced RSA and AES Cryptographic Provider'
+
+    $token   = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId -CertThumbprint $oldThumb
+    $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+    $appResp = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 30 `
+        -Uri ("https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '{0}'" -f $auth.ClientId)
+    if (-not $appResp.value -or $appResp.value.Count -eq 0) { throw "Entra app $($auth.ClientId) not found while self-renewing the auth cert" }
+    $appObjId = $appResp.value[0].id
+    $existing = @($appResp.value[0].keyCredentials)
+    $certB64  = [Convert]::ToBase64String($newCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    $newKey   = @{ type = 'AsymmetricX509Cert'; usage = 'Verify'; key = [Convert]::FromBase64String($certB64); displayName = ("Auth-Cert-" + $newCert.Thumbprint.Substring(0, 8)) }
+    $patchBody = @{ keyCredentials = @($existing + $newKey) } | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method Patch -Uri "https://graph.microsoft.com/v1.0/applications/$appObjId" -Headers $headers -Body $patchBody -TimeoutSec 30 | Out-Null
+
+    $auth | Add-Member -NotePropertyName 'AuthCertThumbprint' -NotePropertyValue $newCert.Thumbprint -Force
+    $null = Save-CertConfig -Config $Config -Reason 'App Proxy auth-cert self-renewal'
+    Write-Log "App Proxy auth cert self-renewed: $oldThumb -> $($newCert.Thumbprint) (old still valid for $days days)." -Level SUCCESS
+    Write-EventLogEntry $EID.AppProxyAuthCertRenewed Information "App Proxy auth cert renewed: $oldThumb -> $($newCert.Thumbprint)"
+    if ($RenewalEvents) { $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-authcert-renewed' -RunOutcome 'Ok' -Message ("{0} -> {1}" -f $oldThumb, $newCert.Thumbprint))) }
+    $facts = Get-TeamsFacts -Config $Config
+    $facts['Old Thumbprint'] = $oldThumb
+    $facts['New Thumbprint'] = $newCert.Thumbprint
+    Send-TeamsNotification -WebhookUrl $Webhook -Title 'App Proxy Auth Certificate Renewed' `
+        -Message "The App Proxy auth certificate on $env:COMPUTERNAME was automatically renewed (zero-touch). Future runs use the new certificate." `
+        -Severity good -Facts $facts
+}
+
+function Invoke-AppProxySyncPass {
+    # One pass after the renewal loop: for every domain carrying an AppProxy binding, push the local cert
+    # into its Entra Application Proxy app when Entra's registered thumbprint differs (covers both the
+    # post-renewal push and the per-run drift reconcile). Best-effort throughout: returns the post-action
+    # issues to fold into the warning Teams card; appends work-events to $RenewalEvents; emits a SUCCESS
+    # Teams card per update (locked decision #4 - higher stakes than a service restart). Never throws.
+    param([Parameter(Mandatory)][object] $Config, [string] $Webhook, $RenewalEvents)
+    $issues = @()
+    $auth = $Config.AppProxyAuth
+    if (-not $auth -or -not $auth.Enabled) { return $issues }
+    $targets = @($Config.Domains | Where-Object { $_.AppProxy -and $_.AppProxy.ApplicationObjectId })
+    if ($targets.Count -eq 0) { return $issues }
+
+    Write-Log '=== App Proxy certificate sync (issue #64) ===' -Level INFO
+    foreach ($f in 'TenantId', 'ClientId', 'AuthCertThumbprint') {
+        if ([string]::IsNullOrWhiteSpace([string]$auth.$f)) {
+            Write-Log "AppProxyAuth block missing '$f'; skipping App Proxy sync (re-run Setup-AppProxy.ps1)." -Level WARNING
+            return $issues
+        }
+    }
+
+    # Auth-cert self-renewal (best-effort; this run keeps using the old cert, persists the new for next run)
+    try { Update-AppProxyAuthCertificate -Config $Config -Webhook $Webhook -RenewalEvents $RenewalEvents }
+    catch { Write-Log "App Proxy auth-cert self-renewal failed (continuing on the existing cert): $($_.Exception.Message)" -Level WARNING }
+
+    # One Graph token for the whole pass (best-effort).
+    $token = $null
+    try { $token = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId -CertThumbprint $auth.AuthCertThumbprint }
+    catch {
+        Write-Log "Could not acquire a Graph token for App Proxy sync: $($_.Exception.Message)" -Level WARNING
+        Write-EventLogEntry $EID.AppProxyFailed Warning "App Proxy sync could not acquire a Graph token: $($_.Exception.Message)"
+        foreach ($d in $targets) {
+            $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-failed' -Domain ([string]$d.MainDomain) -RunOutcome 'Failed' -Message ("Graph token acquisition failed: " + $_.Exception.Message)))
+        }
+        $issues += @{ Domain = '(App Proxy)'; Action = 'App Proxy sync failed'; Detail = 'Graph token acquisition failed' }
+        return $issues
+    }
+
+    foreach ($d in $targets) {
+        $domain   = [string]$d.MainDomain
+        $appObjId = [string]$d.AppProxy.ApplicationObjectId
+        $appName  = if ($d.AppProxy.DisplayName) { [string]$d.AppProxy.DisplayName } else { $domain }
+        try {
+            $cert = Get-PACertificate -MainDomain $domain
+            if (-not ($cert -and $cert.Thumbprint)) { Write-Log "No certificate for $domain; skipping its App Proxy sync." -Level WARNING; continue }
+            $local = ($cert.Thumbprint -replace '[:\s-]', '').ToUpper()
+            $entra = Get-AppProxyRegisteredThumbprint -AccessToken $token -AppObjectId $appObjId
+            if ($entra -and $entra -eq $local) { Write-Log "App Proxy '$appName' already in sync ($local)." -Level INFO; continue }
+
+            if ($DryRun) {
+                Write-Log ("[DryRun] WOULD update App Proxy '{0}' to {1} (registered: {2})." -f $appName, $local, $(if ($entra) { $entra } else { 'none' })) -Level INFO
+                continue
+            }
+
+            $pfx = Get-CertificatePfxForGraph -Certificate $cert
+            $ok  = Set-AppProxyCertificate -AccessToken $token -AppObjectId $appObjId -PfxBase64 $pfx.Base64 -PfxPassword $pfx.Password -DisplayName $appName
+            if (-not $ok) { throw 'Graph PATCH returned a failure' }
+
+            Write-Log "App Proxy '$appName' ($domain) updated to $local." -Level SUCCESS
+            Write-EventLogEntry $EID.AppProxyUpdated Information "App Proxy '$appName' ($domain) certificate updated to $local"
+            $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-updated' -Domain $domain -RunOutcome 'Ok' -Message ("{0}: {1} -> {2}" -f $appName, $(if ($entra) { $entra } else { 'none' }), $local)))
+            $facts = Get-TeamsFacts -Config $Config
+            $facts['App Proxy']      = $appName
+            $facts['New Thumbprint'] = $local
+            Send-TeamsNotification -WebhookUrl $Webhook -Title "App Proxy Certificate Updated - $appName" `
+                -Message "The Application Proxy app **$appName** ($domain) is now serving the renewed certificate." `
+                -Severity good -Facts $facts
+        }
+        catch {
+            Write-Log "App Proxy sync failed for '$appName' ($domain): $($_.Exception.Message)" -Level WARNING
+            Write-EventLogEntry $EID.AppProxyFailed Warning "App Proxy sync failed for '$appName' ($domain): $($_.Exception.Message)"
+            $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-failed' -Domain $domain -RunOutcome 'Failed' -Message ("{0}: {1}" -f $appName, $_.Exception.Message)))
+            $issues += @{ Domain = $domain; Action = 'App Proxy update failed'; Detail = $appName }
+        }
+    }
+    return $issues
+}
+
+#endregion App Proxy certificate sync -----------------------------------------
+
 function Invoke-RenewalCore {
     # The ported v1 renewal loop: binding detection + config validation (incl. CertStore->Netsh
     # upgrade-on-detect), expiry check, Submit-Renewal with stale-authorization (-Force) recovery,
@@ -1803,6 +2078,13 @@ function Invoke-RenewalCore {
             }
         }   # foreach domain
 
+        # App Proxy certificate sync (issue #64) - one pass over the domains with an AppProxy binding,
+        # AFTER the renewal loop so a just-renewed cert is pushed and any drift is reconciled in the same
+        # place. Best-effort: returns post-action issues to fold into the warning card below; emits its own
+        # success cards + telemetry. A configured-but-unused feature is a cheap no-op (returns early).
+        $appProxyIssues = Invoke-AppProxySyncPass -Config $Config -Webhook $webhook -RenewalEvents $renewalEvents
+        if ($appProxyIssues) { $postActionIssues += $appProxyIssues }
+
         # Teams failure card - failures only, no heartbeat (spec section7)
         if ($renewalFailures.Count -gt 0) {
             Write-Log "=== $($renewalFailures.Count) renewal failure(s) detected - sending Teams notification ===" -Level ERROR
@@ -1961,8 +2243,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBw5cUXLJzpwVf6
-# 4uHMbDCBTuDvXEeff4PC/a3hemeGQ6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDf/ioSbloJ4pJN
+# S17aHw4njdmj5z1jGDg4aawSfuruG6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2093,31 +2375,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBoOvx6f+HMvfdl1z6EB4SZ935VjFYkMNwFw
-# j2ceNNWwMA0GCSqGSIb3DQEBAQUABIIBgJ+23lbhlBR4oxYnQ7PG7YDYnJPNTeJE
-# MGO6yu/OSBH4+WDZR9r7gUcZVNkdjHZqFGaUosXgP5z8ZB6Y/+D7eQ8FMbz5Qq5C
-# A7pl37Nxjw+2qvdjxHux9kduosD5bzmoqC1ynZXg4T1BgKEDVyz260Ypx0rsMMCr
-# mYR7ihmDwLkveElT4YHZAbcdfSKRRoTShIVSroATISxaAca917t4FKkgQWrpEP+d
-# EkHQ7iWOr3KtL7rcHR3SJbyBYudR0Z2ahrGUdQ3nlm03pN1dnRqtkOSKBCuV3HfW
-# 4lc6tzUPCdfpHuxvShAqgjcJTc3Aguw+xTPHWJ6tyKhWPvZcgJ0YOBsoynPgdDRi
-# Ztu1xKY7zW/cq3v87fdtbPbUJKpjbtJhBK9lN5orCwj/1ByWhS8zoH+8VV+Ww3aI
-# r/LD2z6i618gmw0R/IIqzw0GLn/14WS0wSNv8yip7k0Cyvrh8WTwe+oDjcn+TiHP
-# /HLAi1GWundDJyZLXlcseHOPOur82i/+f6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIIUHx8/4XNEDeqlKaohlq18C4PImyifV3I6z
+# 5qjl4p2RMA0GCSqGSIb3DQEBAQUABIIBgB25wjLOzhdvMtk3DLg7Pf/CNj3BTZKC
+# bXBBMKmMxKlFGQ5/O4qSYo8S0yAY1dg9PeKm17qyBJFxPiE05r2ECc6tE4DrZjHo
+# WVQNJ9EreVOVXCOZyslG5A9Xu2J8HLRgDqWrHANTJfbla8nZLSXA/YryPepNeRv1
+# vj+53EYd8WDYPWGBh6a9JO296J3uCLVsfcYc3QA3QLhu1ShE4K3ViF7m4epGcOp3
+# g8pk1MlT3JGM1HmESxdeKhGWMpdx4VrGvcvgYKP2+YB+bcF6uHs3vatQneUfB6kw
+# jWomQWiW+Eo+J0z2d+d3d9uJ/YOuGbAdPSOQeqlVnk6IvKVKb7yHws4Kj12JWK2s
+# j5x8q5vO7eTeH8y2FLxC1Cg26FAJ4pWMePQwpKJm6A1Rhr0pHphI+3rmapGkS9g2
+# n9GHtT3wy1LPbcCAgnKF9V1e5eCtIhYDpur+wuuREYY3dpp/Blb8RrjCx+z7/NRD
+# sEF92pgCGPNsus8AGiYljda1K79guNfFp6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjUwODEzMTVaMC8GCSqGSIb3DQEJBDEiBCDs4VkvcaCmKnKlFW+p+4RR
-# y9Jo+5VAlL7zczx9auMnKDANBgkqhkiG9w0BAQEFAASCAgBrjTNE8lP/sP90UC1D
-# j6Up0nEO/DODIdV8VgoeWazKkmX8FJrRV185vW6S2/TOLnBqBRCfQHo1poK0E5f7
-# 9p19lP1TNxSFnqC7vPhEjesRdlDTsDG3O0WePKZKcy6ZV39895+mnECKTyPsHrrD
-# j7cdtnFE7Gz742S1BzhTaoyiZkFnZyVXYD8/dHAH1DE57RPCeEQlAqW7ex9/YvQ8
-# qBoGK4XUsp4H7HiBGDwuMT3h1QtS2C+4DbwEL1eWJgwyRxG+fBb7dZWVMxQnq6JC
-# SSlZZTwm0PwLKdfy6VaLO3wFstCphrHKCLirfq5N4J1Bxz4O8w2CHJ1Akd0p8P18
-# 5RqeXY44tpd1IRNrt+yah5KMOgs7mChGzEW0ZWsSj97kCRY5eKHF/oJH1KtbZbGy
-# 5Wfh2Q67Gg3A43JywtnyV5ZQ3aw6lViDcy7k7AYh1c1p7fV2So/SPSFeHV7jOyvq
-# boMz3IBtftNO04yeZ5wHAkm4/X8gtEUNHJaK6e3DraLEMMU0DztrJwGHMKgPQ1FH
-# XiLcedb2jUv4F7ilPIRNAhzgkkwF9ndNA/LCiZItrVrzv8j9p9/x+3YA/ok3GyLj
-# mg4yNOR7etj5j2cslQfqNsF+x8xy2GT6d4NQMOOMKVnxkKhdWJtu+3LMGtA4+wpI
-# 0We1TF5GWh2MZJ/AVehzYuZ7EQ==
+# Fw0yNjA2MjUxMjIzMjZaMC8GCSqGSIb3DQEJBDEiBCBUxxTt/f1e/FnifxQagNOv
+# M6JSry8/G3yj4kgmxGhXwDANBgkqhkiG9w0BAQEFAASCAgDLlyBFXEDxCRgqPaFK
+# M5SVD/WlABnoMxfVtWs/ZYtSh0bMTjRIRKaKxmBiVjkEKl57anbAoGQg2UvqOAXQ
+# F2Xi4mNtmIUFKnjeROXecWyDkDyVoJOJxi8ZGfvrpApo3PA6VKoL5Tw9/b/gztqz
+# JVql5Jc21TdKZYhmuE9igfMtS3ukuN44wOaLBr9uWPrhqKnbyq5A2a6c8awFmfcj
+# lG0q9jsWI+XbTE/DaOs0Roq6m+KWYo0wtOVz96Aj0f0XjiRIvNYaqRf23E1qIEYP
+# r7CalFnAUOGE1/mRuBsvnbSNkt4y7hktEWxujE9lduAsBcH8obRhl0XHHE3maFp4
+# DUi+EwG1SXMBNcNNsCBtP+NlFb6fIoVV3bEY74cN/uYjne36rXSCNxuEBS29Dij4
+# O9zWexjgbMT48oK1jnYbB+dGPotzqYorh0ZiIfGqTBXq7dBxyv0sTHmUOrGOVsbm
+# JJ16ZRvSJw0J83bjWojspYs/a5soSPk9ImzLeJ2nQuYSBQ6IuNufxEnnUScf+gvR
+# CzlcgUqyj2Tc8RfdO6zJvdGVIKFBnNZVgddzHL3rSaWV3vvOYvsZPBc7C97jU46l
+# ryjhglU58RU9jeuTF3ogbgdGzx908KZrPgzG+2O46Wjl1x4H3ZFTw5tI9Y0vUDHK
+# 5Ut3RDNNAfxfkeAYBe5PVJuKHQ==
 # SIG # End signature block

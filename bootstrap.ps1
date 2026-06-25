@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.6.0'
+$ScriptVersion = '2.7.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -88,6 +88,7 @@ $ConfigPath      = Join-Path $CertRenewalPath 'cert-config.json'
 $SecretsPath     = Join-Path $CertRenewalPath 'cert-secrets.json'
 $RenewalScript   = Join-Path $CertRenewalPath 'Renew-Cert.ps1'
 $CreatorScript   = Join-Path $CertRenewalPath 'Create-New-Cert.ps1'
+$AppProxyScript  = Join-Path $CertRenewalPath 'Setup-AppProxy.ps1'
 $LogDir          = Join-Path $CertRenewalPath 'log'
 $RenewalTaskName = 'Renew-Cert'
 $SharedPoshAcmeDefault = 'C:\ProgramData\Posh-ACME'
@@ -907,6 +908,9 @@ function Install-FleetScripts {
 
     if ($DryRun) {
         Write-Log "[DryRun] WOULD download+verify Renew-Cert.ps1 $($manifest.renewal.version) and Create-New-Cert.ps1 $($manifest.creator.version)." -Level INFO
+        if ($manifest.appProxySetup -and $manifest.appProxySetup.url) {
+            Write-Log "[DryRun] WOULD also download+verify Setup-AppProxy.ps1 $($manifest.appProxySetup.version) (optional App Proxy setup tool)." -Level INFO
+        }
         return
     }
 
@@ -918,6 +922,17 @@ function Install-FleetScripts {
         Write-Log "Placed Create-New-Cert.ps1 $($manifest.creator.version) (signer $cthumb)." -Level SUCCESS
     }
     catch { Write-Log "Create-New-Cert.ps1 download failed: $($_.Exception.Message). Renewal is in place; re-run bootstrap to retry the creator." -Level WARNING }
+
+    # Setup-AppProxy.ps1 (issue #64) - the optional, signed App Proxy setup tool. Best-effort and only when
+    # the manifest carries it (older manifests won't): a fresh box can run it immediately if App Proxy is
+    # needed; a box that never uses App Proxy simply has an unused (signed) script on disk.
+    if ($manifest.appProxySetup -and $manifest.appProxySetup.url -and $manifest.appProxySetup.sha256) {
+        try {
+            $athumb = Save-VerifiedDownload -Url $manifest.appProxySetup.url -ExpectedSha256 $manifest.appProxySetup.sha256 -TargetPath $AppProxyScript -Label 'Setup-AppProxy.ps1'
+            Write-Log "Placed Setup-AppProxy.ps1 $($manifest.appProxySetup.version) (signer $athumb)." -Level SUCCESS
+        }
+        catch { Write-Log "Setup-AppProxy.ps1 download failed: $($_.Exception.Message). It is optional; re-run bootstrap or fetch it later if App Proxy sync is needed." -Level WARNING }
+    }
 
     Write-EventLogEntry $EID.ScriptsInstalled Information "Fleet scripts placed (renewal $($manifest.renewal.version), creator $($manifest.creator.version))"
 }
@@ -1152,8 +1167,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDC2r84LJ3aWqvc
-# jxRo12NYgvMTp5MygQlB8FXHQD9tl6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC07ksQDp87fHgj
+# M8KPwvgx8CF98LbUlBo4+WyQ8aFvtKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1284,31 +1299,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEILMx30Be98pmjKPoBozDjT0VwP/LaGy/ISSk
-# 8n3FNl6+MA0GCSqGSIb3DQEBAQUABIIBgKeiHl1lFyH33dvLotJVdJ6woAAoxzW4
-# nDePVmt2ZyeQWfFhNj+La5KYM2dPWDxOBMl4x0FRoxjINUwFRuRDCgDFTOq5kw6k
-# rsUujmKmOIgHEPNqx00k7Ql5yfYbRnKwQf5mD4gt8eH7Z2lqDwK3zRste5VC0BjG
-# wXNIKnPBe9xEfVbD4IwI7OKqax7kS5wkgVUABVapvvei66t3FBMbRy30Thq5/gpM
-# cEtOd866269EoaUGz9fDjYfK8EEgxcsjnmd1Tw79h7knYbsgteMPVbPDmnOsmZ8m
-# Reec5qI2xIgnh1WqC6d8kTUiuJcBrucJBOn5KFeS6gGwaPiJiV+w7ZYsfSUoAsLE
-# MPUAnw7j20Hsd4f+PqNwdn4Am8l0hOatRglqFyt0YActy5s7owCO7QMEVRHgUHkh
-# wIiSgO0YomZ+jBsqmZr2GAEZRga1PK6uryTze1ICIn1sjgUQElfXdlJtXghM5xG5
-# 0UVOOUTsZ7ZVEjDkwiWvOve+gt66/1qtgaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGx4xDKV5BbJCy1sXq3Ey37RVYJAMCyrDMox
+# Iht2of9lMA0GCSqGSIb3DQEBAQUABIIBgLUcrC7JtQuwEeS2SBmWqxlBTRlWaZn0
+# /SSkDtT1pDOi0asb7BLEjNBh/PFq8ZPerAyK1zjCGOBuq7Re+PJ6by1OmIUXOBQv
+# +kSaBn9sKPMif0JuuZ837sgiUbn76DL0AT+B6YwWA9D80d8Y7HbBN+QX9yhdKAhg
+# D1Dt4DoEEomiepDwpRVcScZhgPY66rhU0WG3TzhFSpjIskmcdnhP0XjgZ/UJCdeB
+# p5frcwVCBKcsp9zHUsBN1dPLUrcCV+XH5Rv7eV8nY5yv4jvhn+XEveV6dcvTEcgf
+# XGb97D+gdr0Lp5UpesY1FSKscFOfcj6D+Y+omiiXz2MRj9JOQdVrvFNtVXe7s+YJ
+# bYEb8O0GiPIV3RnyTCDpf66OvDNjtz4Ritp9wVdMylYMa6vKdNoARCOp0Jq1C/FF
+# nQjIWz/V7T/IpBTm5vGl3Z5X/VxYvsTN/TeGYWQU+DZ2AJNIHn0ILjxtaB4I8sJU
+# iMwcBQF2WYKTYCElAEy2XPu7Kp5WHXTNzKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjUwODEzMTNaMC8GCSqGSIb3DQEJBDEiBCBSFKJgwkycrSNEj3QxUYV4
-# /DpGbuEvdfbZ08UUqdh2YjANBgkqhkiG9w0BAQEFAASCAgAaYkdnc89zFvbEL4XS
-# 5UYQzJbDTIQjusGT0sfWaaI2JpTofIpyD11YbTAfOIUMl+e6KNTbJtfxD7ABELm4
-# igoushP+v/YAeU3FxLa+d9NM7Uz5d4BinZHS3UyqoIqW5HnjlgoEfUnhuvbknzgB
-# XlXU4tkFYWzdLXobXANygODxmzAPRm9/0inlf3yvzX3KojVLnnpbje6O9RTsKGHV
-# nBXr7rI6ZQ60KJnFS+Fvp4dSneJAL2iXbaddafoGOtOHJV+2e282KnKG96lgUl0S
-# 659z3fLiupXGJlRk/plWkR/fn32jw9gHqShEOzA7438fYo/TiPCiQ8rHNa92IWyM
-# EUuohq4G3vEMQOURze8nuXx3qgY7/Mtrbmhd9+l05eROJpOQe1sDVCt0WS7XMfa+
-# CyOiPBXvufvNAezj0mcTOse64fByyAMzMy5Epsreef5WiH8tS9kWPxizfVrOHZ0G
-# rz5XyGKNXlnh/c+N8JiVsQBrEUFCywlLH6jnS3YZdWhECt8n198OtKAKWC2ZVzCf
-# ZR3BCHSiy9884kXQ3XMMNnz6HR97xpEoJyImhT5pKbvOk/CBFw8V+Bb9EouY6ALz
-# Ey+K2yxpJMc8g4/xqdHXFsNOTNZmHSAu//qL2ii+mzpV+lPirYskhjcy6OxuUtib
-# 3aJukv1jfVYXGh7qUv++6/9NLg==
+# Fw0yNjA2MjUxMjIzMjVaMC8GCSqGSIb3DQEJBDEiBCApqr3DXQPZ4V9dnVc9JGcT
+# Z6uicQbHKJaeRkdc8BEIHzANBgkqhkiG9w0BAQEFAASCAgBH1JxbZQ0iqhdDuyNO
+# IDEidC4LK4zTw7LMjqr5EvBS3G1HwngyZRno7zQcMQ5gV2Jqb6FD1A6pf8qySMtQ
+# s+wgnNwankJ4psbmuSFi/Fea4y+Z79vWMZXEAqCAeHzYbPgxbA5QXjuiw/uKcaj7
+# UPsZ8/tVqpemJTFpfsKZ8D4sXnqgB5fSO5wyxullIjYj09RDS7OkMJDmk3PcteSN
+# y3AM4svo5Xllk76z9JSuFGkLy7G2H9uqCqm4flglLMc10KHLYVHTn0gKEqfppnET
+# pvlzqFgRx1obekYV/Ip2Izlq2cR98mx7ziIWoGbdBEvNsRiHdCet67ubnIksb0g6
+# VXe64Tnx2bwBuHs/2kBWcb5oZ3oiXsRWhUyyEoDuiZTNW4K81CJFJY3tGdMal1EB
+# awD20V8w3mEh8bnCTew6i6bQ57YfF6nKBcllWHavT3vMB3sg/7AGiQGKhfefkYXE
+# AORTxCzIEi4obqgfylEXFmdU/sNPYJj1jC7p1vw4a5KA0SWtznsxxP7otNUxefnc
+# PXr3Dmrkm1lhli+/aEXTwSEmQSkl2ObeeKDKuF4VE827s0ROGr862IS6nZ63aEM3
+# V3VRH0bmZZI5qV5uJ9C9ddyOugB/Qr1cHCbkaodAIUpf5AkAdIT9+ayCsTM0mws/
+# gMXELHfFVvciZJSmaaWEpBAyOQ==
 # SIG # End signature block

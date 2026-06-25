@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.6.0'
+$ScriptVersion = '2.7.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -394,6 +394,60 @@ function Get-TelemetryAccessToken {
             client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
             client_assertion      = $jwt
         }).access_token
+}
+
+function Get-GraphAccessToken {
+    # Client-certificate assertion (RS256 JWT, no secret) -> AAD token for the Microsoft Graph scope
+    # https://graph.microsoft.com/.default. The App Proxy cert sync (issue #64) talks to Graph rather than
+    # the Monitor ingestion endpoint, so this is a sibling of Get-TelemetryAccessToken that differs ONLY in
+    # scope - KEPT IN SYNC with it (same JWT/x5t/RSA-PKCS1 flow). Throws on any failure; the best-effort
+    # callers (Invoke-AppProxySyncPass / the creator app-picker) swallow it.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert (diff-able rule).
+    param(
+        [Parameter(Mandatory)][string] $TenantId,
+        [Parameter(Mandatory)][string] $AppClientId,
+        [Parameter(Mandatory)][string] $CertThumbprint
+    )
+    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $CertThumbprint } | Select-Object -First 1
+    if (-not $cert)               { throw "App Proxy auth cert (thumbprint $CertThumbprint) not found in LocalMachine\My" }
+    if (-not $cert.HasPrivateKey) { throw "App Proxy auth cert $CertThumbprint has no private key" }
+
+    $now    = [DateTimeOffset]::UtcNow
+    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = ConvertTo-Base64Url -Bytes $cert.GetCertHash() } | ConvertTo-Json -Compress
+    $claims = @{
+        aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        iss = $AppClientId; sub = $AppClientId
+        jti = [Guid]::NewGuid().ToString()
+        nbf = $now.ToUnixTimeSeconds(); exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+    } | ConvertTo-Json -Compress
+    $toSign = (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($header))) + '.' +
+              (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($claims)))
+    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $sig = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($toSign),
+        [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    $jwt = $toSign + '.' + (ConvertTo-Base64Url -Bytes $sig)
+
+    try {
+        return (Invoke-RestMethod -Method Post `
+            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 20 `
+            -Body @{
+                client_id             = $AppClientId
+                scope                 = 'https://graph.microsoft.com/.default'
+                grant_type            = 'client_credentials'
+                client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                client_assertion      = $jwt
+            }).access_token
+    }
+    catch {
+        # Surface the AAD error body (the AADSTSxxxxx code + description) - a bare "(400) Bad Request" hides
+        # the real reason (bad cert/assertion, missing consent, wrong tenant, ...). Invoke-RestMethod stashes
+        # the response body in $_.ErrorDetails.Message on PS 5.1 and 7.
+        $detail = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "Graph token request failed: $detail"
+    }
 }
 
 function Get-RuntimeInfo {
@@ -1910,6 +1964,102 @@ function Read-RenewalHook {
     return $hook
 }
 
+function Get-AppProxyApplicationsRest {
+    # Issue #64: list the tenant's Entra Application Proxy apps via cert-auth Graph REST (no Graph SDK on
+    # the creator path - the SDK lives only in Setup-AppProxy.ps1). App Proxy apps are the service
+    # principals tagged 'WindowsAzureActiveDirectoryOnPremApp'; for each we resolve the backing application
+    # object id (the PATCH target). Returns @( @{ DisplayName; ObjectId; AppId } ). Creator-only; the caller
+    # handles a throw (token/Graph failure).
+    param([Parameter(Mandatory)][string] $AccessToken)
+    $headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json'; ConsistencyLevel = 'eventual' }
+    $apps = @()
+    $uri  = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=tags/any(t:t eq 'WindowsAzureActiveDirectoryOnPremApp')&`$select=appId,displayName&`$count=true"
+    while ($uri) {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -TimeoutSec 30
+        foreach ($sp in $resp.value) {
+            try {
+                $a = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 30 `
+                    -Uri ("https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '{0}'&`$select=id,displayName,appId" -f $sp.appId)
+                if ($a.value -and $a.value.Count -gt 0) {
+                    $apps += [pscustomobject]@{ DisplayName = [string]$sp.displayName; ObjectId = [string]$a.value[0].id; AppId = [string]$sp.appId }
+                }
+            }
+            catch { Write-Log "Could not resolve the application object for '$($sp.displayName)': $($_.Exception.Message)" -Level WARNING }
+        }
+        $uri = $resp.'@odata.nextLink'
+    }
+    return $apps
+}
+
+function Read-AppProxyTarget {
+    # Issue #64: optional per-domain Entra Application Proxy binding (shared by the Add and Update flows),
+    # mirroring Read-RestartService/Read-RenewalHook. Lists the tenant's App Proxy apps via cert-auth Graph
+    # REST using the shared AppProxyAuth credential and returns @{ ApplicationObjectId; AppId; DisplayName }
+    # (logs/Teams/telemetry use DisplayName only), or $null for none. If AppProxyAuth isn't set up on this
+    # box, explains that Setup-AppProxy.ps1 must run first and skips. -Current (Update flow) is the existing
+    # AppProxy object: [K]eep/[C]hange/[R]emove, so Enter never silently wipes it.
+    param([Parameter(Mandatory)][object] $Config, [object] $Current)
+    $auth = $Config.AppProxyAuth
+    $configured = ($auth -and $auth.Enabled -and
+        -not [string]::IsNullOrWhiteSpace([string]$auth.TenantId) -and
+        -not [string]::IsNullOrWhiteSpace([string]$auth.ClientId) -and
+        -not [string]::IsNullOrWhiteSpace([string]$auth.AuthCertThumbprint))
+    $update  = $PSBoundParameters.ContainsKey('Current')
+    $curName = if ($Current -and $Current.DisplayName) { [string]$Current.DisplayName } else { '' }
+
+    if ($update) {
+        Write-UiSetting 'App Proxy sync' -Current $curName
+        if (-not [string]::IsNullOrWhiteSpace($curName)) {
+            Write-UiOption '[K] keep   [C] change   [R] remove'
+            while ($true) {
+                $ans = (Read-UiInput 'Choice' -Default 'K').Trim().ToUpper()
+                if ($ans -eq '' -or $ans -eq 'K') { return $Current }
+                if ($ans -eq 'R') { Write-UiResult 'App Proxy sync removed'; return $null }
+                if ($ans -eq 'C') { break }
+                Write-Log 'Enter K, C, or R (or press Enter to keep).' -Level WARNING
+            }
+        }
+        else {
+            if (-not $configured) { Write-UiResult 'App Proxy not set up on this box - run Setup-AppProxy.ps1 first (skipping)' -Kind Warn; return $null }
+            if ((Read-UiInput 'Sync this certificate to an Entra Application Proxy app? (y/N)').Trim().ToUpper() -ne 'Y') { return $null }
+        }
+    }
+    else {
+        # Add flow: silently skip when App Proxy isn't set up (opt-in feature - no noise for the common case).
+        if (-not $configured) { return $null }
+        if ((Read-Host 'Sync this certificate to an Entra Application Proxy app? (Y/N)').Trim().ToUpper() -ne 'Y') { return $null }
+    }
+
+    if (-not $configured) { Write-Log 'App Proxy is not set up on this box (run Setup-AppProxy.ps1 first).' -Level WARNING; return $null }
+    if ($DryRun) { Write-Log '[DryRun] WOULD list the tenant''s Application Proxy apps via Graph and prompt to pick one.' -Level INFO; return $null }
+
+    try {
+        $token = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId -CertThumbprint $auth.AuthCertThumbprint
+        $apps  = @(Get-AppProxyApplicationsRest -AccessToken $token)
+    }
+    catch { Write-Log "Could not list Application Proxy apps: $($_.Exception.Message). Skipping App Proxy sync for this certificate." -Level WARNING; return $null }
+
+    if ($apps.Count -eq 0) { Write-Log 'No Entra Application Proxy applications found in this tenant. Skipping.' -Level WARNING; return $null }
+
+    Write-Host ''
+    for ($i = 0; $i -lt $apps.Count; $i++) {
+        Write-Host ("   {0,2}   " -f ($i + 1)) -ForegroundColor Yellow -NoNewline
+        Write-Host ("{0,-40}{1}" -f $apps[$i].DisplayName, $apps[$i].ObjectId) -ForegroundColor White
+    }
+    Write-UiRule
+    while ($true) {
+        $pick = (Read-UiInput 'Pick an App Proxy app number, or Enter to skip').Trim()
+        if ($pick -eq '') { return $null }
+        $idx = 0
+        if (-not [int]::TryParse($pick, [ref]$idx)) { Write-Log 'Enter a number, or Enter to skip.' -Level WARNING; continue }
+        $idx--
+        if ($idx -lt 0 -or $idx -ge $apps.Count) { Write-Log "Enter a number between 1 and $($apps.Count)." -Level WARNING; continue }
+        $sel = $apps[$idx]
+        Write-UiResult "App Proxy app: $($sel.DisplayName)" -Kind Ok
+        return [pscustomobject]@{ ApplicationObjectId = $sel.ObjectId; AppId = $sel.AppId; DisplayName = $sel.DisplayName }
+    }
+}
+
 function Read-RenewalThreshold {
     # Issue #57: interactive renewal lead-time capture (shared by the Add and Update flows). Returns the
     # number of days before expiry to renew at, as an [int]. Pressing Enter keeps the default
@@ -1942,8 +2092,8 @@ function Read-DomainsToAdd {
     # primary FQDN: validate format, optionally collect SANs, pick a deployment Type (IIS Web / IIS FTP
     # / CertStore / Netsh), an optional post-renewal service restart, and optional pre/post-renewal hook
     # scripts (issue #13). Returns an array of domain config objects ([pscustomobject] MainDomain/Type/
-    # Guid/SANs/NetshIpPorts/RestartService/PreRenewalScript/PostRenewalScript).
-    param([object[]] $ExistingDomains = @())
+    # Guid/SANs/NetshIpPorts/RestartService/PreRenewalScript/PostRenewalScript/AppProxy).
+    param([object[]] $ExistingDomains = @(), [object] $Config)
 
     $existingNames = @{}
     $knownNetsh = @{}    # ipPort -> domain, for conflict detection
@@ -1994,6 +2144,10 @@ function Read-DomainsToAdd {
         $preRenewalScript  = Read-RenewalHook -Phase Pre
         $postRenewalScript = Read-RenewalHook -Phase Post
 
+        # Optional Entra App Proxy sync target (issue #64; shared with the Update flow). Silently skips when
+        # App Proxy isn't set up on this box (run Setup-AppProxy.ps1 first).
+        $appProxy = Read-AppProxyTarget -Config $Config
+
         # Renewal lead time (issue #57; shared with the Update flow). Default 30.
         $renewalThreshold = Read-RenewalThreshold
 
@@ -2006,6 +2160,7 @@ function Read-DomainsToAdd {
             RestartService       = $restartService
             PreRenewalScript     = $preRenewalScript
             PostRenewalScript    = $postRenewalScript
+            AppProxy             = $appProxy
             RenewalThresholdDays = $renewalThreshold
         }
         $sanStr = if ($sans.Count -gt 0) { " + SANs: $($sans -join ', ')" } else { '' }
@@ -2034,6 +2189,14 @@ function ConvertTo-DomainConfigObject {
     if ($DomainConfig.RestartService) { $obj | Add-Member -NotePropertyName 'RestartService' -NotePropertyValue $DomainConfig.RestartService }
     if ($DomainConfig.PreRenewalScript)  { $obj | Add-Member -NotePropertyName 'PreRenewalScript'  -NotePropertyValue $DomainConfig.PreRenewalScript }
     if ($DomainConfig.PostRenewalScript) { $obj | Add-Member -NotePropertyName 'PostRenewalScript' -NotePropertyValue $DomainConfig.PostRenewalScript }
+    # Per-domain App Proxy binding (issue #64) - only when set, like RestartService/hooks.
+    if ($DomainConfig.AppProxy -and $DomainConfig.AppProxy.ApplicationObjectId) {
+        $obj | Add-Member -NotePropertyName 'AppProxy' -NotePropertyValue ([pscustomobject]@{
+            ApplicationObjectId = [string]$DomainConfig.AppProxy.ApplicationObjectId
+            AppId               = [string]$DomainConfig.AppProxy.AppId
+            DisplayName         = [string]$DomainConfig.AppProxy.DisplayName
+        })
+    }
     # Store the renewal lead time only when it differs from the default, so simple configs stay clean
     # (an absent field => the script default).
     if ($DomainConfig.RenewalThresholdDays -and [int]$DomainConfig.RenewalThresholdDays -ne $DefaultRenewalThresholdDays) {
@@ -2051,7 +2214,7 @@ function Invoke-AddFlow {
 
     Confirm-OperatorEmail   # accountability: capture the operator before any config-mutating action
     $existingDomains = @(); if ($Config -and $Config.Domains) { $existingDomains = @($Config.Domains) }
-    $toAdd = @(Read-DomainsToAdd -ExistingDomains $existingDomains)
+    $toAdd = @(Read-DomainsToAdd -ExistingDomains $existingDomains -Config $Config)
     if ($toAdd.Count -eq 0) { Write-Log 'No new domains entered - nothing to add.' -Level INFO; return }
 
     # Fresh shared secrets, then Posh-ACME / account setup (all before any issuance, spec section4).
@@ -2234,6 +2397,7 @@ function Invoke-UpdateFlow {
     Write-UiField 'Restart service'   ([string]$selected.RestartService)
     Write-UiField 'Pre-renewal hook'  ([string]$selected.PreRenewalScript)
     Write-UiField 'Post-renewal hook' ([string]$selected.PostRenewalScript)
+    Write-UiField 'App Proxy sync'    $(if ($selected.AppProxy -and $selected.AppProxy.DisplayName) { [string]$selected.AppProxy.DisplayName } else { '' })
     Write-UiField 'Renew before'      $(if ($selected.RenewalThresholdDays) { "$($selected.RenewalThresholdDays) days" } else { "$DefaultRenewalThresholdDays days (default)" })
     Write-UiField 'Thumbprint'        ([string]$selected.Thumbprint)
     Write-UiField 'Expires'           ([string]$selected.NotAfter)
@@ -2253,6 +2417,7 @@ function Invoke-UpdateFlow {
     $restartService = Read-RestartService -Current ([string]$selected.RestartService)
     $preRenewalScript  = Read-RenewalHook -Phase Pre  -Current ([string]$selected.PreRenewalScript)
     $postRenewalScript = Read-RenewalHook -Phase Post -Current ([string]$selected.PostRenewalScript)
+    $appProxy          = Read-AppProxyTarget -Config $Config -Current $selected.AppProxy
     $renewalThreshold  = Read-RenewalThreshold -Current ([int]$selected.RenewalThresholdDays)
 
     # Re-deploy the existing store cert per the new Type (no re-issue). If the cert is gone from the
@@ -2296,6 +2461,15 @@ function Invoke-UpdateFlow {
     elseif ($selected.PSObject.Properties['PreRenewalScript']) { $selected.PSObject.Properties.Remove('PreRenewalScript') }
     if ($postRenewalScript) { $selected | Add-Member -NotePropertyName 'PostRenewalScript' -NotePropertyValue $postRenewalScript -Force }
     elseif ($selected.PSObject.Properties['PostRenewalScript']) { $selected.PSObject.Properties.Remove('PostRenewalScript') }
+    # App Proxy binding (issue #64): set when chosen, removed when cleared - in place, like the hooks.
+    if ($appProxy -and $appProxy.ApplicationObjectId) {
+        $selected | Add-Member -NotePropertyName 'AppProxy' -NotePropertyValue ([pscustomobject]@{
+            ApplicationObjectId = [string]$appProxy.ApplicationObjectId
+            AppId               = [string]$appProxy.AppId
+            DisplayName         = [string]$appProxy.DisplayName
+        }) -Force
+    }
+    elseif ($selected.PSObject.Properties['AppProxy']) { $selected.PSObject.Properties.Remove('AppProxy') }
     # Renewal lead time: store only a non-default override; choosing the default clears it (issue #57).
     if ($renewalThreshold -and $renewalThreshold -ne $DefaultRenewalThresholdDays) {
         $selected | Add-Member -NotePropertyName 'RenewalThresholdDays' -NotePropertyValue ([int]$renewalThreshold) -Force
@@ -2342,6 +2516,7 @@ function Write-ConfigOverview {
         if ($d.RestartService)              { $bits += "restart $($d.RestartService)" }
         if ($d.PreRenewalScript)            { $bits += 'pre-hook' }
         if ($d.PostRenewalScript)           { $bits += 'post-hook' }
+        if ($d.AppProxy -and $d.AppProxy.ApplicationObjectId) { $bits += 'app-proxy' }
         if ($bits.Count) { Write-Host ("        " + ($bits -join "  $dot ")) -ForegroundColor DarkGray }
     }
     Write-UiRule
@@ -2480,8 +2655,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAei1TwUgxM2QOJ
-# Kt22mx/A19aq0htyZdW3gkU+a5hYxaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCABCpYi71rfdlk+
+# iakDzsdbvOF817/KUaTw/WsMhZO+46CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2612,31 +2787,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIM4NCiWNv9Wq1HGNBK/6UTuSR+kEKBoQj2IA
-# PEehXRpYMA0GCSqGSIb3DQEBAQUABIIBgLYcBS/A2K626J4BH4vSJghyyhUKVV8h
-# DgqWRrndY/njSesWq96HRmlLl9FSA/J8+vQ0ihqyKo3TUErGv/ipdpEDP9ad27dZ
-# tq0SD9Xw7n9qeupRV5gBGszpvVyucG6I+c6zXBYCkB5DwSidXJG/OExifjplRJiN
-# T/jnPQtzwGxIP/bNiZQ1s1UxGZl5vMbj76HmsxGwLpwkWB2ZUzBRVdvYyUuktglh
-# DJMYL3gVBqVvEIC4mS3Rb78ICBsbP2WM0/iUJ91UlLo/m8dOq2+ov/DwNW6zU2NO
-# y2BrEPx0tC105qvEooPsVefAZT+KnqeyuE8zz7w8wuz+txw1e09AVDEqGu59Fzaa
-# 391SS30ga45TgPQiTYqZMGIxFAUcMpkcBWizkGZF7UHEcQKOG4gFpDyB8k/vwezs
-# q2p2cVK3mB+iKzAImaBAnWDODAO3o0Phi/900tunYPLcEEyvRAQkrU9Enllu/Fse
-# 6i/hhgy2C/O9Rj4bJ4kdVmMRFRsfARyye6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIH8HuQtaqcvkJGebxeEGUWsGvfzGvXviAGjb
+# BOeoMux4MA0GCSqGSIb3DQEBAQUABIIBgH85SFRmMFIAffiLsVciACQFQZQ7lKei
+# l5znO3vwaKVZPuSggMC/GfAyB2tTgTpkVwOeHCfMPdJhnZM9lOCvLg87yUXmLQJX
+# aedfQLMVj+Uia+TYNYAM9YILznvpzSkmgT5vmwC+cF22hbQAd+vj3YO7war7CypW
+# 1Z6iMyX4/QGtar1qwwspGGRSRHnIVYdd7yTNrmwCl0IIUcu1YdrL/7/ynAFqgxUk
+# 5Hebymcgy2cr/lCyos+tF3mNJCPEzOvxh3Z7nbSdgol54uu5Cpme7Akm7KSXHx1k
+# TV2WmpF3IxLQODn5u1TjC2MjJrc/WvV4ZTAWfJ1KyyVv3mWGmenpy97hoql79gFS
+# X9eVr4lU9JHKcQQ2MQnLzBs8AOcLKcuWbgOiVlvlIHO7PfXPdQynT0V1gmumJXcD
+# 8pW55wYVdTvSBtNjVDUqyMfRXlXkUZRnYcBQE+YPpqpe+1TFjQ70IiMbX9kaW3DV
+# aCawlRWrs7FuWhWHttkueSBM0OL/NRG/R6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjUwODEzMTRaMC8GCSqGSIb3DQEJBDEiBCBZHgsQcOUIVUDi3RBy6NWg
-# P6zL0jFqLtW2jjGJvxkzFzANBgkqhkiG9w0BAQEFAASCAgDDJpqAiF2AIu739YK6
-# 7mTKZZFwF9OCPyiNCwDwZBWKgMcC2nGc28kvukO/+AeEY5pC9gUstFjLtfAeTSvD
-# Rn1uN0TpWRIJKcLVR2XcEpem70NwPtcS3sZ0xz6KVHfnrd77vzLrb8cqC/cg99H3
-# y6++k0JFX/VRezje074wtDAIcSy8Q3htV0K/qCYJWkXOAPucFj7VxB212N97ukil
-# RFki3yoKrWhOraq8MJNeC5/FpKJ/zuALx7Gr/isCo0g52xbWDs6iaG6/OTZuu4ZA
-# 53jtPRpT9E+RNESsAvU2KMah8rUMX33SM4pvUbm4GpapqVUrBpdapu0atK8YObaC
-# cd4Lr+mEA1ryOB5MFYMDRxyJOmGXi906qfILwtiY8KBAvQNF4krIkwD2bzvebzGr
-# aCmAUkd0aTt91JsLGmZ4SOK5O2t2u59X0joFTrIEecVD89rZTPC36jc8694Nuw3/
-# 6T81/oAICCRh1hj62buvbYmN5Vc6eQwhkORAbMGodW0FQOi+CRIJ4fmdLinnCdNy
-# MOz6P6QzcNGYFfs/0XZhQqrXmWa9NYrJvX6Boh+M3ap4i/mK+RH4OKvfdnlFEQ5N
-# Tz8vV1jj6RBx1wy/BRL/+7eZMFUa27ZYmHU4KWeP337zCj3yvrB05zWuUcjc9mE5
-# 8qaWjmtUUGLFIYOmXrb+3rKfxg==
+# Fw0yNjA2MjUxMjIzMjZaMC8GCSqGSIb3DQEJBDEiBCBiy7ZcR8/Iv1FnfyXwREej
+# 4StuoQ476NmD6q3KjjixzzANBgkqhkiG9w0BAQEFAASCAgCR5cEtU//65brEkGN5
+# m4mPqjlVockxxyoBOZPlIFTb9xK6hqP9ux42TUrX/HErqUTQ5+1L/vTIgrApCTK4
+# NFd9trilaNBcm/dgLnvOrpNbiE2zxuyK6XqoDaE/5Mgf9DghJmOb4jiyrkdNgOxF
+# GuR0a55hTuU8sBOfEjvKtiwiVjRKpZXZy6eWlBqlzk6xszp+raXphgjo+GImTePW
+# VOfR4EjF8eU2JT+ziWeNW9SmlE5HfgAxakru+V9Wjh42hM5MWd8eq2KDV96OiR4B
+# pfdHxOB9I8tlYOUu481n86wWKumb64wTYPtBodA7ucANpvzZ31KTIwoxpnalC0jQ
+# 870zEBFnGgCpUI/1ivZV+9DHZ4+nPDMh6qoU0lc2lAYLwdpd2kMH17ujDNAx9kAx
+# 8euyp6H5HkyVaXNjsbQ1vywR/nLGBR8uGKxhRpOZqi6cHRmk2LyLwhLehznVUFmQ
+# LwENlEvgxqR3URIikeiIiw6hlJD/UiTJLg9uH8stoaXjt1YuNRgihXijfl1zPMFi
+# byKL0o9J8cy2G3n6Upf62k6KLXDCT1rg64IaetrFbIz0hCDInPvKsEDEqitvklJN
+# 12Gst6ugBQQwFyi7tOhFF7l0yFb/V6zdr/adbNsQw6K8Sj7NQiNYI7il2zXBsqwO
+# Pt60TOTZ+wPR9BzRV9e3QU9e1g==
 # SIG # End signature block
