@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.7.0'
+$ScriptVersion = '2.8.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -81,6 +81,11 @@ $AllowedSignerThumbprints = @(
 # Built-in production URLs (overridable via -ManifestUrl / -CodeSignCertUrl test channels).
 $DefaultManifestUrl     = 'https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/manifest.json'
 $DefaultCodeSignCertUrl = 'https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/codesign.cer'
+
+# Operations guide (the public mirror's README) shown to the operator. The manifest's docs.url may move it,
+# but is honoured only under the iteam-as GitHub prefixes (Resolve-GuideUrl) - the manifest is unsigned.
+$DefaultGuideUrl = 'https://github.com/iteam-as/public-certrenewal#readme'
+$script:GuideUrl = $DefaultGuideUrl
 
 # Paths (identical to Renew-Cert.ps1 / Create-New-Cert.ps1 so all three files agree).
 $CertRenewalPath = 'C:\Cert\Renewal'
@@ -694,6 +699,24 @@ function Register-RenewalTask {
 
 #region Bootstrap-only helpers ------------------------------------------------
 
+function Resolve-GuideUrl {
+    # Pick the operations-guide URL to show the operator: the manifest's docs.url when present AND under the
+    # iteam-as GitHub prefixes, else the built-in mirror README ($DefaultGuideUrl). The manifest is fetched
+    # over HTTPS but is NOT signed, so its value must never be able to send an admin's browser somewhere
+    # else - the prefix allow-list is hard-coded by design (never make it configurable). Never throws.
+    # SHARED VERBATIM by the creator + bootstrap (NOT renewal - it has no operator to show it to).
+    param([object] $Manifest)
+    $url = $DefaultGuideUrl
+    try {
+        $candidate = if ($Manifest -and $Manifest.docs) { [string]$Manifest.docs.url } else { $null }
+        if ($candidate -and ($candidate -like 'https://github.com/iteam-as/*' -or $candidate -like 'https://raw.githubusercontent.com/iteam-as/*')) {
+            $url = $candidate
+        }
+    }
+    catch { }
+    return $url
+}
+
 function Confirm-OperatorEmail {
     # Capture the accountable operator's work email for interactive, config-mutating runs (telemetry schema
     # v2 -> OperatorEmail). Required: re-prompts until a valid address is entered (no skip - that is the
@@ -858,10 +881,11 @@ function Install-SpCert {
 function Install-RequiredModules {
     # Duty 3 ("Fix A", unattended). Ensure NuGet provider + PSGallery trust + TLS 1.2, then install the
     # modules the SYSTEM renewal + creator need, machine-wide (-Scope AllUsers) so the SYSTEM task can load
-    # them. Born here; the creator's pending interactive "Fix A" copies this (sharing, not duplicating) and
+    # them. DnsClient-PS is creator-only (CAA walk in Test-CaaRecordForLetsEncrypt) but the creator hard-fails
+    # without it, so it belongs in the baseline set. Born here; the creator's pending interactive "Fix A" copies this (sharing, not duplicating) and
     # wraps it with prompts. Best-effort per module: a failure warns + continues (Connect-SecretsVault /
     # Posh-ACME re-check at use; the box may still be partly usable).
-    param([string[]] $Modules = @('Az.Accounts', 'Az.KeyVault', 'Posh-ACME'))
+    param([string[]] $Modules = @('Az.Accounts', 'Az.KeyVault', 'Posh-ACME', 'DnsClient-PS'))
     if ($DryRun) {
         Write-Log "[DryRun] WOULD ensure NuGet + PSGallery trust + install (AllUsers): $($Modules -join ', ')." -Level INFO
         return
@@ -905,6 +929,7 @@ function Install-FleetScripts {
     $manifest = Invoke-WithRetry -OperationName 'manifest fetch' -ScriptBlock { Invoke-RestMethod -Uri $url -TimeoutSec 15 -UseBasicParsing }
     if (-not $manifest.renewal.version) { throw 'manifest has no renewal.version' }
     if (-not $manifest.creator.version) { throw 'manifest has no creator.version' }
+    $script:GuideUrl = Resolve-GuideUrl -Manifest $manifest   # for the Next-steps block (prefix-guarded)
 
     if ($DryRun) {
         Write-Log "[DryRun] WOULD download+verify Renew-Cert.ps1 $($manifest.renewal.version) and Create-New-Cert.ps1 $($manifest.creator.version)." -Level INFO
@@ -1088,6 +1113,37 @@ function Sync-BootstrapSecrets {
     }
 }
 
+function Write-BootstrapNextSteps {
+    # Bootstrap-only (#86). Tell the operator what to do now, tailored to the box: no managed certificates ->
+    # run the creator; certificates present (migrated / re-run) -> verify. Ends with the operations guide URL
+    # (Resolve-GuideUrl) and, on an interactive non-DryRun run, offers to open it in the default browser.
+    # Best-effort: a hiccup here must never turn a completed bootstrap into an error.
+    param([object] $Config)
+    try {
+        $domains = @(); if ($Config -and $Config.Domains) { $domains = @($Config.Domains) }
+        Write-Log '--- Next steps ---' -Level INFO
+        if ($domains.Count -eq 0) {
+            Write-Log "1. Add your certificates (elevated):  & '$CreatorScript'" -Level INFO
+            Write-Log '   Have the _acme-challenge CNAME for each name in place first; the creator prints the exact record if it is missing.' -Level INFO
+            Write-Log "2. Verify:  & '$CreatorScript' -CheckOnly    and    & '$RenewalScript' -DryRun" -Level INFO
+        }
+        else {
+            Write-Log "This server manages $($domains.Count) certificate(s). Verify they are all listed and the daily run is clean:" -Level INFO
+            Write-Log "   & '$CreatorScript' -CheckOnly" -Level INFO
+            Write-Log "   & '$RenewalScript' -DryRun" -Level INFO
+            Write-Log "   Get-ScheduledTask -TaskName '$RenewalTaskName'" -Level INFO
+        }
+        Write-Log "Step-by-step guide (install, upgrade, day-2, troubleshooting): $($script:GuideUrl)" -Level INFO
+        if ($DryRun -or -not [Environment]::UserInteractive) { return }
+        $answer = (Read-Host 'Open the guide in your browser now? [y/N]').Trim()
+        if ($answer -match '^[Yy]') {
+            Start-Process $script:GuideUrl | Out-Null
+            Write-Log 'Opened the guide in the default browser.' -Level INFO
+        }
+    }
+    catch { Write-Log "Could not print next steps: $($_.Exception.Message)" -Level DEBUG }
+}
+
 #endregion Bootstrap-only helpers ---------------------------------------------
 
 #region Main ------------------------------------------------------------------
@@ -1148,11 +1204,13 @@ try {
 
     Send-Telemetry -Config $config -Outcome ([pscustomobject]@{ Action = 'bootstrap'; RunOutcome = 'Success' })
     Write-Log '=== bootstrap finished ===' -Level SUCCESS
+    Write-BootstrapNextSteps -Config $config
 }
 catch {
     # Fatal failure (not elevated is handled above; here: codesign verify, required-script download, SP
     # cert absent + no PFX, config dir). Exit non-zero (spec section10).
     Write-Log "FATAL: $($_.Exception.Message)" -Level ERROR
+    Write-Log "Fix the cause above and run bootstrap again (it is safe to re-run). Troubleshooting page: linked from $($script:GuideUrl)" -Level INFO
     Write-EventLogEntry $EID.Start Error "Fatal bootstrap failure: $($_.Exception.Message)"
     $exitCode = 1
 }
@@ -1167,8 +1225,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC07ksQDp87fHgj
-# M8KPwvgx8CF98LbUlBo4+WyQ8aFvtKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCArZrvZIYH5InCQ
+# b65kQ4rQoCU5QG7a5z3MH/vxoyt+36CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1258,25 +1316,25 @@ exit $exitCode
 # d6xpR6oaQf/DJbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2Z
 # yJ/+xhCx9yHbxtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWC
 # nb5WqxL3/BAPvIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQ
-# CoDvGEuN8QWC0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEX
+# CE/cM09+RU7bww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEX
 # MBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0
-# ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1
-# MDYwNDAwMDAwMFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNV
+# ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2
+# MDgwNTAwMDAwMFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNV
 # BAoTDkRpZ2lDZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNB
-# NDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEB
-# BQADggIPADCCAgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMy
-# qJnfFNZx+wvA69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4Q
-# KpVD7dvNZh6wW2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8
-# SOhPUWlLnh00Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtU
-# DVHRXdmncOOMA3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCv
-# pSduSwhwUmotuQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1
-# Hf2JNMVL4Q1OpbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORV
-# bPR1VVnDuSeHVZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWn
-# qWU3dCCyFG1roSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyT
-# laCCfw7aSUROwnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0
-# yZIXe+giAwW00aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mn
-# AgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfz
-# kXFjGVBDz2GM6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNV
+# NDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEB
+# BQADggIPADCCAgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzW
+# JjF/NWJrFIhy24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2
+# epx+l+lZBcmJCcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGL
+# jsBNlLol9VZ7pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1
+# w+nCg6XpCtklTJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9
+# VuA5RVynb/whITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6M
+# Tdtr/n74lIT/ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDA
+# MDtozNgLctkGD1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJ
+# Y24L0yYKD1Nkddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLG
+# vdL/WHEj3ZnqMqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M
+# 0iwgUHwbrJvfpklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9
+# AgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtu
+# lPPm40B+9ezN4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNV
 # HQ8BAf8EBAMCB4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEB
 # BIGIMIGFMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYI
 # KwYBBQUHMAKGUWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRy
@@ -1284,46 +1342,46 @@ exit $exitCode
 # HR8EWDBWMFSgUqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRU
 # cnVzdGVkRzRUaW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYD
 # VR0gBBkwFzAIBgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4IC
-# AQBlKq3xHCcEua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fN
-# aNmFj6Eh8/YmRDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim
-# 8/9yJmZSe2F8AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4da
-# IqToXFE/JQ/EABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX
-# 8VBRKe1uNnzQVTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1
-# d0IbX6Wq8/gVutDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQf
-# VjnzrvwiCZ85EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ3
-# 5XTxfUlQ+8Hggt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3C
-# rWqZzBt1R9xJgKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlK
-# V9jEnstrniLvUxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk
-# +EMF/cWuiC7POGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzGCBb0wggW5AgEBMGEw
+# AQCNxTphHp1SCt+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwX
+# OdrOpWygLzlT12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJm
+# pR+b7lr4d7Uwn+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORS
+# jXzdjfw1iZH9d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC4
+# 1DSFYL3GhTiy0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlY
+# JoW3TiXA/+t0YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEW
+# PMqKDB+qbceb6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w
+# /TCaKtLRaRT7LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd
+# 1XOqtlpg/JgwtKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPW
+# cslIx2VhkSKSXjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr
+# 5dtFPTW6jATlWJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzGCBb0wggW5AgEBMGEw
 # TTELMAkGA1UEBhMCTk8xETAPBgNVBAoMCEl0ZWFtIEFTMSswKQYDVQQDDCJJdGVh
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGx4xDKV5BbJCy1sXq3Ey37RVYJAMCyrDMox
-# Iht2of9lMA0GCSqGSIb3DQEBAQUABIIBgLUcrC7JtQuwEeS2SBmWqxlBTRlWaZn0
-# /SSkDtT1pDOi0asb7BLEjNBh/PFq8ZPerAyK1zjCGOBuq7Re+PJ6by1OmIUXOBQv
-# +kSaBn9sKPMif0JuuZ837sgiUbn76DL0AT+B6YwWA9D80d8Y7HbBN+QX9yhdKAhg
-# D1Dt4DoEEomiepDwpRVcScZhgPY66rhU0WG3TzhFSpjIskmcdnhP0XjgZ/UJCdeB
-# p5frcwVCBKcsp9zHUsBN1dPLUrcCV+XH5Rv7eV8nY5yv4jvhn+XEveV6dcvTEcgf
-# XGb97D+gdr0Lp5UpesY1FSKscFOfcj6D+Y+omiiXz2MRj9JOQdVrvFNtVXe7s+YJ
-# bYEb8O0GiPIV3RnyTCDpf66OvDNjtz4Ritp9wVdMylYMa6vKdNoARCOp0Jq1C/FF
-# nQjIWz/V7T/IpBTm5vGl3Z5X/VxYvsTN/TeGYWQU+DZ2AJNIHn0ILjxtaB4I8sJU
-# iMwcBQF2WYKTYCElAEy2XPu7Kp5WHXTNzKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIN1QTiVPp/jt2r6xM5X3bFphjgLD/J27HbSl
+# a2KNbODFMA0GCSqGSIb3DQEBAQUABIIBgJOuQLXyW2UC+ELcarm1E86fphOyVSJA
+# MQBmy8FuKo8YvaZgN+J62GvCUKMpDi1lOnk2EH9l5lvc6MzRw3jRUFhXHyGadQS5
+# 6qpEZKZcINE3vNk9GR4HlOj/ubmN7sKaCiXcUDdFBeE70xkkE2qaqGmLIcJOCAyX
+# T0iXkCreszefEfX2Q94nAZYlduZ9CDYgYvXih3aPN9wV7ydUjDRQSJUcrkGwu6Dp
+# 31ijlH1gn+WOrrfceothwgliLQBC2mKisf88ZgdOPwX/pHow8mVlSdlMRIL4Imrt
+# nYT17OPaaD/JtaSRxdMaGBZsGiyHclGSwQtQWaKq6VqzQgnu5oxV7kFW5ZZDBFV8
+# I/k/GNAXy3MKtLte1uafkxRI8zjmO3+1vs08Lea8O9H5hYedDIWJ/szlIBftUJLp
+# vLx+4pgnxg3txaB9rab5I9y1wDPWSC3oSNej1kEJg1foVReEXoYwfTeH92YjNnOb
+# BgTIX+c5ivLxu9P5C0Z6GBecNb+WlxLDFqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
-# NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
+# NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjUxMjIzMjVaMC8GCSqGSIb3DQEJBDEiBCApqr3DXQPZ4V9dnVc9JGcT
-# Z6uicQbHKJaeRkdc8BEIHzANBgkqhkiG9w0BAQEFAASCAgBH1JxbZQ0iqhdDuyNO
-# IDEidC4LK4zTw7LMjqr5EvBS3G1HwngyZRno7zQcMQ5gV2Jqb6FD1A6pf8qySMtQ
-# s+wgnNwankJ4psbmuSFi/Fea4y+Z79vWMZXEAqCAeHzYbPgxbA5QXjuiw/uKcaj7
-# UPsZ8/tVqpemJTFpfsKZ8D4sXnqgB5fSO5wyxullIjYj09RDS7OkMJDmk3PcteSN
-# y3AM4svo5Xllk76z9JSuFGkLy7G2H9uqCqm4flglLMc10KHLYVHTn0gKEqfppnET
-# pvlzqFgRx1obekYV/Ip2Izlq2cR98mx7ziIWoGbdBEvNsRiHdCet67ubnIksb0g6
-# VXe64Tnx2bwBuHs/2kBWcb5oZ3oiXsRWhUyyEoDuiZTNW4K81CJFJY3tGdMal1EB
-# awD20V8w3mEh8bnCTew6i6bQ57YfF6nKBcllWHavT3vMB3sg/7AGiQGKhfefkYXE
-# AORTxCzIEi4obqgfylEXFmdU/sNPYJj1jC7p1vw4a5KA0SWtznsxxP7otNUxefnc
-# PXr3Dmrkm1lhli+/aEXTwSEmQSkl2ObeeKDKuF4VE827s0ROGr862IS6nZ63aEM3
-# V3VRH0bmZZI5qV5uJ9C9ddyOugB/Qr1cHCbkaodAIUpf5AkAdIT9+ayCsTM0mws/
-# gMXELHfFVvciZJSmaaWEpBAyOQ==
+# Fw0yNjA5MDgxMDMzMDJaMC8GCSqGSIb3DQEJBDEiBCCTXQ23f+dTU/Q0I5812KYF
+# 53ksfq7AGvv9mNl9USIitjANBgkqhkiG9w0BAQEFAASCAgAS4lv65oeqU/P47WuE
+# xqWcdPMUrTzBRngFkL1Mw7gm/BDvG5ySzmhbR05QLGT9uI1xNXpk9YRFmm2H/JzZ
+# ReMLCIxznilt7ZQAD3elMga3q0f2zH7NKheo964AIay1xlCMNrlVrbmYsrwFPebm
+# 1IUHE5KvJoQQ1WKvi/wQLtmfGLYZKvxryNfJjxD4Jjyd1MYcnd7ZPRfYMedniwMW
+# /+znziQwOt+cnDDIM+N0/hXjCkxzpjdDMTFQzcA+CW7Bt022s7s0Vynm6EkovajW
+# +zrIXs3jXaxoJd4pzysVrXZqLWBdIRi02kk+Yi9iQMCiSkwO3Rkg2f6tPa3b1uaP
+# KgywRn1NbLp5+phrjOBSXwTnzgYQmYkhvxbHBkGZs07BWHZMW7KzOQkcXud0p+8K
+# nGfgKBVppL5Fv/Y0zKEbwLabSgUqRCs70wPLvftGIlDJQiUb/5gZI4vGmauxh+4/
+# jet+UPAw9DT/iiys0ciVUXQoIcTcoxyvYAMo8MoBb0nWVYVcE7rxDNI2zwsyMY4D
+# 6tHFYi4+qG3Dmy0F+7CBfcx1b0NuX0l0kh67kbzpntm7JXDiRXDQ7dxsTx74QXdv
+# 62KBZDPykJqCvlH11Q4rbxuHIhKirYHvDGL1ASjdgjGxDYdcBQDQ6jI8HOeeB1r8
+# zdv4oDb8GGeTCdNu9K2++y8TeQ==
 # SIG # End signature block

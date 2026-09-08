@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.7.0'
+$ScriptVersion = '2.8.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -53,6 +53,11 @@ $AllowedSignerThumbprints = @(
 
 # Built-in production manifest URL (overridable via -ManifestUrl or cert-config.ManifestUrl test channel).
 $DefaultManifestUrl = 'https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/manifest.json'
+
+# Operations guide (the public mirror's README) shown to the operator. The manifest's docs.url may move it,
+# but is honoured only under the iteam-as GitHub prefixes (Resolve-GuideUrl) - the manifest is unsigned.
+$DefaultGuideUrl = 'https://github.com/iteam-as/public-certrenewal#readme'
+$script:GuideUrl = $DefaultGuideUrl
 
 # Paths (identical to Renew-Cert.ps1 so both files agree).
 $CertRenewalPath = 'C:\Cert\Renewal'
@@ -955,6 +960,7 @@ function Invoke-CreatorSelfUpdate {
     try {
         Write-Log "Self-update: fetching manifest $url" -Level INFO
         $manifest = Invoke-WithRetry -OperationName 'manifest fetch' -ScriptBlock { Invoke-RestMethod -Uri $url -TimeoutSec 15 -UseBasicParsing }
+        $script:GuideUrl = Resolve-GuideUrl -Manifest $manifest   # overview / [H]elp target (prefix-guarded)
 
         # --- (1) Renewal script: install if absent, upgrade if the manifest is newer. ---
         # Isolated in its own try so a renewal download/verify failure does NOT skip the creator
@@ -1234,6 +1240,24 @@ function New-DefaultCertConfig {
     return (Set-ConfigVersionStamps -Config $config)
 }
 
+function Resolve-GuideUrl {
+    # Pick the operations-guide URL to show the operator: the manifest's docs.url when present AND under the
+    # iteam-as GitHub prefixes, else the built-in mirror README ($DefaultGuideUrl). The manifest is fetched
+    # over HTTPS but is NOT signed, so its value must never be able to send an admin's browser somewhere
+    # else - the prefix allow-list is hard-coded by design (never make it configurable). Never throws.
+    # SHARED VERBATIM by the creator + bootstrap (NOT renewal - it has no operator to show it to).
+    param([object] $Manifest)
+    $url = $DefaultGuideUrl
+    try {
+        $candidate = if ($Manifest -and $Manifest.docs) { [string]$Manifest.docs.url } else { $null }
+        if ($candidate -and ($candidate -like 'https://github.com/iteam-as/*' -or $candidate -like 'https://raw.githubusercontent.com/iteam-as/*')) {
+            $url = $candidate
+        }
+    }
+    catch { }
+    return $url
+}
+
 function Confirm-OperatorEmail {
     # Capture the accountable operator's work email for interactive, config-mutating runs (telemetry schema
     # v2 -> OperatorEmail). Required: re-prompts until a valid address is entered (no skip - that is the
@@ -1389,9 +1413,34 @@ function Test-ValidFQDN {
     return $true
 }
 
+function Get-ReachableExternalDnsResolvers {
+    # Creator-only (not in Renew-Cert.ps1). Probe the public resolvers Test-DnsCnameRecords falls back to
+    # and return only the ones this server can actually reach. Each probe asks the resolver for a name it
+    # is guaranteed to answer, so a probe failure means "egress DNS to that resolver is blocked / times
+    # out", not "record missing" - which is what lets the caller give an honest message instead of the
+    # old "not found on any DNS server". -QuickTimeout keeps a blocked resolver from stalling the wizard
+    # for the full Windows DNS retry budget. Read-only. Callers must @()-wrap (PS 5.1 single-element unwrap).
+    $candidates = @(
+        [pscustomobject]@{ Ip = '8.8.8.8'; Name = 'Google';     Probe = 'dns.google' },
+        [pscustomobject]@{ Ip = '1.1.1.1'; Name = 'Cloudflare'; Probe = 'one.one.one.one' }
+    )
+    $reachable = @()
+    foreach ($resolver in $candidates) {
+        try {
+            Resolve-DnsName -Name $resolver.Probe -Type A -Server $resolver.Ip -DnsOnly -QuickTimeout -ErrorAction Stop | Out-Null
+            $reachable += $resolver
+        }
+        catch { Write-Log "  External resolver $($resolver.Name) ($($resolver.Ip)) is not reachable from this server: $($_.Exception.Message)" -Level DEBUG }
+    }
+    return $reachable
+}
+
 function Test-DnsCnameRecords {
     # Creator-only (not in Renew-Cert.ps1). Verify each domain has its DNS-01 _acme-challenge CNAME
-    # pointing at the certval.no delegation, querying internal DNS first then public resolvers.
+    # pointing at the certval.no delegation, querying internal DNS first then the public resolvers that
+    # Get-ReachableExternalDnsResolvers says this server can reach (probed lazily, once per call). When
+    # none are reachable the external check is skipped - with a message that says so - rather than
+    # timing out twice and then claiming the record does not exist.
     # Returns $true only if every domain validates. Read-only (safe under DryRun).
     param(
         [Parameter(Mandatory)][string[]] $Domains,
@@ -1399,6 +1448,7 @@ function Test-DnsCnameRecords {
     )
     $validationFailed = $false
     $actionText = if ($IsRetry) { 'Rechecking' } else { 'Checking' }
+    $externalResolvers = $null   # probed on the first internal miss only; $null = not probed yet
 
     foreach ($checkDomain in $Domains) {
         try {
@@ -1409,27 +1459,43 @@ function Test-DnsCnameRecords {
 
             Write-Log "$actionText DNS CNAME record for $challengeDomain..." -Level INFO
             $cnameFound = $false
+            $externalSkipped = $false
             try {
                 $cname = Resolve-DnsName -Name $challengeDomain -Type CNAME -ErrorAction Stop
                 Write-Log "  CNAME record found (internal DNS): $($cname.NameHost)" -Level SUCCESS
                 $cnameFound = $true
             }
             catch {
-                Write-Log '  CNAME record not found via internal DNS, trying external DNS servers...' -Level WARNING
-                foreach ($dnsServer in @('8.8.8.8', '1.1.1.1')) {
-                    try {
-                        $cname = Resolve-DnsName -Name $challengeDomain -Type CNAME -Server $dnsServer -ErrorAction Stop
-                        Write-Log "  CNAME record found (external DNS via $dnsServer): $($cname.NameHost)" -Level SUCCESS
-                        $cnameFound = $true
-                        break
+                Write-Log "  CNAME record not found via internal DNS ($($_.Exception.Message))." -Level WARNING
+                if ($null -eq $externalResolvers) { $externalResolvers = @(Get-ReachableExternalDnsResolvers) }
+                if ($externalResolvers.Count -eq 0) {
+                    $externalSkipped = $true
+                    Write-Log '  This server cannot reach the public resolvers (Google 8.8.8.8, Cloudflare 1.1.1.1) - outbound DNS is probably blocked by a firewall. Skipping the external check.' -Level WARNING
+                }
+                else {
+                    $resolverList = ($externalResolvers | ForEach-Object { "$($_.Name) $($_.Ip)" }) -join ', '
+                    Write-Log "  Trying external resolver(s): $resolverList..." -Level INFO
+                    foreach ($resolver in $externalResolvers) {
+                        try {
+                            $cname = Resolve-DnsName -Name $challengeDomain -Type CNAME -Server $resolver.Ip -ErrorAction Stop
+                            Write-Log "  CNAME record found (external DNS via $($resolver.Name) $($resolver.Ip)): $($cname.NameHost)" -Level SUCCESS
+                            $cnameFound = $true
+                            break
+                        }
+                        catch { Write-Log "  $($resolver.Name) ($($resolver.Ip)): $($_.Exception.Message)" -Level DEBUG }
                     }
-                    catch { }   # try the next resolver
                 }
             }
 
             if (-not $cnameFound) {
                 $notFoundText = if ($IsRetry) { 'still not found' } else { 'not found' }
-                Write-Log "  CNAME record $notFoundText on any DNS server!" -Level ERROR
+                if ($externalSkipped) {
+                    Write-Log "  CNAME record $notFoundText via internal DNS, and the external check could not run from this server." -Level ERROR
+                    Write-Log "  Either the record is missing, or internal DNS has not picked it up yet. Verify from a machine with internet access:  nslookup -type=CNAME $challengeDomain 8.8.8.8" -Level WARNING
+                }
+                else {
+                    Write-Log "  CNAME record $notFoundText on any DNS server (internal + external)." -Level ERROR
+                }
                 if (-not $IsRetry) {
                     Write-Log "  Please create a CNAME record:  Name: $challengeDomain  Type: CNAME  Value: $challengeTarget" -Level WARNING
                     if ($checkDomain -match '^\*\.') { Write-Log "  Note: for wildcard domain $checkDomain" -Level INFO }
@@ -1645,6 +1711,7 @@ function Invoke-DomainValidation {
     $dnsOk = Test-DnsCnameRecords -Domains $AllDomains
     if (-not $dnsOk) {
         Write-Log "DNS validation failed for $MainDomain." -Level ERROR
+        Write-Log "Troubleshooting (the DNS rows): $($script:GuideUrl)" -Level INFO
         while ($true) {
             $choice = (Read-Host 'DNS validation: [R]etry (after fixing CNAMEs) / [S]kip this cert / [A]bort').Trim().ToUpper()
             if ($choice -eq 'R') { if (Test-DnsCnameRecords -Domains $AllDomains -IsRetry) { break } else { Write-Log 'DNS validation still failing.' -Level ERROR; continue } }
@@ -2482,6 +2549,18 @@ function Invoke-UpdateFlow {
     Write-Log "Update flow complete: $($selected.MainDomain) is now Type=$($deploy.Type)." -Level SUCCESS
 }
 
+function Open-OperationsGuide {
+    # Creator-only (#86). [H]elp: open the operations guide (Resolve-GuideUrl) in the default browser. Under
+    # -DryRun only logs what it WOULD do. Never throws - if no browser can be launched (Core, RDP without a
+    # shell association) it prints the URL instead.
+    if ($DryRun) { Write-Log "[DryRun] WOULD open $($script:GuideUrl) in the browser." -Level INFO; return }
+    try {
+        Start-Process $script:GuideUrl | Out-Null
+        Write-UiResult "opened $($script:GuideUrl)" -Kind Ok
+    }
+    catch { Write-UiResult "could not open a browser here - the guide is at $($script:GuideUrl)" -Kind Warn }
+}
+
 function Write-ConfigOverview {
     # The at-a-glance state screen shown above the main menu: install path, installed script versions,
     # telemetry on/off, the Billing customer, and the managed certificates with their key per-cert details.
@@ -2499,6 +2578,7 @@ function Write-ConfigOverview {
     Write-UiField 'Scripts'   ("creator {0} {1} renewal {2}" -f $ScriptVersion, $dot, $(if ($renewalVer) { $renewalVer } else { 'absent' }))
     Write-UiField 'Telemetry' $tele
     Write-UiField 'Billing'   $bill
+    Write-UiField 'Guide'     $script:GuideUrl
     Write-UiRule
     Write-Host (" Managed certificates ({0})" -f $domains.Count) -ForegroundColor White
     Write-Host ''
@@ -2543,14 +2623,15 @@ function Invoke-CreatorMenu {
         Write-Host ''
         Write-Host ' What would you like to do?' -ForegroundColor White
         Write-UiOption '[A] Add a certificate     [U] Update a certificate or billing'
-        Write-UiOption '[D] Delete a certificate  [Q] Quit'
+        Write-UiOption '[D] Delete a certificate  [H] Help (open the guide)   [Q] Quit'
         $choice = (Read-UiInput 'Choice' -Default 'Q').Trim().ToUpper()
         switch ($choice) {
             'A' { Invoke-AddFlow -Config $Config; return $result }
             'U' { Invoke-UpdateFlow -Config $Config; return $result }
             'D' { Invoke-DeleteFlow -Config $Config; return $result }
+            'H' { Open-OperationsGuide }   # stays in the menu
             'Q' { Write-Log 'Quit.' -Level INFO; return $result }
-            default { Write-Log 'Invalid choice. Enter A, U, D, or Q.' -Level WARNING }
+            default { Write-Log 'Invalid choice. Enter A, U, D, H, or Q.' -Level WARNING }
         }
     }
 }
@@ -2596,6 +2677,7 @@ try {
             $sans = if ($d.SANs) { " + SANs: $($d.SANs -join ', ')" } else { '' }
             Write-Log "  $($d.MainDomain) [$($d.Type)]$sans" -Level INFO
         }
+        Write-Log "Guide: $($script:GuideUrl)" -Level INFO
         Write-Log 'CheckOnly complete.' -Level SUCCESS
     }
     else {
@@ -2655,8 +2737,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCABCpYi71rfdlk+
-# iakDzsdbvOF817/KUaTw/WsMhZO+46CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD/yYx1ui8HlD6l
+# 0cBLaDF7ZIYFv/v7S88+toEJAxfu/qCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2746,25 +2828,25 @@ exit $exitCode
 # d6xpR6oaQf/DJbg3s6KCLPAlZ66RzIg9sC+NJpud/v4+7RWsWCiKi9EOLLHfMR2Z
 # yJ/+xhCx9yHbxtl5TPau1j/1MIDpMPx0LckTetiSuEtQvLsNz3Qbp7wGWqbIiOWC
 # nb5WqxL3/BAPvIXKUjPSxyZsq8WhbaM2tszWkPZPubdcMIIG7TCCBNWgAwIBAgIQ
-# CoDvGEuN8QWC0cR2p5V0aDANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEX
+# CE/cM09+RU7bww+P+ZIYNTANBgkqhkiG9w0BAQsFADBpMQswCQYDVQQGEwJVUzEX
 # MBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0
-# ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1
-# MDYwNDAwMDAwMFoXDTM2MDkwMzIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNV
+# ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI2
+# MDgwNTAwMDAwMFoXDTM3MTEwNDIzNTk1OVowYzELMAkGA1UEBhMCVVMxFzAVBgNV
 # BAoTDkRpZ2lDZXJ0LCBJbmMuMTswOQYDVQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNB
-# NDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEB
-# BQADggIPADCCAgoCggIBANBGrC0Sxp7Q6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMy
-# qJnfFNZx+wvA69HFTBdwbHwBSOeLpvPnZ8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4Q
-# KpVD7dvNZh6wW2R6kSu9RJt/4QhguSssp3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8
-# SOhPUWlLnh00Cll8pjrUcCV3K3E0zz09ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtU
-# DVHRXdmncOOMA3CoB/iUSROUINDT98oksouTMYFOnHoRh6+86Ltc5zjPKHW5KqCv
-# pSduSwhwUmotuQhcg9tw2YD3w6ySSSu+3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1
-# Hf2JNMVL4Q1OpbybpMe46YceNA0LfNsnqcnpJeItK/DhKbPxTTuGoX7wJNdoRORV
-# bPR1VVnDuSeHVZlc4seAO+6d2sC26/PQPdP51ho1zBp+xUIZkpSFA8vWdoUoHLWn
-# qWU3dCCyFG1roSrgHjSHlq8xymLnjCbSLZ49kPmk8iyyizNDIXj//cOgrY7rlRyT
-# laCCfw7aSUROwnu7zER6EaJ+AliL7ojTdS5PWPsWeupWs7NpChUk555K096V1hE0
-# yZIXe+giAwW00aHzrDchIc2bQhpp0IoKRR7YufAkprxMiXAJQ1XCmnCfgPf8+3mn
-# AgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTkO/zyMe39/dfz
-# kXFjGVBDz2GM6DAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNV
+# NDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjYgMTCCAiIwDQYJKoZIhvcNAQEB
+# BQADggIPADCCAgoCggIBALZ7pvLJ/s1K+NSbTGWz/TjGMPh8CQ6RucZCLv5anHzW
+# JjF/NWJrFIhy24fcpKXlgRiky4WAawDfU3YP0BMxt9l3Dm5oCG5Z69AqEN1kgHg2
+# epx+l+lZBcmJCcN0ASURML5uFIS80sZsDwO3BSkUxDjLJhBI+qiZP3aixAC/qEGL
+# jsBNlLol9VZ7pfGEXiMlneJIC5/YKuizVzNFKZZEeoy/0B8Zm+nzKBgSWG52lCO1
+# w+nCg6XpCtklTJXeIg283hw7TmmsZXR+SMbjbrEOvZ3fP2VxIgeR28Y90ZStd3F9
+# VuA5RVynb/whITPAo9b75Zr4Ta6Mj3URm26QZYMn/FnbuTegcoRcFEZ9FOqM5T6M
+# Tdtr/n74lIT/ug0eeOzmZ6QTFg33otX+bFRsIolvykE1jive4PuESaT8zzVeFWDA
+# MDtozNgLctkGD1ZjkEyZtJrLl5ya0m5doH/ScpaZCZVl6pNUOCybMc/kxC6EAmSJ
+# Y24L0yYKD1Nkddsnb/ItVKi/2nXpQNMu1PT5prW83vV8d67WowuUs0HdY4H8AMLG
+# vdL/WHEj3ZnqMqAQQP9u3Ai9t+5eQ02GDwy0ODjdzi0xlp70W+ow63/0++YDEX1M
+# 0iwgUHwbrJvfpklkZQvw3+kv3vUPItdwroczk9icflf55W1zOEKAcJVAIXpcMCU9
+# AgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBQUyWOKMC7USvtu
+# lPPm40B+9ezN4jAfBgNVHSMEGDAWgBTvb1NK6eQGfHrK4pBW9i/USezLTjAOBgNV
 # HQ8BAf8EBAMCB4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEB
 # BIGIMIGFMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wXQYI
 # KwYBBQUHMAKGUWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRy
@@ -2772,46 +2854,46 @@ exit $exitCode
 # HR8EWDBWMFSgUqBQhk5odHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRU
 # cnVzdGVkRzRUaW1lU3RhbXBpbmdSU0E0MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYD
 # VR0gBBkwFzAIBgZngQwBBAIwCwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4IC
-# AQBlKq3xHCcEua5gQezRCESeY0ByIfjk9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fN
-# aNmFj6Eh8/YmRDfxT7C0k8FUFqNh+tshgb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim
-# 8/9yJmZSe2F8AQ/UdKFOtj7YMTmqPO9mzskgiC3QYIUP2S3HQvHG1FDu+WUqW4da
-# IqToXFE/JQ/EABgfZXLWU0ziTN6R3ygQBHMUBaB5bdrPbF6MRYs03h4obEMnxYOX
-# 8VBRKe1uNnzQVTeLni2nHkX/QqvXnNb+YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1
-# d0IbX6Wq8/gVutDojBIFeRlqAcuEVT0cKsb+zJNEsuEB7O7/cuvTQasnM9AWcIQf
-# VjnzrvwiCZ85EE8LUkqRhoS3Y50OHgaY7T/lwd6UArb+BOVAkg2oOvol/DJgddJ3
-# 5XTxfUlQ+8Hggt8l2Yv7roancJIFcbojBcxlRcGG0LIhp6GvReQGgMgYxQbV1S3C
-# rWqZzBt1R9xJgKf47CdxVRd/ndUlQ05oxYy2zRWVFjF7mcr4C34Mj3ocCVccAvlK
-# V9jEnstrniLvUxxVZE/rptb7IRE2lskKPIJgbaP5t2nGj/ULLi49xTcBZU8atufk
-# +EMF/cWuiC7POGT75qaL6vdCvHlshtjdNXOCIUjsarfNZzGCBb0wggW5AgEBMGEw
+# AQCNxTphHp1SCt+ZrAmAfn0oQLFr0mLywSLaDXQIENoyKqxrFbJblzCVP/pkXmwX
+# OdrOpWygLzlT12os5ipDCy35RBCg2UMeApEtrfGhz45F4Wt4WGdNdIbRWt3YTYJm
+# pR+b7lr4d7Uwn+H600u4D7RnOGf8Wj4UNgAdZkfHhHv1mx9EVh71SJelcEN/oORS
+# jXzdjfw1iZH9d8Nh/thn6hH23d+VsPAr6GAYyzSA02nXD1nYLI7Ijmiv+xLCiYC4
+# 1DSFYL3GhTiy0PxpawPtGRyaBVGzq+UiTfM8pD7KVyF5aQyWP4KhVGUUTnmm/RlY
+# JoW3TiXA/+t0YcT2oRVBm3JETjajHug2AL+v5jhtKVnd3D0rbHXEu27o+Q8p4sEW
+# PMqKDB+qbceb6T/6WcwTwXmQ9lOCLLYcsQeSWmvKqzpAec9etE14jOQAzLKWdE3w
+# /TCaKtLRaRT7LCkRYVnhA2D73FLje1O5b3HR5eHs0NzU/+xX7NbEdcofy0W3Wdwd
+# 1XOqtlpg/JgwtKfZM5dqO94lbUveOiJBI+xZEbGRsMNbXmMREUTgu+Oca7Y73MPW
+# cslIx2VhkSKSXjDbD6rgg39H5Mh7QfieAIjWagkJNt68Yfim6cjEzVSiLSeZfdkr
+# 5dtFPTW6jATlWJdYeeDRGCyatf8R1hSjzSvdN8yWQPT9gzGCBb0wggW5AgEBMGEw
 # TTELMAkGA1UEBhMCTk8xETAPBgNVBAoMCEl0ZWFtIEFTMSswKQYDVQQDDCJJdGVh
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIH8HuQtaqcvkJGebxeEGUWsGvfzGvXviAGjb
-# BOeoMux4MA0GCSqGSIb3DQEBAQUABIIBgH85SFRmMFIAffiLsVciACQFQZQ7lKei
-# l5znO3vwaKVZPuSggMC/GfAyB2tTgTpkVwOeHCfMPdJhnZM9lOCvLg87yUXmLQJX
-# aedfQLMVj+Uia+TYNYAM9YILznvpzSkmgT5vmwC+cF22hbQAd+vj3YO7war7CypW
-# 1Z6iMyX4/QGtar1qwwspGGRSRHnIVYdd7yTNrmwCl0IIUcu1YdrL/7/ynAFqgxUk
-# 5Hebymcgy2cr/lCyos+tF3mNJCPEzOvxh3Z7nbSdgol54uu5Cpme7Akm7KSXHx1k
-# TV2WmpF3IxLQODn5u1TjC2MjJrc/WvV4ZTAWfJ1KyyVv3mWGmenpy97hoql79gFS
-# X9eVr4lU9JHKcQQ2MQnLzBs8AOcLKcuWbgOiVlvlIHO7PfXPdQynT0V1gmumJXcD
-# 8pW55wYVdTvSBtNjVDUqyMfRXlXkUZRnYcBQE+YPpqpe+1TFjQ70IiMbX9kaW3DV
-# aCawlRWrs7FuWhWHttkueSBM0OL/NRG/R6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFK3OwvD5QdPPzlpcNc7FBmPcu+o6UrlcW2Z
+# Gbkf+qTpMA0GCSqGSIb3DQEBAQUABIIBgJePBxAQMWAiRqOnpJcRAh3iPYskrDKN
+# YVki5shSU0vR9KA5A6fdCSoFAZqejGHzxZCXBUhqP64H8aiUxoINgT3jbPdPxcs1
+# RoCzZajpBwznmERfz/OiNgFyShLk+Kme2LeXUOSU7H/pfpwE1xVUHvhhYrGVcJ6B
+# FfycN4jBr+AmwGoswFq3lsz8L3c6C1QRV/KcTJSkxadW7KRg0FVEkP4WxSfaiQAz
+# FDeBduGgxaqQyWrqoEaaciaqon+4BiHXoVJob8SAOdweH1n+HjeU3dasrPhw2n70
+# CDpRHeYRjFYDFLb9vcch20w/Vp8tbdFHpiZJJZF+TtJrkaC11glKKnn7VcoEDcVn
+# iPkrYGoJi/rQxrxy4VYDn9cs1f8htxLlN6VbA8ID06mEFA2+ZlqXK1gYtmRHbjir
+# UD+Mp53Zj6w7qWCJEGLKMaMArX0pgCVePHIQMBSGfS8F58KKeTyt4vXrUzAGBc0J
+# XaU3Dt+/KW35ZH5IXYXMk0ec5MJ+SFu1n6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
-# NDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUD
+# NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA2MjUxMjIzMjZaMC8GCSqGSIb3DQEJBDEiBCBiy7ZcR8/Iv1FnfyXwREej
-# 4StuoQ476NmD6q3KjjixzzANBgkqhkiG9w0BAQEFAASCAgCR5cEtU//65brEkGN5
-# m4mPqjlVockxxyoBOZPlIFTb9xK6hqP9ux42TUrX/HErqUTQ5+1L/vTIgrApCTK4
-# NFd9trilaNBcm/dgLnvOrpNbiE2zxuyK6XqoDaE/5Mgf9DghJmOb4jiyrkdNgOxF
-# GuR0a55hTuU8sBOfEjvKtiwiVjRKpZXZy6eWlBqlzk6xszp+raXphgjo+GImTePW
-# VOfR4EjF8eU2JT+ziWeNW9SmlE5HfgAxakru+V9Wjh42hM5MWd8eq2KDV96OiR4B
-# pfdHxOB9I8tlYOUu481n86wWKumb64wTYPtBodA7ucANpvzZ31KTIwoxpnalC0jQ
-# 870zEBFnGgCpUI/1ivZV+9DHZ4+nPDMh6qoU0lc2lAYLwdpd2kMH17ujDNAx9kAx
-# 8euyp6H5HkyVaXNjsbQ1vywR/nLGBR8uGKxhRpOZqi6cHRmk2LyLwhLehznVUFmQ
-# LwENlEvgxqR3URIikeiIiw6hlJD/UiTJLg9uH8stoaXjt1YuNRgihXijfl1zPMFi
-# byKL0o9J8cy2G3n6Upf62k6KLXDCT1rg64IaetrFbIz0hCDInPvKsEDEqitvklJN
-# 12Gst6ugBQQwFyi7tOhFF7l0yFb/V6zdr/adbNsQw6K8Sj7NQiNYI7il2zXBsqwO
-# Pt60TOTZ+wPR9BzRV9e3QU9e1g==
+# Fw0yNjA5MDgxMDMzMDJaMC8GCSqGSIb3DQEJBDEiBCCV2vwk640OwhhKnioaVrQF
+# EnffpLM4+tmcM4wy+fSw0DANBgkqhkiG9w0BAQEFAASCAgAmeinEcpvC5F+tvUUY
+# KMYczU+SRSJOjev45GhwRKHzqhrpKMTGppr6h9Xy535RQ+op3up8dphG944Oep9L
+# HTeo/BF5U4sNPZSIzSWNzwBQds6P+J4F+Ac0WeBlGEWz9m8Zz9xc0lLCQWMrB9FO
+# PNjiNCvIGqJMD0iUTBV9rkU5eU5Me0dAO7fx/iXzGJ6DfejFh3ZU2Z5Rq5UfJ3Me
+# q3Y0snZbu1q6d9hSajYgylQb1XLrv34rlxg3Vk2kVFGOuQ6NwROLyrX3E0UkA9Ll
+# La8ph/h+YmxuM0Lv7ymOOyUpnsjqmfpRhhRccw4BClRthfnulf25HwCRcTlwlV8S
+# yQBYD6s/6JlEBtzQTiPf/WQgFJpT2VPVJiBhrhJYtNIZAC5Jo4oaPckQuQhUwME9
+# nDtL/KqsnXPBPuBWVgPKtGAZ+brQU//D3ncmNECCr7NRhmUhRHnR/v3DaQzDI87h
+# 1kg8+MQD9ocH234vjeHBtYdkmXMYT6r5/RwjavtCtYbUsNZrusRiYNm8Vz2srDsi
+# 9ri+//qUBM2OqalssqZ4duef/I+dwcRny09CZQi9UiTQXz78XxiBzjMCdVsnflEv
+# 1lYcnX7NQsbJM/UuuSNbeRLhMQgGN+6N9p7sxLybWJl5A9IwHEl2uXcgIMNeAGzM
+# 4OBtery+U2v+YAyezOkDg5gXkg==
 # SIG # End signature block
