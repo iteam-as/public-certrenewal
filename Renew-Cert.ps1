@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.8.0'
+$ScriptVersion = '2.8.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -88,6 +88,10 @@ $EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; R
 # Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
 # Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
 $SelfUpdateStatus = 'Skipped'
+
+# Version this run installed, for VersionAfter on the schema-v2 'self-update' event. Set by
+# Invoke-SelfUpdate on the upgrade path only; stays $null on every other path (where no such event fires).
+$SelfUpdateVersionAfter = $null
 
 # Schema-v2 telemetry run identity (read by Send-Telemetry). The renewal runs unattended as the SYSTEM
 # scheduled task, so there is no accountable human: RunMode is always 'automatic' and OperatorEmail is null.
@@ -602,6 +606,7 @@ function Invoke-SelfUpdate {
         Write-EventLogEntry $EID.Upgraded Information "Upgraded $ScriptVersion -> $latest"
         $state.consecutiveFailures = 0; Save-SelfUpdateState $state
         $script:SelfUpdateStatus = 'Upgraded'
+        $script:SelfUpdateVersionAfter = $latest   # schema v2: VersionAfter on the 'self-update' event
         return $true
     }
     catch {
@@ -2206,6 +2211,21 @@ try {
 
         if (-not $SkipSelfUpdate) {
             if (Invoke-SelfUpdate -Config $config) {
+                # Schema-v2 'self-update' event, Component='renewal' (telemetry-v2-schema-spec section4 -
+                # the creator emits the same event with Component='creator'). This run exits BEFORE
+                # Invoke-RenewalCore and therefore before the daily summary, so without this the box would
+                # report nothing at all on the day it upgrades - a false gap in the fleet's "who reported
+                # today" view, and the one path on which SelfUpdateStatus='Upgraded' can reach the table.
+                # Best-effort like every Send-Telemetry call: it cannot block the upgrade that just landed.
+                # Deliberately NOT emitted on the no-upgrade paths - the daily 'renew' summary already
+                # carries SelfUpdateStatus there, and a second row per box per day is noise at fleet scale.
+                Send-Telemetry -Config $config -Outcome ([pscustomobject]@{
+                    Action        = 'self-update'
+                    RunOutcome    = 'RenewalReplaced'
+                    Component     = 'renewal'
+                    VersionBefore = $ScriptVersion
+                    VersionAfter  = $(if ($SelfUpdateVersionAfter) { $SelfUpdateVersionAfter } else { $ScriptVersion })
+                })
                 Write-Log 'Exiting after self-update; the new version runs on the next schedule.' -Level INFO
                 try { Stop-Transcript | Out-Null } catch { }
                 exit 0
@@ -2243,8 +2263,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCExkSgPGR4taJa
-# SJyITUCRa2vS84acjgnR5rvrLjU3hqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCANBZb57Qk+0Qaw
+# 7lXIj0TrPBStj5axlnIvwoJ6ZmRK9KCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2375,31 +2395,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIOZVmaj1526Br1KwVMhv+fvjG5Xxa0o9Ge3Q
-# b7+RN6jFMA0GCSqGSIb3DQEBAQUABIIBgKpjhBnVuFlvfWQ8/5hRimtn6zymKYa0
-# 6D1PWz3/Z2eRs5uiHdeIZQyod/YHF18r+Dx+iN7BWjejVR84xGI1j4u/FGm275iz
-# 7k4ZjY0MbTb5sANktEKzvUwlRtKavti7dA52Q/pLK5KRxSXinomsCkkH2HhCsSsx
-# KY2YKEufK/ybaMpIZ/tRv/YcOVLIul7EYuK1dKstVD1aXAIkV7jIkaMM+sW++MkH
-# BnWcP+1JhnCQSHljSm5EzrTe1z/gnpW8RNuQtMne3usIlKMK19VcJN70jl2A138v
-# XqaHemtMzD/fIdLGdug+mzSbPmSBXm+ffIQBbaBhlUKUx3WiVjoB5CS5bDTyFTMt
-# DMxbLgqbDhTfObSZbqihr9kpYL8GpTsBe5Cqr5JwrQv7UamlUAQlACE/tUxbhDWf
-# CszUkoWNsTCKqQXj1ueqUBYWPM8bIeS/Zvz6RPZRmsgbo2gQ+q1LNLV6fzB0pohS
-# QLdg6JZc6uwonE502NoitbX0dModZ2c1DaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIChDQpkrV1TeMAQYV/dccSmv2tWMtM+8c/pv
+# SqUj2FygMA0GCSqGSIb3DQEBAQUABIIBgIAgazrKpAiYPp8H0PBFn0PWRAWa8bf4
+# sLZtpf5s5S/gm/OCUTgzwv3j95EPRZCIMXvaNSJ0/ccyxbu//hNrWBx6m9Ix8LUh
+# lRpPAF1w0kHiYBGDxEy+Nw6BDqfDZTOFE5AqoGjq4eSeoebGRQ25wk6PA4AxHhYB
+# uOlLzzGC8RT0S0LLNmpB15PUbNgC+eZg9B+Jenh+5zq8NyOsZJDlIyPMJZuZCIhF
+# 4hufcvYrNQnsAMsk76cWGN8jt8UchxReKZ5CMk9BsHRf7xQaFRiXCrgEN7RTKKSg
+# 9g50cje1mfOSwUoTnoVMtwv7s5Qn7n6a53tAJg1HT7EOsC2IbFk0P4VCaAmtHrNx
+# deNn9EPQ759PrRPA+h7zy87mdZYoaimCzfrkYW8xbsADPlDnkiPPDLlkYQ+VjN4C
+# sZX5HPSwV7lTW69TvBiBqGN4HLl8DOBHUof2VRS7QDTMNYH0umajcycOIpcl5frq
+# VVFiF6aSF71LIXq59ULjhRirwI7LzYO4p6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MDgxMDMzMDNaMC8GCSqGSIb3DQEJBDEiBCCPP+eas/lQm4akyGWcS23r
-# vV3Yhk5XRwj/ET60RoPwGDANBgkqhkiG9w0BAQEFAASCAgBtZwn4YrRp7KPJPm6E
-# oCgebd/A0A639LdXYaGj54jsGI6/bb9488KWxLGHpmLRApP+o3bZ2zW4RJTGUvcm
-# Ee54UiM2enbrGtlNivDVhDUOB103xUuOuctYxWcOZuwKj5PavZrJImoEFDFHD794
-# vVbo3ZQsyRvf/N+7Oy4WbAS5Oi1VaKRq0ICk8UMf+EJtLsvbYYYAd5gs2Y/GyNh3
-# lJm1uRCabittktXgSoM4TldasU3vZQbSduWxTu6gsbifytcNowFXXWU8Kiw8eHsK
-# yT8Nn+fn8fCff+YcUTOPTJ9F7mavbw/ipxJhTiUl3gS/El7KwOYhn1p+OCVka/gz
-# x3TPE+SrBXYhtZTiA+HroSTfLuKpt72tLVG4SkXi/295q6dfDtcWmgsU80b7t0vK
-# lqvVPJuIRWRHZpYgxJbmbuLXxuPUTn0QWYNvkovtPJU4aWPv8g8IQve+eo7E9LXS
-# PrhHUHaFjzeQBOa6D5dfxJp5+Ff5DrpuMhVIEMAAaLWB9/dm2g2XymyNR9ZuaGmJ
-# iIbNe82SUwa4CqccsmiCuoLvCKr2S7uYaF1Yv8mk5OxJ8mgjUwgKZcS0hWjj5Ioj
-# xAeKdB0xEwjAMBajA/6di70nRyvfbIzmACrUKLW3bcCuIM0TI9HZbbDjU6HWGkNT
-# 2hVsWBr3Y/ZTXTaTkjxdbQfTbw==
+# Fw0yNjA5MDkxMjI4MzlaMC8GCSqGSIb3DQEJBDEiBCDVqSJda266VuCZQ6M7YR7K
+# zNY65oRo03jdJ2L/Po1lSDANBgkqhkiG9w0BAQEFAASCAgBLS5XIMK4brrtcbq2p
+# U+oqtIZsHJxIpaIktdU2gz+nl3rgY5NyHx9Ll5rM8gUvnMiWhMCzyYBM/OMm2AGu
+# 9z2ffRM7lKFbWJrwaQhS8kGnK/spGQx7BXjCIz/318wE5GtHG2PPpgGaPnWDHwS5
+# X4a8duNiKXFV3ZDEwB5Ntx25cpDDslfyNVzQidmI/X230UP+U3CHgRSF440cYkHL
+# T6q3Cor8A0wVkvIokRuTCiKTUsR9IXLQ7y8ov3ojfHWHALNIuuWprzyLwOkrGTCt
+# nogId+w4OMdZ+P3bpYMjsjG5G/3P+NA1cij+yhP11vIdrUhPYvNNo6GCWa/gmm5d
+# qbhfNeaSuaZ1hdNAZN+uowc0sZMY4h03gAtJ42RQmyeoncP4xYAcwhnw8OXSYs5k
+# g6V6lQccIxn1SWrfoS71/FygpGZgrNqejS9qS/I3nLqwlDmj31mtF4GWmzV9JEWL
+# I8lOb1iETy27OsAnTYxoza3vqMFBfhCdfEEzzeun8ifzia+i5FQbL7rr+bhixaPj
+# Nt4LJp23e9/ksU1esZ3Mr0jtc2p+OW1LebpxpcEXIOE0/aalZ9jbKdP8IdNsDNtv
+# u4EU1zvv7V6V6AUCMmjoHijmkPlwgvjOt1dI/y8wqEL+tniGqrwJkmKosQzIp2Uc
+# eNwUt+BIbeX+hlwPDamipyO1bQ==
 # SIG # End signature block
