@@ -1,1 +1,4 @@
 *.ps1 -text
+manifest.json -text
+*.sig -text
+*.pem -text
