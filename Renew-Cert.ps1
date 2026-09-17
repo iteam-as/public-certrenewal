@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.9.0'
+$ScriptVersion = '2.9.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -108,6 +108,11 @@ $SelfUpdateStatus = 'Skipped'
 # Version this run installed, for VersionAfter on the schema-v2 'self-update' event. Set by
 # Invoke-SelfUpdate on the upgrade path only; stays $null on every other path (where no such event fires).
 $SelfUpdateVersionAfter = $null
+
+# The 'manifest-unverified' telemetry canary for this run (issue #97), built by New-ManifestSigEvent at the
+# manifest fetch and appended to this run's telemetry POST; stays $null when the signature verified, so a
+# healthy fleet emits no extra rows.
+$ManifestSigEvent = $null
 
 # Schema-v2 telemetry run identity (read by Send-Telemetry). The renewal runs unattended as the SYSTEM
 # scheduled task, so there is no accountable human: RunMode is always 'automatic' and OperatorEmail is null.
@@ -329,6 +334,34 @@ function Get-SignedManifest {
     $json = [Text.Encoding]::UTF8.GetString($bytes)
     if ($json.Length -gt 0 -and $json[0] -eq [char]0xFEFF) { $json = $json.Substring(1) }
     return @{ Status = $status; Manifest = ($json | ConvertFrom-Json); Reason = $reason; KeyId = $keyId }
+}
+
+function New-ManifestSigEvent {
+    # Telemetry canary for a manifest signature that did NOT verify (issue #97). Returns ONE work-event for
+    # Send-Telemetry, or $null when the signature verified (or was never fetched) - so a healthy fleet adds no
+    # rows at all, while a box that cannot verify reports one row per run. That is what the spec section 6.3
+    # evidence gate needs: event ManifestSigMissing goes to the LOCAL event log only, so "zero of them across
+    # the fleet" is otherwise not observable in Log Analytics, and SelfUpdateStatus cannot tell a verified
+    # signature apart from a missing one that was soft-accepted. EXISTING telemetry columns only - no DCR /
+    # ingestor / schema change. The manifest URL rides in Message because the gate is worded against the
+    # PRODUCTION url (a lab run on a test channel must not read as fleet drift). Best-effort like every
+    # telemetry path: this only builds an object - callers append it to the run's POST and never branch on
+    # it, so it can never change the outcome of a run. SHARED VERBATIM.
+    param(
+        [object] $Signed,
+        [Parameter(Mandatory)][string] $Component,
+        [string] $Uri
+    )
+    if (-not $Signed -or ([string]$Signed.Status -eq 'Verified')) { return $null }
+    $refused = ([string]$Signed.Status -eq 'Refused')
+    [pscustomobject]@{
+        Action        = 'manifest-unverified'
+        RunOutcome    = $(if ($refused) { 'SignatureRefused' } else { 'SignatureMissing' })
+        Severity      = $(if ($refused) { 'Error' } else { 'Warning' })
+        Component     = $Component
+        Message       = "$([string]$Signed.Reason) (manifest $Uri)"
+        TimeGenerated = (Get-Date).ToUniversalTime().ToString('o')
+    }
 }
 
 function Get-SelfUpdateState {
@@ -692,6 +725,7 @@ function Invoke-SelfUpdate {
     try {
         Write-Log "Self-update: fetching manifest $url" -Level INFO
         $signed = Invoke-WithRetry -OperationName 'manifest fetch' -ScriptBlock { Get-SignedManifest -Uri $url }
+        $script:ManifestSigEvent = New-ManifestSigEvent -Signed $signed -Component 'renewal' -Uri $url
         if ($signed.Status -eq 'Refused') {
             # A present-but-invalid (or, in hard mode, missing) manifest signature refuses the whole update,
             # exactly like an Authenticode refusal: the breaker counts it and the box keeps renewing.
@@ -2353,13 +2387,15 @@ try {
                 # Best-effort like every Send-Telemetry call: it cannot block the upgrade that just landed.
                 # Deliberately NOT emitted on the no-upgrade paths - the daily 'renew' summary already
                 # carries SelfUpdateStatus there, and a second row per box per day is noise at fleet scale.
-                Send-Telemetry -Config $config -Outcome ([pscustomobject]@{
+                # The #97 canary rides along: this is the ONLY POST of an upgrade run, so an upgrade taken
+                # off an unverified manifest would otherwise go unreported for that day.
+                Send-Telemetry -Config $config -Outcome (@([pscustomobject]@{
                     Action        = 'self-update'
                     RunOutcome    = 'RenewalReplaced'
                     Component     = 'renewal'
                     VersionBefore = $ScriptVersion
                     VersionAfter  = $(if ($SelfUpdateVersionAfter) { $SelfUpdateVersionAfter } else { $ScriptVersion })
-                })
+                }) + @($ManifestSigEvent | Where-Object { $_ }))
                 Write-Log 'Exiting after self-update; the new version runs on the next schedule.' -Level INFO
                 try { Stop-Transcript | Out-Null } catch { }
                 exit 0
@@ -2374,7 +2410,7 @@ try {
 
         # Best-effort liveness/inventory/billing event (the 'renew' summary) + the discrete per-domain
         # work-events, all in one batched POST. The summary defaults Action='renew' and carries no Domain.
-        Send-Telemetry -Config $config -Outcome (@($outcome) + @($outcome.RenewalEvents))
+        Send-Telemetry -Config $config -Outcome (@($outcome) + @($outcome.RenewalEvents) + @($ManifestSigEvent | Where-Object { $_ }))
 
         # Exit-code policy (spec section10): 0 even on partial/total renewal failure - Teams + telemetry are the signal.
         Write-Log "=== Renew-Cert finished (outcome=$($outcome.RunOutcome)) ===" -Level SUCCESS
@@ -2397,8 +2433,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBK0D34zUAclcQw
-# jejR2MVgdbUtxs/Om4tZtI2fTDgw/KCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAedzCiDFCea4SB
+# Mu4kW0sbxSGNmm2t6PGKOOcOUV28OaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2529,31 +2565,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIHYo91igqdSP8irnqnKjpNLeoW9jAyw40d03
-# pZjZabD0MA0GCSqGSIb3DQEBAQUABIIBgCk3oeuBJuIihDw8GntnoNvLJqhIwQ08
-# YefRMG+7DTLO+6JS4TQ9Q8kIDBtYj8C5yiCDAN4hVixHVhrDIrQiOLN3QC+gVFVI
-# 2OP6FuDKwB1WrC3yEYHn0Fi3zBbLPor/9MsgVDoOeHnuq4Mf5t2k/Ea9qhCOUAoR
-# 13kn6jiG211TzdMlBWqDYK3la366nO7dLf2/4Ycebky1ql1xqNtzZtzlk/W7e7Cj
-# rLNLsZ5Zd44WGr80ItWBtnwinEMRbODJ/o6lYbcbdU3NhAbmsgxK5pgdlDVQ6fr3
-# XiBAVC5jXnIjs/eeIXyfgIjFvQEmi1qeRY6H3/DXeANHgmMLYTRXjC+pZRIGJKjn
-# fUED1j4mgHfuqKEviyX3eTSNpJYocj/HOn7Z0hGJSaJeAEb0C3l63R32ugmDLsPq
-# JOV/DEiOLBlUyj5kvsJaruJvimbb7u0pf58ExiAGgquVJt+EsBG36D2aO4OXRy5Q
-# mbvZe2tLwoOEhCfFgNqMbsIihpBABf0OqqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIE0slhWJ33Oh1rBGuh8rgMEvXuXqK7KNeBmw
+# rnY4wJCGMA0GCSqGSIb3DQEBAQUABIIBgCIOhYhQsSux/fRcEGzvHGAyfOLj7T6U
+# vCeyLlnYG1jOHf0JRIQiykmZHWq+YzOjRpgGDyPb5Gv8+DVmwS/Lmpuepeq0LnIX
+# +mzTcSYvXx68vleUaZq9l0BDjEvmIqlEk45w6OqkBGzOxmILNA1zrHolSQvdC3V6
+# Bm6sBw5CA0H8pL7EaerhmDr9KhHXgKEWFSfL3S0tbwSup/M+mrNazAiQqmsC0FhH
+# GUjJYeROf3HvVklxDOkCZVWZ2MOgecip4r8wqRIqifiv4Xen1HT3e+kl4+AKrrmu
+# Sx6JmzzEKmbMgUOxzCxV3A74tRXBnHq+ayGbNFcsVT6tj/MTPzMsFKnXUB6Fhu6M
+# 77nuHre1yRX9QUq8ddriZf6yriuzLFTAGK6YKlLMOBRYGZLIdofGmzh4KFNhnnBk
+# dI8PY70uLOHs++AlkhwTfKYtfHqa+NhYGL3sRpm448GvvY88QQLmAICEJwAb+y+C
+# jvhf8MQi112Tt7rF3BPPT3eJKtmsa249zaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MTExMDIyNTlaMC8GCSqGSIb3DQEJBDEiBCC5dRXhYROGA4Rql6m4f6OY
-# IH9ZyMqLas02ef7MLrxnezANBgkqhkiG9w0BAQEFAASCAgBrHHAUsU3cvUCuGJI6
-# c8wxhuBYH95ptRWTxO5PTZfQL8CVqe9CM7GOFw352PcYchpPdcLkykcjsQ4R7DwN
-# 4VWL4TKMYL+2BSIIGBBc3lvN9WVUyVedfeRRrqA+/wfwSV0WazZ453uKLumDZYBr
-# brdVqH99OAhikbz8rG5ejRamMrtfv0BH/HXj3SSi9KFZJE/nWPPHB/pgCHVt6PUY
-# 2l9Smm41VvSmsc72TtFnMryQQ3civI3tRgnPW9vANJN7oDfdCu/dTZGK7ipzdPiD
-# MylDxitBGuG8LidKkGxmBtJmDhUegRoC3Y/+iavLCQf7nLt2/Hkyniy882lPidhK
-# M3mcPY/+qR6GjohZeUD53l1MeV94kidVSEH/UfBQNxBlLORw+vtv+dPTZzKpH1xC
-# SwJq2IyjBHCfd6En5K/qvLH0dgYtCtiVMVy2IPCcECXwtRnkFCxB40KVGiKrROME
-# 8TskwEqykKOD9ZE9Z1sebW3CzbsnTxqkKtQgOj44OhiLWKcGUPvhhwurvesovXPO
-# YNBTGXwzCBK1oBm95KkJsrha2+dDLRkoywT72l9YsYK3ZD/kSD426M+crTbOfdOP
-# sjc9IAs6Tp67aFFEQfguk+f2L/QVes+1WJoxU+sjIMJebfSRcmcW8iD9edLHQq8W
-# gltOA1OMbfl+w/A1wJFeQNQhog==
+# Fw0yNjA5MTcxMDQwNDBaMC8GCSqGSIb3DQEJBDEiBCA/uoIkR5ug2BCCooa5HZ7q
+# 3QI3CII1FY3iAyKjqS4q3jANBgkqhkiG9w0BAQEFAASCAgBHAYwQwDilLrfjk7Ov
+# mxbieiF2PkN/1ob4mQXtCnMpfcjhnFpFVXnbOqqpOyjleyw+RUnEDijos/0ijT/w
+# yDM1nu3L66JlOYnbxjD6iCTFmSXE9SHVjnUWeZSda7LCDzRzpKgbX3QULyNYDVz6
+# DRWEGhQ4oIv/R9fW5AKak1z5EvQjt/LBNff5VlWJSVNIZ6f2HAyBdSpoVm91VWka
+# HWwodAEobFsC9+SakpH3KiemwhrBNoccbA4WwrkqE/wLsGJAAjkiW7f1fWSEbqgw
+# s4HrkT4J4Y9lMX/mHgqyJQth7+rNsxI6Kd/ibuSVxRcNNmPMjhAEBr+xxwikvUR4
+# CYt7jJ/JobLPSsGyJ2E9bIcgLjJUHuMKlzk4pVDayJNYG0VLECQ0ftUiMvKrYdWl
+# P3KJFWraiptdHT6OhpsDqZHUq1bFeIbDfojo+fmhljGiwRBMgKPq2lJpA/0PKRqu
+# wu/mc3tGO4iOwApgP5sxj9y04pdNSXtTPEY08IG5zRUVJXbOstCfspXAUTszVIF8
+# qRIs9HXeiv0fc0veMSdfNVdfQQwBnNDzQTVejjGd7JZSeZsk308Ai3eM/6G5IFYp
+# jAhjfNc+IQOhFPRceAZqtqImtJVH9g/INpDEPw6iW4oK30Qh0NY22qWWfvDQt4mJ
+# GcNAwOrJ/78JVh+qQEyF+lWTMw==
 # SIG # End signature block

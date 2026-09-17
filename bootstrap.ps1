@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.9.0'
+$ScriptVersion = '2.9.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -140,6 +140,11 @@ $EID = @{ Start = 1200; TrustInstalled = 1210; CertImported = 1220; ModulesInsta
 
 # Read by the shared Send-Telemetry (SelfUpdateStatus column). Bootstrap does not self-update.
 $SelfUpdateStatus = 'n/a'
+
+# The 'manifest-unverified' telemetry canary for this run (issue #97), built by New-ManifestSigEvent at the
+# manifest fetch and appended to this run's telemetry POST; stays $null when the signature verified, so a
+# healthy fleet emits no extra rows.
+$ManifestSigEvent = $null
 
 # Schema-v2 telemetry run identity (read by Send-Telemetry). Bootstrap is interactive; $OperatorEmail is
 # captured by Confirm-OperatorEmail at start (PR-2).
@@ -351,6 +356,34 @@ function Get-SignedManifest {
     $json = [Text.Encoding]::UTF8.GetString($bytes)
     if ($json.Length -gt 0 -and $json[0] -eq [char]0xFEFF) { $json = $json.Substring(1) }
     return @{ Status = $status; Manifest = ($json | ConvertFrom-Json); Reason = $reason; KeyId = $keyId }
+}
+
+function New-ManifestSigEvent {
+    # Telemetry canary for a manifest signature that did NOT verify (issue #97). Returns ONE work-event for
+    # Send-Telemetry, or $null when the signature verified (or was never fetched) - so a healthy fleet adds no
+    # rows at all, while a box that cannot verify reports one row per run. That is what the spec section 6.3
+    # evidence gate needs: event ManifestSigMissing goes to the LOCAL event log only, so "zero of them across
+    # the fleet" is otherwise not observable in Log Analytics, and SelfUpdateStatus cannot tell a verified
+    # signature apart from a missing one that was soft-accepted. EXISTING telemetry columns only - no DCR /
+    # ingestor / schema change. The manifest URL rides in Message because the gate is worded against the
+    # PRODUCTION url (a lab run on a test channel must not read as fleet drift). Best-effort like every
+    # telemetry path: this only builds an object - callers append it to the run's POST and never branch on
+    # it, so it can never change the outcome of a run. SHARED VERBATIM.
+    param(
+        [object] $Signed,
+        [Parameter(Mandatory)][string] $Component,
+        [string] $Uri
+    )
+    if (-not $Signed -or ([string]$Signed.Status -eq 'Verified')) { return $null }
+    $refused = ([string]$Signed.Status -eq 'Refused')
+    [pscustomobject]@{
+        Action        = 'manifest-unverified'
+        RunOutcome    = $(if ($refused) { 'SignatureRefused' } else { 'SignatureMissing' })
+        Severity      = $(if ($refused) { 'Error' } else { 'Warning' })
+        Component     = $Component
+        Message       = "$([string]$Signed.Reason) (manifest $Uri)"
+        TimeGenerated = (Get-Date).ToUniversalTime().ToString('o')
+    }
 }
 
 function Get-OnDiskScriptVersion {
@@ -1054,6 +1087,7 @@ function Install-FleetScripts {
     $url = if ($ManifestUrl) { $ManifestUrl } else { $DefaultManifestUrl }
     Write-Log "Fetching manifest $url" -Level INFO
     $signed = Invoke-WithRetry -OperationName 'manifest fetch' -ScriptBlock { Get-SignedManifest -Uri $url }
+    $script:ManifestSigEvent = New-ManifestSigEvent -Signed $signed -Component 'bootstrap' -Uri $url
     if ($signed.Status -eq 'Refused') {
         # Fatal by design: bootstrap must never place scripts from a manifest whose signature is present but
         # wrong (or, in hard mode, missing). Nothing has been installed at this point.
@@ -1336,7 +1370,7 @@ try {
     # Duty 4b - register the daily SYSTEM renewal task (event source created lazily on first Write).
     if (-not (Register-RenewalTask)) { Write-Log 'Scheduled-task registration did not complete - see the error above.' -Level WARNING }
 
-    Send-Telemetry -Config $config -Outcome ([pscustomobject]@{ Action = 'bootstrap'; RunOutcome = 'Success' })
+    Send-Telemetry -Config $config -Outcome (@([pscustomobject]@{ Action = 'bootstrap'; RunOutcome = 'Success' }) + @($ManifestSigEvent | Where-Object { $_ }))
     Write-Log '=== bootstrap finished ===' -Level SUCCESS
     Write-BootstrapNextSteps -Config $config
 }
@@ -1359,8 +1393,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDeg/EGZJ7YaHAM
-# Wsnjj5NO5KnnMCgoBjfGq31BDQrZmKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDO/0yRFJssH/rd
+# QYzohiNWSx5Qe/Zma/jS5aca8mrN86CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1491,31 +1525,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIKtfdN5JaZ6UI7EBosDTVpAIyvISiUlsadaz
-# v6Kxx2gwMA0GCSqGSIb3DQEBAQUABIIBgFwIxDWtDE9TU7FJMdMHLLuhzzinasdA
-# pr+f53iyZc/+3HaX3zfoc6KSR1G00ytifhqGXbkNyQ/JHa0G43YPW3EUqkedRLXB
-# /L2u6B0MqEAVe2CukSEc7m424kQR2sffuUKkF+5I+VFu8Y5lauYUvqDwwCceoi1x
-# knBpPG03SJqs43/Su24FIMVKVqG+gYC14ZLaiYjJotHqagyVH+KSwsrIlM5lpxm+
-# RKj3yr+6JFfal5OJtpu0Ys5om+VgKpAwm39D7IRsab1H5PK714SUqUtKsiPWhjQO
-# wbj923l0xXFMxlgT8G60rFlzeyWbdt+d3bh1cAJ9SYA0PgF7HFirBBh6c1ZyCsgR
-# KD549nJjbTm9J2gVhbcHO+Lv4zrwg+sqMOXPE1GvJvbagp4EdPhz9iHt0w3sTWX0
-# MIWjcccYYwF7rvvP7Bvf8gixbik+Ift2i7S29dvq8NNA9lzHIWRQuQudCzyAil8p
-# dblUL2onCOd6h85LmiqSlLjj6YUiNgZZ56GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIJ/kiJZLmXvd+LKb+r15p09NpiWJK8ZKnxos
+# H6hqZmgqMA0GCSqGSIb3DQEBAQUABIIBgBhxePiC7+cJc5rOcQxeVyV4xfGvFpq/
+# OZquUTIbjxMeih38VI+YSd8CV0suTw/UBALSU3E3W7vd5lDSNpyNwDrOIlMkCYx1
+# 6B/oMGoPf6r2kLwGqwP6vi3As9fZom3A7J9D44HYaXmPstfowzG67MJKgaxU3z57
+# uR5KvuE37LWFDSAj14Ta8HaPUwfqInLMQ7XEDgXMPfcqu3+6WGpljIrqw5b025nx
+# zhEGY6KGhbPbbMPpn5RGx0qYxhA1IsnTpW240heBsLRcaj+W2VIaf5Mpls69boOl
+# Ph8ZR+EOef9HItA3Gsvg1d8Et/4+nh34Jt8IEw6aqSBX37qWU5QQt2SHFmNWFyB9
+# ZTg9Q0QPiVcQBYrmlLSwyNh2ICOd/JBH3mj7wwblCFTx3iRgqGLEuElLRybimTSl
+# dBFQIQOSJThISrSOoqtHmtjcoQU69Qb5DFiwWBs96/FYO7et7Jk5kZIjFPAB0ZHR
+# 0uup8k9Zmz8/VklQvqjTfkWia/x5kWOjV6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MTExMDIyNTdaMC8GCSqGSIb3DQEJBDEiBCBbpFkrctmCohTWZR/E6Q58
-# PcG5obu+YgU8qJD7D4tViDANBgkqhkiG9w0BAQEFAASCAgCM3Mbs1uyjce1xLbvZ
-# 7vxZqxGNI+iZUX7WuRTUIGC/I1nbpt8byAkgWaeJ+Q7BJTxZ5y8SjbeadZvvASYV
-# sl9oVOuUMMFu4Y4z9qLdbWsH53CLv2V42YWTZQpluhr9N+ZsT2GDGU3zo6gAp4Mu
-# /I6AL3eWNOxFz8vD3QeZHLTUMdvIWfyvSKaLjg2kRsojtkDNA9GZacqO5f1ygrbr
-# 4CUIg5x9/UxMB+XuAHPbIGtBb9jcF54mZsEpgxhT6lVf3g1IXD78MG9Idxlmdcim
-# dHh0PLsA0teo10C9j9RNT3aYH+pIIzZSkFyeUk4IqdB+TGaIz7WjyfZRPWN73Onk
-# D/iBkUdSw4pKAbMCkVmC5RK6wsCnV1nta1E7su6ZdQWmWr++f/bWPgD//yzJ5Ti+
-# BOT0F+HZ1AFr/fs21aC0rOgL1uOuZmkVdp9YCyevT6ymqn8keowSkQVceiGLGoZB
-# fHYZtbPkNI5uu7ojDexKySyl9eVIADzC3Hzq5TtbRAeKJG5eZyTOAnyDxJJGrKrj
-# MDx7ViKvJYO+9sq+VxFVwVZpCukxVEhn7fkekTKyGTIgBdg4NXeIYUHllWZz/RC2
-# tWkOlvW5ztX4j4Kq7S3XlT+8OP6fMK7ewE2HIMW34T7mvyOA5RkpGJPJvE4hdM4q
-# XaKaFglUh0w2j32hjb62t4Yx5Q==
+# Fw0yNjA5MTcxMDQwMzhaMC8GCSqGSIb3DQEJBDEiBCAbpX4M9QJYobA5Qnfy0DLm
+# 49bSSRHBiXMQs6YmBzIE+zANBgkqhkiG9w0BAQEFAASCAgA5kkcU7DVx9Qjd7t5m
+# U1vdOmvCkBIkZiJDPgU0YJCd7cbXEnDr/SGdDjZf+C2d157awG0PVe0hwtH6VJJq
+# 0TSus1xNVa1zWLpDFSQbQRzKIaCYB2CA9zVYnMLNU8y3fGQQzKLhqeba2XObITVG
+# /W+HQJEEzkrJC18opOf35enm8hPq72N2FhX1kkHtrepaCW41SeCqn1Kj8OgPxtEg
+# T09KU0ETW7S79brphinFGg0cMEupazHqk+Vz0ZdWI7W1he0L4W+LizZ/rgcQmvjL
+# Skde9va4eGgXoHBn48OEEpraL+q2PTsLTWZREQHXQ+zeZ+/jmGzm0+x0TzWMFtG/
+# Gc7a4uPLeUnNY3GwjFd43AtViGvrGFRHG2Zb4D7lqBjX/0zMo3PbmImPcyJbI34R
+# CHYdZqzsHk5jDKQDdmy9W7OHpeblpafTbh2fxINQ+soWXWgEWL1Tv+VdygkRAPxw
+# 0mlP9HpuyLSTj2FEZvex1xt4mlM7eLJghtrSN3Qtmb50nRK/8Gnw3ttnlszhCTDs
+# 5xEzLb5GDV6l0C9IrIVyv6V/SIO1YE7n4z1jUb3T5RIiShNQRZB87FjTycaT3ceE
+# Rir3ofK377jvdN7/kajqEB+KM5SwphkyBGMa7Kj60MEjuGugBDvdyRYcieA6OmpR
+# K60ps8br7ddjH2MBbt2nN65KvQ==
 # SIG # End signature block

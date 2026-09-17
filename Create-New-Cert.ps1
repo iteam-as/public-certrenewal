@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.9.0'
+$ScriptVersion = '2.9.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -109,6 +109,11 @@ $EID = @{ Start = 1100; SecretsWritten = 1110; CertIssued = 1120; CertDeleted = 
 # Read by the shared Send-Telemetry (SelfUpdateStatus column). The creator reports its own self-update via
 # the 'self-update' event's RunOutcome; this default keeps the field defined for its other events.
 $SelfUpdateStatus = 'Skipped'
+
+# The 'manifest-unverified' telemetry canary for this run (issue #97), built by New-ManifestSigEvent at the
+# manifest fetch and appended to this run's telemetry POST; stays $null when the signature verified, so a
+# healthy fleet emits no extra rows.
+$ManifestSigEvent = $null
 
 # Schema-v2 telemetry run identity (read by Send-Telemetry). The creator is interactive; $OperatorEmail is
 # captured per session by Confirm-OperatorEmail before a config-mutating action (PR-2).
@@ -415,6 +420,34 @@ function Get-SignedManifest {
     $json = [Text.Encoding]::UTF8.GetString($bytes)
     if ($json.Length -gt 0 -and $json[0] -eq [char]0xFEFF) { $json = $json.Substring(1) }
     return @{ Status = $status; Manifest = ($json | ConvertFrom-Json); Reason = $reason; KeyId = $keyId }
+}
+
+function New-ManifestSigEvent {
+    # Telemetry canary for a manifest signature that did NOT verify (issue #97). Returns ONE work-event for
+    # Send-Telemetry, or $null when the signature verified (or was never fetched) - so a healthy fleet adds no
+    # rows at all, while a box that cannot verify reports one row per run. That is what the spec section 6.3
+    # evidence gate needs: event ManifestSigMissing goes to the LOCAL event log only, so "zero of them across
+    # the fleet" is otherwise not observable in Log Analytics, and SelfUpdateStatus cannot tell a verified
+    # signature apart from a missing one that was soft-accepted. EXISTING telemetry columns only - no DCR /
+    # ingestor / schema change. The manifest URL rides in Message because the gate is worded against the
+    # PRODUCTION url (a lab run on a test channel must not read as fleet drift). Best-effort like every
+    # telemetry path: this only builds an object - callers append it to the run's POST and never branch on
+    # it, so it can never change the outcome of a run. SHARED VERBATIM.
+    param(
+        [object] $Signed,
+        [Parameter(Mandatory)][string] $Component,
+        [string] $Uri
+    )
+    if (-not $Signed -or ([string]$Signed.Status -eq 'Verified')) { return $null }
+    $refused = ([string]$Signed.Status -eq 'Refused')
+    [pscustomobject]@{
+        Action        = 'manifest-unverified'
+        RunOutcome    = $(if ($refused) { 'SignatureRefused' } else { 'SignatureMissing' })
+        Severity      = $(if ($refused) { 'Error' } else { 'Warning' })
+        Component     = $Component
+        Message       = "$([string]$Signed.Reason) (manifest $Uri)"
+        TimeGenerated = (Get-Date).ToUniversalTime().ToString('o')
+    }
 }
 
 function Get-SelfUpdateState {
@@ -1086,6 +1119,7 @@ function Invoke-CreatorSelfUpdate {
     try {
         Write-Log "Self-update: fetching manifest $url" -Level INFO
         $signed = Invoke-WithRetry -OperationName 'manifest fetch' -ScriptBlock { Get-SignedManifest -Uri $url }
+        $script:ManifestSigEvent = New-ManifestSigEvent -Signed $signed -Component 'creator' -Uri $url
         if ($signed.Status -eq 'Refused') {
             # A present-but-invalid (or, in hard mode, missing) manifest signature refuses BOTH updates, exactly
             # like an Authenticode refusal: nothing is downloaded and the breaker (catch below) counts it.
@@ -2819,7 +2853,7 @@ try {
         $selfReplaced = $false
         if (-not $SkipSelfUpdate) {
             $selfReplaced = Invoke-CreatorSelfUpdate -Config $config
-            Send-Telemetry -Config $config -Outcome ([pscustomobject]@{ Action = 'self-update'; RunOutcome = $(if ($selfReplaced) { 'CreatorReplaced' } else { 'Checked' }); Component = 'creator'; VersionBefore = $ScriptVersion; VersionAfter = $(if ($script:SelfUpdateVersionAfter) { $script:SelfUpdateVersionAfter } else { $ScriptVersion }) })
+            Send-Telemetry -Config $config -Outcome (@([pscustomobject]@{ Action = 'self-update'; RunOutcome = $(if ($selfReplaced) { 'CreatorReplaced' } else { 'Checked' }); Component = 'creator'; VersionBefore = $ScriptVersion; VersionAfter = $(if ($script:SelfUpdateVersionAfter) { $script:SelfUpdateVersionAfter } else { $ScriptVersion }) }) + @($ManifestSigEvent | Where-Object { $_ }))
         }
         else { Write-Log 'Self-update skipped (-SkipSelfUpdate).' -Level INFO }
 
@@ -2871,8 +2905,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDPa871I+wnRIfy
-# Lm8vRx9n/Z6uRl7RT1k9Bi8BO0R84KCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDPXKPym6L1/rTA
+# 5Ox9bTlWv4RSL/d8vDrpJytIZo8WXaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3003,31 +3037,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGfBWpsgpLKh/425A92HsDWafTjMaPVflGt/
-# iZTq9zlfMA0GCSqGSIb3DQEBAQUABIIBgCgkWnJHfKGqa7I/f0XNGBLJHwQNLV0c
-# LX9P8ZpgdQXBtOaeYvriiaTnG54JDnSUmJLOj9vwuYcWKis32coYbpTaFlRpwZc6
-# eRehFOV9RW2URdGjaa6HRmzj/ACn4c0ctyoax9T87VzjmASbr3PGoYrzU7uu2vGR
-# 37IGiYDFYaTbOfnzVYTr/GqZJo8EsqQLAJPRwo5Zku+NypC9RVIkvH1mudF+Ah6R
-# F+z687Xq9GPZNUrokCxxj9/tM6bQhmBMQiOAKInvJFgQyjJ91renbk0MLrsjm+yw
-# 4wA0JHBHGlBs1VP9iZ9v/fQcbTK/XovF7aW7dT8XUcF9u7PWv9kuDolNx4MheWQv
-# OmZ11UUJnYk8pgdpQtzXGyJh9ll1/JHp/kYjnSssM2t8Jr666szxbZ++olpgbv/3
-# b6oEZOmDZ5c/juPK+x0qmHFUUQ2GwGjUN9bJqkghMwETNC241MGJUhTlGWpH7FuG
-# nnLDtiLmlIc2Ggt0pPPqw2upVTLJmBY1j6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGj3OKmfs4bjzVCWqCQZsGRGLZA6tcN0Zz/1
+# +L298zqhMA0GCSqGSIb3DQEBAQUABIIBgHqaINnW/LKLpta9gxdqYQQ8NP5/L/Z/
+# EbcuAp87y0YWwXfZ1vRilnmOFn27I8Xg82Xt+0UjJmxwr0BYOKvr2kQaTpcIo6rL
+# I/1u2jeIIMgYRaE6PKRGSwJHDKC1XSeb1rByCLpUvM5APoclm7CCW1zupT64JqlL
+# xs7VWZeMMaGD3C/iLC0WjXOJ8XLp70OanEuoAclTeHGRF+SreaN8Aw6v4ptsE8ew
+# oNfoY2Ab/OkOwrnKs7UoMYUhw7kfF5k1EsoOP72sVL4zfAqNb+xlwTCSAV+jD0HG
+# Sydsj7Zan81xkR+b2rFJU4tdLwyl+b485pbhy0d9/bQbJHK3Vrnhwpz30nPooAnb
+# mNTClOifNBKWgAHqDMMhUYUPklDoIbcxo2ewRRoQtydP/BHqDV3InGKx2gTim/qX
+# FRUMkhmQz6LvDe8Lm5PQTK5Js7ODERwHsIElX/c6pWGMZOhiuL2LOij4dyk7nipG
+# Fmz63HP0g+M6eeT/Fc2RmU4qw1mqBntRnaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MTExMDIyNThaMC8GCSqGSIb3DQEJBDEiBCDVeokiyxdw1emqoGu/wsQb
-# odWI2hl5bnNN0L5do3udqjANBgkqhkiG9w0BAQEFAASCAgAUcNq1ZMaTauY2U851
-# RJXiIDJ/3saTrOBgIS3FUhvw6zjsevWMt7Yme5AnIXL+56uULVdMWm5M+Ud3SolO
-# kgTtpcg55+zxPf2Ez7cWvduPyRWNUxdePkXy3E010yIraNrgOdHTrWXhC4moNlcy
-# Z/BnUYnU6FW/2+gAuwXOEAsO3SY05WgMP79mKPgRSh1mGN276XhdagNglj7Y5lrT
-# CySG5cEjjBxjUHd5XN2m56jjvpT/UxEDlSv8Wt4LElpns0Q4oxXOScxtYEFEOQoZ
-# 8s5ClMUe8FpXL2Gf4ZB91ww3EQGqr921nI70kjq2LLaHs9yDW3+lrIumEOTAO7Fk
-# l/7tnjSg7i2N5y/DRNjVr3DFpsc+35QH19e4N+3UVfF5K/KhMY+79vn5+wQfYP+C
-# th7MxurLUYpelH/oDhSfiMpsixCHxjKzE93iInxvRm3dM0VpuUgTd829Afy0BtpI
-# tl+YcObgrgUqQDgEMOmQHzB5wdgpAjNOyU4jpXpIvPAlSlnLwL51yFnVNfyoZbGD
-# p5gqIHMJ+R3vqeHAapFoStlyvjN0QwftwSpPWnNxshVl5cCUY9Keb9FV2mX2Yn63
-# K0zz4DoMxvyGgTJpSyp3+sdPaB+R/RSszSEHR5LdYFJiMqOgUx9hgO+MoT6gwdTc
-# Vq3mNICOsxtWQH8I1aIY87X5Qw==
+# Fw0yNjA5MTcxMDQwMzlaMC8GCSqGSIb3DQEJBDEiBCCQr+lnV7EnvhoVtMbvP4UT
+# MyksBmi9lkdzAbOaGus71zANBgkqhkiG9w0BAQEFAASCAgBISe09+SMBfOyAJQNO
+# cs+U1biNrloJ0ObYXidUsHHUOppvzig6/OtDrmqsyFNPSRFfmZPEn9BF3UZ1oSnQ
+# Uk0AwB2en0Ev2EjKWL2Gzy7TXe2JERr3R877qKunO6TgZPfhgoeRtXbSS2XeMmKC
+# /xSkZ5+9N9HU2s0fCfReS7mm55KIikrZnXuDQwRLF3lqbY5tWe2UVgVK0FhfhZb2
+# NgP5CNfWCLUgJLzoxkioRTYFnsFEdIzPM8zYpps6Ur+Ro/Ip6OJUoz9KtcpzL7/h
+# A5ujwb3/ddM4PfLZoZx2RUiIsetXX+VliDlM9jq3Vjwz9fMq3HnMf9e9QKS1szqa
+# GZtCTQPxOpHcsVWH75ilnpAfUu2UajIEtphayP3T7ep+wbujS71mV8TJHwLPDTt7
+# ArewQiQ2xxtKLWkAVFOTSNlmaimT4+ZnotHgIJ8tGUtUbFJEovDivevL0Fofq5lX
+# 0vR3tGMp+2uy53XYBOI98Hs56ySQQ21PnvDBsMFPlWkkq/CrU71TR7WdyV4KXQ+7
+# EZ7MyE5Q83sSWKfxA1u1fKDU1GzqfW1CnrRpWH9o7ZoIhTi/z5viBKBjV55sYIQm
+# E4AgWvm7x3OoOCs6ogyN4bH1dszhnQXFlQP41V43OJ8i50fw9ztiwK0xeEXV3OGB
+# zLGrxDmOYE4AQxc/y48BhaxVKA==
 # SIG # End signature block
