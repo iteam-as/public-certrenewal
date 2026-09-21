@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.9.1'
+$ScriptVersion = '2.10.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -86,13 +86,16 @@ $AllowedManifestPublicKeys = @(
     'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGV7cYxo1XOqotWQAWrANs4090AGZID7XE1x+RYiMXeZKVHjpV9G+vpKSsxX04iWla5EOwgv2Lt8+GfOpx9n9/Q=='   # iteam manifest signing key 2026-09 (id 8F2DC7236B894C22)
 )
 
-# Manifest-signature policy - hard-coded by design, there is no flag. $false = SOFT (the L0 rollout): a
-# manifest published WITHOUT a signature logs a WARNING + event ManifestSigMissing and the run continues on
-# the Authenticode + SHA-256 gates it always had; a signature that is PRESENT but does not verify is refused
-# regardless. The second L0 release flips this to $true (HARD: missing = refused) once the fleet has shown
-# 7 clean days with every box reporting (spec section 6.3). Linux, which cannot verify Authenticode, ships
-# hard from day one.
-$RequireManifestSignature = $false
+# Manifest-signature policy - hard-coded by design, there is no flag. $true = HARD (shipped 2026-09-21,
+# issue #23 L0): a manifest is used ONLY if it carries a signature that verifies against the allow-list
+# above. Missing, unverifiable and wrong are refused alike; the run then keeps renewing certificates on the
+# version it already has and merely stops updating itself. $false would be SOFT - how v2.9.0/v2.9.1 shipped
+# while the fleet was observed: a MISSING signature logged a WARNING + event ManifestSigMissing and
+# continued on the Authenticode + SHA-256 gates, while a PRESENT but non-verifying signature was refused
+# even then. The soft branch is still implemented and tested, but no longer reachable in a shipped build;
+# relaxing it is a deliberate act that must also flip the pinned test (spec section 6.3). Linux, which
+# cannot verify Authenticode at all, is hard from day one.
+$RequireManifestSignature = $true
 
 # Built-in production URLs (overridable via -ManifestUrl / -CodeSignCertUrl test channels).
 $DefaultManifestUrl     = 'https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/manifest.json'
@@ -263,8 +266,8 @@ function Get-ManifestContent {
 
 function Get-ManifestSignatureText {
     # The detached signature published beside the manifest (<manifest-url>.sig): base64 text. Returns $null
-    # when the mirror has none (HTTP 404) - the soft-rollout case the caller must handle - and throws on any
-    # other failure so the caller's retry sees it. SHARED VERBATIM.
+    # when the mirror has none (HTTP 404) - which Get-SignedManifest refuses under the shipped hard policy -
+    # and throws on any other failure so the caller's retry sees it. SHARED VERBATIM.
     param([Parameter(Mandatory)][string] $Uri)
     try {
         $r = Invoke-WebRequest -Uri $Uri -TimeoutSec 15 -UseBasicParsing
@@ -329,10 +332,12 @@ function Get-SignedManifest {
     #   @{ Status = 'Verified' | 'Missing' | 'Refused'; Manifest = <object, $null when Refused>; Reason; KeyId }
     # Policy (see $RequireManifestSignature - hard-coded, never configurable):
     #   present + valid                         -> Verified
-    #   present + does NOT verify               -> Refused, ALWAYS - even in soft mode a wrong signature is
-    #                                              evidence of tampering or a mis-signed release, never noise
-    #   absent (404) / runtime cannot verify    -> soft: WARNING + event ManifestSigMissing, Status 'Missing',
-    #                                              manifest still returned; hard: Refused
+    #   present + does NOT verify               -> Refused, ALWAYS - a wrong signature is evidence of
+    #                                              tampering or a mis-signed release, never noise
+    #   absent (404) / runtime cannot verify    -> HARD (the shipped policy): Refused. Soft, still
+    #                                              implemented and tested but no longer shipped: WARNING +
+    #                                              event ManifestSigMissing, Status 'Missing', manifest
+    #                                              still returned
     # Callers turn Refused into their own refusal event + throw, exactly as they do for Authenticode.
     # Network failures throw (the caller's Invoke-WithRetry handles them). SHARED VERBATIM.
     param([Parameter(Mandatory)][string] $Uri)
@@ -362,9 +367,12 @@ function New-ManifestSigEvent {
     # Telemetry canary for a manifest signature that did NOT verify (issue #97). Returns ONE work-event for
     # Send-Telemetry, or $null when the signature verified (or was never fetched) - so a healthy fleet adds no
     # rows at all, while a box that cannot verify reports one row per run. That is what the spec section 6.3
-    # evidence gate needs: event ManifestSigMissing goes to the LOCAL event log only, so "zero of them across
-    # the fleet" is otherwise not observable in Log Analytics, and SelfUpdateStatus cannot tell a verified
-    # signature apart from a missing one that was soft-accepted. EXISTING telemetry columns only - no DCR /
+    # evidence gate needed: event ManifestSigMissing goes to the LOCAL event log only, so "zero of them across
+    # the fleet" was not observable in Log Analytics, and SelfUpdateStatus could not tell a verified signature
+    # apart from a missing one that was soft-accepted. It still earns its place now that the policy is hard:
+    # SelfUpdateStatus says only 'Refused', while this row names the REASON and the manifest URL - and under
+    # the hard policy every row is SignatureRefused, since nothing is soft-accepted any more. Uses EXISTING
+    # telemetry columns only - no DCR /
     # ingestor / schema change. The manifest URL rides in Message because the gate is worded against the
     # PRODUCTION url (a lab run on a test channel must not read as fleet drift). Best-effort like every
     # telemetry path: this only builds an object - callers append it to the run's POST and never branch on
@@ -861,9 +869,10 @@ function Register-RenewalTask {
 function Resolve-GuideUrl {
     # Pick the operations-guide URL to show the operator: the manifest's docs.url when present AND under the
     # iteam-as GitHub prefixes, else the built-in mirror README ($DefaultGuideUrl). The manifest is fetched
-    # over HTTPS and (since issue #23 L0) carries a detached signature, but that is only SOFT-enforced during
-    # the rollout, so its value must never be able to send an admin's browser somewhere else - the prefix
-    # allow-list is hard-coded by design (never make it configurable). Never throws.
+    # over HTTPS and (since issue #23 L0) carries a detached signature that must now verify - but a signed
+    # manifest is still only as trustworthy as whoever signed it, so its value must never be able to send an
+    # admin's browser somewhere else; the prefix allow-list is hard-coded by design (never make it
+    # configurable). Never throws.
     # SHARED VERBATIM by the creator + bootstrap (NOT renewal - it has no operator to show it to).
     param([object] $Manifest)
     $url = $DefaultGuideUrl
@@ -1393,8 +1402,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDO/0yRFJssH/rd
-# QYzohiNWSx5Qe/Zma/jS5aca8mrN86CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDzpXpISg1WGxrY
+# LwgfF4UEojnyZXDrLQpFQFt9HoR9BaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1525,31 +1534,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIJ/kiJZLmXvd+LKb+r15p09NpiWJK8ZKnxos
-# H6hqZmgqMA0GCSqGSIb3DQEBAQUABIIBgBhxePiC7+cJc5rOcQxeVyV4xfGvFpq/
-# OZquUTIbjxMeih38VI+YSd8CV0suTw/UBALSU3E3W7vd5lDSNpyNwDrOIlMkCYx1
-# 6B/oMGoPf6r2kLwGqwP6vi3As9fZom3A7J9D44HYaXmPstfowzG67MJKgaxU3z57
-# uR5KvuE37LWFDSAj14Ta8HaPUwfqInLMQ7XEDgXMPfcqu3+6WGpljIrqw5b025nx
-# zhEGY6KGhbPbbMPpn5RGx0qYxhA1IsnTpW240heBsLRcaj+W2VIaf5Mpls69boOl
-# Ph8ZR+EOef9HItA3Gsvg1d8Et/4+nh34Jt8IEw6aqSBX37qWU5QQt2SHFmNWFyB9
-# ZTg9Q0QPiVcQBYrmlLSwyNh2ICOd/JBH3mj7wwblCFTx3iRgqGLEuElLRybimTSl
-# dBFQIQOSJThISrSOoqtHmtjcoQU69Qb5DFiwWBs96/FYO7et7Jk5kZIjFPAB0ZHR
-# 0uup8k9Zmz8/VklQvqjTfkWia/x5kWOjV6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGtTBBJkHCSJJBMaymGNzcGO8KtbM1kdq+70
+# cP2NT/4PMA0GCSqGSIb3DQEBAQUABIIBgJT4WAE/bMNyMDz6JBpi8qFg4VGPQLxF
+# FcAm4cPJ6I5dXbP0X+PdnCZA/ycfGF6ewH2RWUm7eI4H9qW8iTQzvlZxLtpWykz4
+# etzaFmNMF4Ppun9ANNV99Hfvd1GzflRaRmho0tmQOKSEFKQ/gfH4tHOBodhf+t/r
+# /P7cx7JxmO+vZ+ooUAcXJak5gF0tuMoVEQsrZuTtpgwJbJhGUWPu9kfwu6B7QECf
+# VIAHU3PSmK/b98/RnZnSl40nbq1sump1XpTcc9M5em/F3GHZPa6bwGMu28HW6YXK
+# o5ICaO8wV89xpV6zHDkb5fGaFHHbVHtpwWbEOdz05Irobw2rS25tZiPpnhMoUhtz
+# 1LuS6Be1nBoXvJSQoQOjiTbJQ9mBarTaxU+zCnktCwC1tFfU+YTqLkxOZv3iuC2f
+# uvTeag4Gx3xNbrlC6EzFQ+PheqEStBEmibdSGSpRISYiSyhly42PReLthXnVE7iG
+# AGZM+pUwYdwlbfmWr6FjMGr2h8b0MPB2DqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MTcxMDQwMzhaMC8GCSqGSIb3DQEJBDEiBCAbpX4M9QJYobA5Qnfy0DLm
-# 49bSSRHBiXMQs6YmBzIE+zANBgkqhkiG9w0BAQEFAASCAgA5kkcU7DVx9Qjd7t5m
-# U1vdOmvCkBIkZiJDPgU0YJCd7cbXEnDr/SGdDjZf+C2d157awG0PVe0hwtH6VJJq
-# 0TSus1xNVa1zWLpDFSQbQRzKIaCYB2CA9zVYnMLNU8y3fGQQzKLhqeba2XObITVG
-# /W+HQJEEzkrJC18opOf35enm8hPq72N2FhX1kkHtrepaCW41SeCqn1Kj8OgPxtEg
-# T09KU0ETW7S79brphinFGg0cMEupazHqk+Vz0ZdWI7W1he0L4W+LizZ/rgcQmvjL
-# Skde9va4eGgXoHBn48OEEpraL+q2PTsLTWZREQHXQ+zeZ+/jmGzm0+x0TzWMFtG/
-# Gc7a4uPLeUnNY3GwjFd43AtViGvrGFRHG2Zb4D7lqBjX/0zMo3PbmImPcyJbI34R
-# CHYdZqzsHk5jDKQDdmy9W7OHpeblpafTbh2fxINQ+soWXWgEWL1Tv+VdygkRAPxw
-# 0mlP9HpuyLSTj2FEZvex1xt4mlM7eLJghtrSN3Qtmb50nRK/8Gnw3ttnlszhCTDs
-# 5xEzLb5GDV6l0C9IrIVyv6V/SIO1YE7n4z1jUb3T5RIiShNQRZB87FjTycaT3ceE
-# Rir3ofK377jvdN7/kajqEB+KM5SwphkyBGMa7Kj60MEjuGugBDvdyRYcieA6OmpR
-# K60ps8br7ddjH2MBbt2nN65KvQ==
+# Fw0yNjA5MjEwODU2MThaMC8GCSqGSIb3DQEJBDEiBCDgcZBNzibiODGq8nbNhGI7
+# 0tTKl4Aq3xLQf5I/PCJKxjANBgkqhkiG9w0BAQEFAASCAgAqtUNRqcsumdERBkCV
+# qCb5aAdZ/1IYioVSP2qDh+IOlvVyIC0oghzQ7kERy9otxCmsKoOZ+7V9JKcKOM+k
+# AX9lm21ThSaJPfFucXyZusaDKU6rAkIwlkijuk7trrx8u2B3hByGK6dn/6BrZ7nI
+# ucY6qqe3DTC8pPVgyfiptm1ZL+Q8pmpXSaKOhxqekwWRxsOTr1g1uW0EkUgVImGL
+# shhxvBHujC/ul2+1teYpCDFCHOyZpyDKjx9rkkKeU1EgzOZkBJEqmRb+DJrFef3+
+# dBt+TtQ4iM8kVhvL/c5G2XD441bsGppRYBlOb5/fSEYQnSs7dJ/44pjhUi/iMCzO
+# 8ccU4lrr7UcezRsV6sP0TgSoWVnNZswLEWcSVvnsS+gZ22oOZy/hlmVeAmiaz1a8
+# rXKBXbk+fUFE8SU9FbZWVI7rX1cDAU/6FaiDUZomDxeDk19gWEy5uPvf0jeZNv0u
+# ynDpx46lZELLOaKzYeQlpISh+OgadCBkZFW5WoR0Y2T4fnXMlohrFyLAWlpbWxnR
+# edaCr4xfI2mdtACbOO0EbVCTj/doBiNmuDVOwfZkRX5eRMYD7zc9aRSDjeLh9G08
+# Zm7EoNK9+WwcrspE6IZA7lc4SdeSh8/a/BeaerFktsG8H8QIb8C6qyyhuTLBpcJB
+# dpzw7IzXlpnU3vxbQ5YhdFEMUQ==
 # SIG # End signature block
