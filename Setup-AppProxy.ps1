@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # CI replaces 'DEV' with the release tag (e.g. 2.7.0) at publish time.
-$ScriptVersion = '2.10.0'
+$ScriptVersion = '2.11.0'
 
 # The shared Entra app (one per tenant) the fleet authenticates as to update App Proxy certs.
 $AppName = 'AppProxy-Certificate-Updater'
@@ -57,6 +57,10 @@ $AppName = 'AppProxy-Certificate-Updater'
 # Graph SDK sub-modules - only the two we use (NOT the full Microsoft.Graph meta-module, NOT Users /
 # Identity.DirectoryManagement which the AdHoc #Requires lists but our flow never calls).
 $GraphModules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Applications')
+
+# Delegated scopes the operator's sign-in must carry: register the app, upload the cert, grant the app-role
+# assignments. Verified against Get-MgContext after Connect-MgGraph (a cached token can lack them).
+$RequiredGraphScopes = @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'Directory.ReadWrite.All')
 
 # Graph app-role ids (well-known): Application.ReadWrite.All + Directory.ReadWrite.All on the Graph SP.
 $GraphResourceId       = '00000003-0000-0000-c000-000000000000'
@@ -254,25 +258,64 @@ function Install-GraphModules {
     foreach ($m in $GraphModules) { Import-Module $m -ErrorAction Stop }
 }
 
+function Test-IsGuid {
+    # True when the value is a GUID. Used wherever an id from Graph is about to be persisted or reused, so a
+    # $null from a failed call (or a leaked banner) is caught at the boundary instead of days later.
+    param([AllowNull()][AllowEmptyString()][string] $Value)
+    return [bool]($Value -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')
+}
+
+function Get-MissingGraphScopes {
+    # The required scopes that the signed-in context does NOT carry (case-insensitive). Empty = all present.
+    param([AllowNull()][string[]] $GrantedScopes, [Parameter(Mandatory)][string[]] $RequiredScopes)
+    $granted = @($GrantedScopes | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    return @($RequiredScopes | Where-Object { $granted -notcontains $_.ToLowerInvariant() })
+}
+
+function ConvertTo-GraphFailureMessage {
+    # One line the operator can act on. A 403 Authorization_RequestDenied from a Graph call means Entra
+    # refused the SIGNED-IN ACCOUNT for that operation - the delegated scope only lets the user do what the
+    # user could already do. On a Global Administrator that is almost always a token that predates a PIM
+    # activation, so say so instead of leaving the operator staring at "Insufficient privileges".
+    param([Parameter(Mandatory)][string] $Step, [Parameter(Mandatory)][System.Management.Automation.ErrorRecord] $ErrorRecord)
+    $detail = [string]$ErrorRecord.Exception.Message
+    $msg = "$Step failed: $(@($detail -split '\r?\n')[0])"   # first line only - the SDK appends status + headers
+    if ($detail -match 'Authorization_RequestDenied|Insufficient privileges' -or [string]$ErrorRecord.FullyQualifiedErrorId -like 'Authorization_RequestDenied*') {
+        $msg += ' Entra refused the signed-in account for this operation. The account needs Global Administrator or' +
+                ' Privileged Role Administrator (the consent step assigns Microsoft Graph application roles, which' +
+                ' Application Administrator / Cloud Application Administrator cannot grant). If the role was activated' +
+                ' through PIM after signing in, the token predates it: run Disconnect-MgGraph, then run this setup again.'
+    }
+    return $msg
+}
+
 function Connect-Graph {
     # Interactive Graph sign-in for the admin running setup. Returns the tenant id. The scopes are the ones
     # needed to register the app, upload the cert, and grant the app-role assignments.
-    if ($DryRun) { Write-Log '[DryRun] WOULD Connect-MgGraph (Application.ReadWrite.All, AppRoleAssignment.ReadWrite.All, Directory.ReadWrite.All).' -Level INFO; return $null }
+    if ($DryRun) { Write-Log "[DryRun] WOULD Connect-MgGraph ($($RequiredGraphScopes -join ', '))." -Level INFO; return $null }
     # Suppress the SDK's welcome / connection banner on EVERY stream it might use: -NoWelcome is honored
     # inconsistently across Graph SDK versions, and the banner has been observed on the Information stream
     # (6) AND the success stream. Redirect both (6>$null + Out-Null) and silence Information at the source
     # (-InformationAction); -ErrorAction Stop still throws because the error stream is NOT redirected.
     # Without this the banner leaked into this function's output and got saved as AppProxyAuth.TenantId,
     # producing an "Invalid URL" 400 when the renewal built the token endpoint from it.
-    Connect-MgGraph -Scopes 'Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'Directory.ReadWrite.All' `
+    # -ContextScope Process: the admin's token lives in this process only - never reused from (or left in)
+    # the on-disk cache of an earlier session on the server, which is how a stale token gets a 403.
+    Connect-MgGraph -Scopes $RequiredGraphScopes -ContextScope Process `
         -NoWelcome -ErrorAction Stop -InformationAction SilentlyContinue 6>$null | Out-Null
-    $ctx = Get-MgContext
+    $ctx = Get-MgContext -ErrorAction Stop
     if (-not $ctx) { throw 'Connect-MgGraph did not establish a context.' }
     # Guard: the tenant id is written into cert-config.json and used to build the AAD token URL, so it MUST
     # be a GUID. If Get-MgContext ever returns something else, fail loudly rather than persist a bad value.
     $tid = [string]$ctx.TenantId
-    if ($tid -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+    if (-not (Test-IsGuid $tid)) {
         throw "Get-MgContext returned an unexpected tenant id ('$tid') - aborting rather than writing a bad AppProxyAuth.TenantId."
+    }
+    # Guard: the token must actually carry every scope we asked for. Otherwise the first mutation gets a 403
+    # that reads like a role problem when it is a consent/token problem.
+    $missing = Get-MissingGraphScopes -GrantedScopes $ctx.Scopes -RequiredScopes $RequiredGraphScopes
+    if ($missing.Count -gt 0) {
+        throw "The Graph sign-in does not carry the scope(s) $($missing -join ', '). Consent was not granted for them - sign in again and accept the consent prompt (as an account that can consent on behalf of the organisation)."
     }
     Write-UiResult "connected as $($ctx.Account) (tenant $tid)" -Kind Ok
     return $tid
@@ -310,18 +353,34 @@ function Get-OrCreateEntraApp {
         return @{ AppId = '(dry-run)'; ObjectId = '(dry-run)' }
     }
 
+    # Every Graph mutation below carries an explicit -ErrorAction Stop and a try/catch. The Graph SDK cmdlets
+    # do NOT reliably honour the script-wide $ErrorActionPreference: without this a 403 on New-MgApplication
+    # returned $null, the UI printed "[ok] registered app (appId )", and the run limped on into a
+    # parameter-binding error two calls later (#117). Fail closed at the call that failed, with a message
+    # that names the step.
     $app = Get-MgApplication -Filter "displayName eq '$AppName'" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($app) {
         Write-UiResult "reusing existing Entra app '$AppName' (appId $($app.AppId))" -Kind Ok
     }
     else {
         Write-UiResult "registering new Entra app '$AppName'..." -Kind Note
-        $app = New-MgApplication -DisplayName $AppName -SignInAudience 'AzureADMyOrg'
+        try { $app = New-MgApplication -DisplayName $AppName -SignInAudience 'AzureADMyOrg' -ErrorAction Stop }
+        catch { throw (ConvertTo-GraphFailureMessage -Step "Registering the Entra app '$AppName'" -ErrorRecord $_) }
         Write-UiResult "registered app (appId $($app.AppId))" -Kind Ok
+    }
+    # The app's ids are reused by every call below and the appId is persisted as AppProxyAuth.ClientId, so
+    # both must be GUIDs - never continue with an empty application.
+    if (-not (Test-IsGuid ([string]$app.AppId)) -or -not (Test-IsGuid ([string]$app.Id))) {
+        throw "Graph returned no usable ids for the Entra app '$AppName' (appId '$($app.AppId)', objectId '$($app.Id)') - aborting."
     }
 
     $sp = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $sp) { $sp = New-MgServicePrincipal -AppId $app.AppId; Write-UiResult 'created service principal' -Kind Note }
+    if (-not $sp) {
+        try { $sp = New-MgServicePrincipal -AppId $app.AppId -ErrorAction Stop }
+        catch { throw (ConvertTo-GraphFailureMessage -Step "Creating the service principal for '$AppName'" -ErrorRecord $_) }
+        Write-UiResult 'created service principal' -Kind Note
+    }
+    if (-not (Test-IsGuid ([string]$sp.Id))) { throw "Graph returned no usable service principal id for '$AppName' - aborting." }
 
     # Upload the auth cert public key (append if not already present).
     $hash = [System.Convert]::ToBase64String($AuthCertificate.GetCertHash())
@@ -336,28 +395,36 @@ function Get-OrCreateEntraApp {
             Key         = $AuthCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
             DisplayName = "Auth-Cert-$($AuthCertificate.Thumbprint.Substring(0,8))"
         }
-        Update-MgApplication -ApplicationId $app.Id -KeyCredentials @(@($app.KeyCredentials) + $keyCred)
+        try { Update-MgApplication -ApplicationId $app.Id -KeyCredentials @(@($app.KeyCredentials) + $keyCred) -ErrorAction Stop }
+        catch { throw (ConvertTo-GraphFailureMessage -Step 'Uploading the auth certificate to the app' -ErrorRecord $_) }
         Write-UiResult "uploaded auth certificate $($AuthCertificate.Thumbprint) to the app" -Kind Ok
     }
 
     # Ensure the required Graph permissions are declared.
-    Update-MgApplication -ApplicationId $app.Id -RequiredResourceAccess @(@{
-        ResourceAppId  = $GraphResourceId
-        ResourceAccess = @(
-            @{ Id = $AppReadWriteAllRole;   Type = 'Role' },
-            @{ Id = $DirectoryReadWriteAll; Type = 'Role' }
-        )
-    })
+    try {
+        Update-MgApplication -ApplicationId $app.Id -ErrorAction Stop -RequiredResourceAccess @(@{
+            ResourceAppId  = $GraphResourceId
+            ResourceAccess = @(
+                @{ Id = $AppReadWriteAllRole;   Type = 'Role' },
+                @{ Id = $DirectoryReadWriteAll; Type = 'Role' }
+            )
+        })
+    }
+    catch { throw (ConvertTo-GraphFailureMessage -Step 'Declaring the required Graph permissions on the app' -ErrorRecord $_) }
 
-    # Grant admin consent (idempotent: skip a role already assigned).
-    $graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphResourceId'" | Select-Object -First 1
+    # Grant admin consent (idempotent: skip a role already assigned). This is the step that needs Global
+    # Administrator / Privileged Role Administrator: it assigns Microsoft Graph application roles.
+    try { $graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphResourceId'" -ErrorAction Stop | Select-Object -First 1 }
+    catch { throw (ConvertTo-GraphFailureMessage -Step 'Looking up the Microsoft Graph service principal' -ErrorRecord $_) }
+    if (-not (Test-IsGuid ([string]$graphSp.Id))) { throw 'The Microsoft Graph service principal was not found in this tenant - cannot grant the app-roles.' }
     $existingAssignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue)
     foreach ($roleId in @($AppReadWriteAllRole, $DirectoryReadWriteAll)) {
         if ($existingAssignments | Where-Object { $_.AppRoleId -eq $roleId -and $_.ResourceId -eq $graphSp.Id }) {
             Write-UiResult "Graph app-role $roleId already granted" -Kind Note
             continue
         }
-        New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $roleId | Out-Null
+        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $roleId -ErrorAction Stop | Out-Null }
+        catch { throw (ConvertTo-GraphFailureMessage -Step "Granting Graph app-role $roleId (admin consent)" -ErrorRecord $_) }
         Write-UiResult "granted Graph app-role $roleId" -Kind Ok
     }
 
@@ -380,7 +447,7 @@ function Set-AppProxyAuthBlock {
     # Skipped under -DryRun, where the values are the '(dry-run)' placeholder (nothing is persisted anyway).
     if (-not $DryRun) {
         foreach ($pair in @(@{ N = 'TenantId'; V = $TenantId }, @{ N = 'ClientId'; V = $ClientId })) {
-            if ($pair.V -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+            if (-not (Test-IsGuid $pair.V)) {
                 throw "Refusing to write AppProxyAuth: $($pair.N) is not a GUID ('$($pair.V)')."
             }
         }
@@ -468,7 +535,7 @@ try {
     # -NoWelcome + redirection, which contaminates any function return. Discard the return and read the
     # tenant id straight off the SDK context object (always a clean GUID) instead.
     $null = Connect-Graph
-    $tenantId = if ($DryRun) { $null } else { [string](Get-MgContext).TenantId }
+    $tenantId = if ($DryRun) { $null } else { [string](Get-MgContext -ErrorAction Stop).TenantId }
 
     Write-UiHeader 'Authentication certificate'
     $authCert = Get-OrCreateAuthCertificate
@@ -561,8 +628,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDOWFjsigmsnhjw
-# CI2nRiGwsMWfnVoL8BcFP9tK7ol0+aCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDfE2+hees2sw/h
+# NN2cq2h1ccJEO4oDsP91WRFxCnuIRKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -693,31 +760,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIAkED6iApsOeccW5xdgup8UAv0WY6k3hI//O
-# 6tYKRmeJMA0GCSqGSIb3DQEBAQUABIIBgKe2bSwfnw3zb0sJ1/8r5wKCkVYriLXv
-# IE2IYYyuTe/IlS2bUCfJWeRNRGOqROz5bJ+c0lIZNz/9Kf6bIsvVTwSxhDY2nf7r
-# N6Q+lv+cz06KihZjRbXYxwEl2aWnDROlK0EyThRP663CkwOXCK5ZtbQBGr+xoeJj
-# CwzbNVv+DJzQrxP+5qlrjdA7n0eL0N3CmHZzjLLmwi7Q/cDGbo8lqq+hvS0EAqaq
-# TTDeGWLgNA7n2SVDQ/OeL/wjiGcykzn53TmUJoPkQouF/7GxZgth1rHX81ssI20N
-# GTqP00j3rrcJ1IH/tmRfwzGak1EhwEGDEg6yyzUoKs5CNrbyelJHRBxUsL9kOsBi
-# ZrOxRw0FfHoo4NlObg1Aq3DwnpWVj2Ru3Idd4e0aHRqhurnbXyqtg9YULMLtv26r
-# VNVxDWZlfIxY+Gh6XaF9PNQdyVtPkokqzOb/VTRRa5ml2nKo3exl8lqElu1MYV68
-# 8JoWGzw0SdWgg5qUuL4nriFpg7YmINwur6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBTc5tXlpPpjNArgf3HIku1NMF21VA2N7Fj4
+# ZfkucY0TMA0GCSqGSIb3DQEBAQUABIIBgIevTGwFvptqXlyT06FYePbOHeKpAers
+# 1u8A7XiE8a8RyfZa0pCyRdrcNXwShwrqG4nBh6tsXf9822UGpPj1pkGAfVoU+7JP
+# NUwLLAllIz67LmzkuoZiuTbBhimmjZBVFl6HMgL1Hjs54CkolGj7jr9Om6CXfir5
+# B6VasBO4Fdox8TpyrG5KQ6RjFB2bg7Z4Gi9DLZD1NeylG77RwbAMFx2hJZrDnk1e
+# Syig+wu+fzrkEvMeuMkAaDFtXB+zud9kKlM3J1fp0mDvNsmYt7AlNW8l4xvd9jjn
+# 53HmFOaske8SV0HopVpP+JAwig6nm0+gW101/eYeuYqVk/U/5et8/rpSaKNp7AJE
+# 9loBz17LAPOxw6EVZYkG9Pi5HS32KqBOXPvXnn4ld8hcBbUcYaDrj9r6HkPN/Djs
+# KmITy0k+wNjXh397uFcjKf+ys1K5FHl+vMDEAdC6qvkkwUiJGtPLC9u9oIWNNVhi
+# SB+YMrOzyOGClmhLYzmvMRFDOMeEFAR6s6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjEwODU2MjJaMC8GCSqGSIb3DQEJBDEiBCBcUCephV3aMCMuTQxcIQHO
-# 1+uDpPPcTgE5VmLhGX5/IzANBgkqhkiG9w0BAQEFAASCAgAF91xKehCucmJkJC4J
-# 2si1KtkK+fQhfcNBc9NlqYF5S084Htd53F7PBxPC+dB5YAXVwdy8MFxjz4ZT99s5
-# UgnH89eUE3BUx1HV4HvwZdJcfMtZKyrxSNLTQE352KFXb8PS7lbYtd29abUXatFT
-# dIBhK+qJ/Zwb/ySmmlsGz6I/EdZEeKnWhpTvn68YLYV4xlL5LhiVtyNY07rd+30O
-# ShOBYnulO7LFT00gL+019nI/5NDAwTu9MutBudLC/ObijczRxqbTKrN9vaAVM+S6
-# 02Jb6/DyZ75a0CqxJTiCrbgNbsY70Y9NEcnXoSfPtRElUlH9DDh8QG4GhXbeD2H/
-# YGhaTC4l6+wC4WPmcnS7x3wsh5cQPGLfBtprmPo4sAronrMNuExJ9/FbsY6sUGwi
-# Yytw8w6hy7Pa1mrLt6JsD+7VmQbNZcfMlx5Wz23D0AvW1WCSvYvOHHhME4/bkQuW
-# reKdl6TWCIDMzxsvLkeNK38TaJ4J6/3cXkRoVg+U4wbCDzqxP5h0XSGtvroSMPyW
-# 0piC4011SNKEgTkK0qeJat5OJigt+2eJ5tvcRv1NFD/+PLm6NxSIzZVf4v0H3kzs
-# KFpE08k5FDfJme7tzvc7PgN3O/4oF73N2vOdR+EoCHbPGrhOtDbPG1KLnpJslKCK
-# UtjCIH3atYQFtIInn0oJLJBVLA==
+# Fw0yNjA5MjUwOTE5MjRaMC8GCSqGSIb3DQEJBDEiBCD+fetkbTBz+EvnrYVIeMl6
+# jYK1GOZxHMqhn3L4TjJ8wzANBgkqhkiG9w0BAQEFAASCAgAbhx8Q2YYqXHU5kZiM
+# pwfc4X9kWIQkI9sPDlfUgiHH9R2bvu7nQJ1SxWg+qUKLEzr9lgA5eDwnCeMzvmkl
+# 097fVhx75lyPxliIMRQUL193STGFsPEgFqTte5ntrChZx/4fElTI27D2Vhkg2Iei
+# tntAjKC8B6HWqXXvajpNA8WIYQKeq5KqhRVRgOPxApf8QTpjXq0xDkGfAOFiEK6o
+# irok8gJ600vDrRVyw8PJxTqcgPLNyORK53qh6eYSJM93/UFuiPcvvWuoZiS+hM8u
+# toT6tXzzU5cuYdVxbNuuIrlCxnbvxMw/gx1B73NDKevctckeLPLM5PopcF++XCNa
+# OrMaCtz9yBKlHwjbRPq7fI7WByZwYkvJF1+6g5rYdwhsGmwpZ6IQgFsgkOyjTX5Q
+# 16MNtVU0MV7krVibSlQEYCtfRh7vMvKDbyzoTar+Ce6EKoE+i+zmIOFAR0wjwEyj
+# 1/A7/9cTaDYzYGwV5oCXCxOAI6AIGSnqLWg8ew8+SDydL/ShjYChhxgCAijdQEHc
+# U8Pj4+9d7zxSZcfjyRGqTzFidWVvukdlpFncIdlld5SgAfX6gbKYjsLNDW4uLS6Y
+# QeHGSXXVmXxCxtw4P18fU5A1pMxy1L3TOuZF0geArUPXmY2lKwtnpl9pBffS/Qgo
+# njfHhgX7mPK8Q4ck1t/FbfWAvA==
 # SIG # End signature block

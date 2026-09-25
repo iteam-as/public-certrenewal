@@ -2,7 +2,9 @@
 
 # Cert-Renewal — Operations Guide
 
-Cert-renewal keeps Let's Encrypt certificates on a Windows server valid, automatically. You set it up
+Cert-renewal keeps Let's Encrypt certificates on a Windows **or Linux** server valid, automatically.
+This page is the Windows guide; for Linux start at [linux.md](linux.md).
+ You set it up
 **once** with `bootstrap.ps1`, add your certificates with `Create-New-Cert.ps1`, and from then on a daily
 task renews every certificate that is close to expiry and re-binds it wherever it is used (IIS sites, FTP,
 or HTTP.SYS/netsh). The scripts also keep themselves up to date.
@@ -11,7 +13,8 @@ or HTTP.SYS/netsh). The scripts also keep themselves up to date.
 
 | I want to… | Go to |
 |---|---|
-| **Set up a new server** | This page — start at [Quick start](#quick-start-fresh-server). |
+| **Set up a new Windows server** | This page — start at [Quick start](#quick-start-fresh-server). |
+| **Set up a new Linux server** | [linux.md](linux.md) — one command: `sudo sh install.sh`. |
 | **Upgrade a server that runs the old v1 setup** | [upgrade-from-v1.md](upgrade-from-v1.md) |
 | Add, change or remove a certificate; force a renewal; hooks; App Proxy | [day-2-operations.md](day-2-operations.md) |
 | Something went wrong | [troubleshooting.md](troubleshooting.md) |

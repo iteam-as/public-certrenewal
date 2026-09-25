@@ -7,6 +7,15 @@ Everything after the install. All of it happens through `Create-New-Cert.ps1` (t
 & 'C:\Cert\Renewal\Create-New-Cert.ps1'
 ```
 
+On **Linux**, the same menu, as root:
+
+```bash
+sudo pwsh -NoProfile -File /opt/certrenewal/Create-New-Cert.ps1
+```
+
+Everything on this page applies to both platforms. Where a path or command differs, the Linux form is
+given alongside; [linux.md](linux.md) has the parts that exist only there.
+
 With certificates present it shows an overview of the install (script versions, telemetry, billing, the
 managed certificates) and a menu: **[A]dd / [U]pdate / [D]elete / [H]elp / [Q]uit**.
 
@@ -55,6 +64,19 @@ certificate would renew on every run and hit Let's Encrypt's rate limits.
 & 'C:\Cert\Renewal\Renew-Cert.ps1' -Force -DryRun    # shows what would renew, including hooks
 ```
 
+On **Linux**:
+
+```bash
+sudo pwsh -NoProfile -File /opt/certrenewal/Renew-Cert.ps1 -Force
+sudo pwsh -NoProfile -File /opt/certrenewal/Renew-Cert.ps1 -Force -DryRun
+```
+
+Or let the timer's own unit do it, which is closer to what happens at 03:00:
+
+```bash
+sudo systemctl start certrenewal.service && journalctl -u certrenewal.service -n 40
+```
+
 `-Force` ignores the lead time and Let's Encrypt's renewal window and re-issues a genuinely new
 certificate for every managed name. Use it for an on-demand rotation, for example after a key compromise,
 or to exercise a freshly configured hook. **Do not loop it**: repeated forced re-issues hit the
@@ -86,7 +108,10 @@ If a certificate is published through an **Entra Application Proxy** app, the re
 renewed certificate straight into Entra, so App Proxy never serves a stale certificate. No portal
 re-upload, no separate scheduled task.
 
-One-time setup per server, by a Graph administrator:
+One-time setup per server. Run it signed in as a **Global Administrator** or **Privileged Role
+Administrator**: the consent step assigns Microsoft Graph application roles to the shared app, which
+Application Administrator / Cloud Application Administrator cannot grant. If you activate the role through
+PIM, do it *before* the sign-in prompt (a token issued earlier does not carry it).
 
 ```powershell
 # Fresh setup: registers the shared Entra app, mints a per-machine auth cert, writes the AppProxyAuth block
@@ -136,5 +161,17 @@ them to see exactly what a save changed, or restore one by copying it back over 
 | Event log | Windows Event Log → *Application* → source **CertRenewal** |
 | Config snapshots | `C:\Cert\Renewal\config-backups\` |
 | Shared ACME account and order state | `C:\ProgramData\Posh-ACME\` |
+
+On **Linux**:
+
+| What | Where |
+|---|---|
+| Scripts | `/opt/certrenewal/` |
+| Config and secrets | `/etc/certrenewal/` (`cert-config.json`, `cert-secrets.json`, `keys/`) |
+| Per-run logs (90 days) | `/var/log/certrenewal/` |
+| Event log | journald — `journalctl -t CertRenewal`, or by event id: `journalctl CERTRENEWAL_EID=1020` (renewal succeeded) |
+| Config snapshots | `/var/lib/certrenewal/config-backups/` |
+| Shared ACME account and order state | `/var/lib/certrenewal/posh-acme/` |
+| Deployed certificates | `/var/lib/certrenewal/live/<domain>/` (or wherever `Files.Directory` points) |
 
 Something not working? See [troubleshooting.md](troubleshooting.md).

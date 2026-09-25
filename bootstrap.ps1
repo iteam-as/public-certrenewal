@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.10.0'
+$ScriptVersion = '2.11.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -106,16 +106,64 @@ $DefaultCodeSignCertUrl = 'https://raw.githubusercontent.com/iteam-as/public-cer
 $DefaultGuideUrl = 'https://github.com/iteam-as/public-certrenewal#readme'
 $script:GuideUrl = $DefaultGuideUrl
 
-# Paths (identical to Renew-Cert.ps1 / Create-New-Cert.ps1 so all three files agree).
-$CertRenewalPath = 'C:\Cert\Renewal'
-$ConfigPath      = Join-Path $CertRenewalPath 'cert-config.json'
-$SecretsPath     = Join-Path $CertRenewalPath 'cert-secrets.json'
+# --- Platform gate + layout (issue #23 L1) -----------------------------------
+# $IsWindows is UNDEFINED on Windows PowerShell 5.1 - it reads as $null, i.e. falsy - so the edition has to
+# be tested first or every 5.1 box would decide it was running on Linux. SHARED VERBATIM (diff-able rule).
+$IsWindowsHost = ($PSVersionTable.PSEdition -ne 'Core') -or [bool]$IsWindows
+
+function Get-PlatformPaths {
+    # The on-disk layout for this host (spec section 2). Windows keeps the single C:\Cert\Renewal root it has
+    # always had, so nothing about an existing box changes. Linux uses the split tree: /opt for the
+    # self-updating vendor scripts, /etc for config an admin edits, /var/lib for state, /var/log for
+    # transcripts. Every value is a DEFAULT - cert-config overrides (SharedPoshAcmePath, per-domain
+    # Files.Directory) still win. Defined ABOVE the path constants on purpose: they call this at load time,
+    # and a function is only callable once execution has passed its definition. SHARED VERBATIM.
+    if ($IsWindowsHost) {
+        $root = 'C:\Cert\Renewal'
+        return [pscustomobject]@{
+            ScriptsDir      = $root
+            ConfigDir       = $root
+            StateDir        = $root
+            # Literal concatenation, not Join-Path: Join-Path resolves against the running host's
+            # providers, so a 'C:\...' base THROWS on Linux ("A drive with the name 'C' does not exist").
+            # Keeping this function pure means the Linux CI leg can verify the Windows layout too.
+            Config          = "$root\cert-config.json"
+            Secrets         = "$root\cert-secrets.json"
+            SelfUpdateState = "$root\selfupdate-state.json"
+            LogDir          = "$root\log"
+            ConfigBackups   = "$root\config-backups"
+            PoshAcmeHome    = 'C:\ProgramData\Posh-ACME'
+            KeyDir          = $null    # Windows keeps machine credentials in LocalMachine\My, not as files
+            LiveDir         = $null    # 'Files' deployment is Linux-only for now (D9)
+        }
+    }
+    return [pscustomobject]@{
+        ScriptsDir      = '/opt/certrenewal'
+        ConfigDir       = '/etc/certrenewal'
+        StateDir        = '/var/lib/certrenewal'
+        Config          = '/etc/certrenewal/cert-config.json'
+        Secrets         = '/etc/certrenewal/cert-secrets.json'
+        SelfUpdateState = '/var/lib/certrenewal/selfupdate-state.json'
+        LogDir          = '/var/log/certrenewal'
+        ConfigBackups   = '/var/lib/certrenewal/config-backups'
+        PoshAcmeHome    = '/var/lib/certrenewal/posh-acme'
+        KeyDir          = '/etc/certrenewal/keys'
+        LiveDir         = '/var/lib/certrenewal/live'
+    }
+}
+
+# Paths (resolved by the shared Get-PlatformPaths above, so all three files agree on both platforms).
+$Paths           = Get-PlatformPaths
+$CertRenewalPath = $Paths.ScriptsDir
+$ConfigPath      = $Paths.Config
+$SecretsPath     = $Paths.Secrets
 $RenewalScript   = Join-Path $CertRenewalPath 'Renew-Cert.ps1'
 $CreatorScript   = Join-Path $CertRenewalPath 'Create-New-Cert.ps1'
 $AppProxyScript  = Join-Path $CertRenewalPath 'Setup-AppProxy.ps1'
-$LogDir          = Join-Path $CertRenewalPath 'log'
+$LogDir          = $Paths.LogDir
+$ConfigBackupDir = $Paths.ConfigBackups
 $RenewalTaskName = 'Renew-Cert'
-$SharedPoshAcmeDefault = 'C:\ProgramData\Posh-ACME'
+$SharedPoshAcmeDefault = $Paths.PoshAcmeHome
 
 # Azure Key Vault + telemetry SP identity (built-in; all NON-SECRET, private key stays non-exportable in
 # the cert store). Same constants the creator ships (Decision D3 / docs/keyvault-secrets-setup.md section6).
@@ -139,6 +187,10 @@ $TelemetryEndpointUri    = 'https://dcr-certrenewal-og5l-norwayeast.logs.z1.inge
 # Windows Event Log (source shared with renewal/creator; bootstrap owns 1200-1250).
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
+# Which script this is, for the CERTRENEWAL_SCRIPT journald field (spec section 8). Same vocabulary
+# as the manifest canary's -Component, and per-script BY DESIGN - the one constant here that must
+# differ between the three copies.
+$ScriptComponent = 'bootstrap'
 $EID = @{ Start = 1200; TrustInstalled = 1210; CertImported = 1220; ModulesInstalled = 1230; SecretsWritten = 1235; ScriptsInstalled = 1240; SelfUpdate = 1241; TaskRegistered = 1245; ManifestSigMissing = 1246; Migrated = 1250 }
 
 # Read by the shared Send-Telemetry (SelfUpdateStatus column). Bootstrap does not self-update.
@@ -180,6 +232,16 @@ function Write-EventLogEntry {
         [Parameter(Mandatory)][string] $Message
     )
     try {
+        if (-not $IsWindowsHost) {
+            # journald is the Linux event log. The -t tag keeps `journalctl -t CertRenewal` working as the
+            # Get-WinEvent equivalent, and the [EID nnnn] prefix preserves the IDs dashboards key on - the
+            # ranges are unchanged across platforms (renewal 1000-1050, creator 1100-1150, bootstrap
+            # 1200-1250, App Proxy setup 1300-1350).
+            $prio = switch ($EntryType) { 'Error' { 'err' } 'Warning' { 'warning' } default { 'info' } }
+            Write-JournaldEntry -Tag $EventLogSource -Priority $prio -Message "[EID $EventId] $Message" `
+                -EventId $EventId -Component $ScriptComponent
+            return
+        }
         if (-not [System.Diagnostics.EventLog]::SourceExists($EventLogSource)) {
             New-EventLog -LogName $EventLogName -Source $EventLogSource -ErrorAction Stop
         }
@@ -189,6 +251,185 @@ function Write-EventLogEntry {
         # Event Log needs admin to create the source; never fatal - transcript still captures everything.
         Write-Log "Event Log write skipped (id $EventId): $($_.Exception.Message)" -Level DEBUG
     }
+}
+
+function Test-NativeCommand {
+    # Is this native binary actually present? Split into its own function for a testing reason worth
+    # stating: a Pester stub or mock is a FUNCTION, so a `-CommandType Application` check can never see
+    # it - which would leave every transport-selection branch below unreachable in tests anywhere but a
+    # real Linux box. Mocking this one predicate instead keeps the production check strict (a PowerShell
+    # function called `logger` must not be mistaken for the binary) while making the branches testable.
+    # SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Name)
+    return [bool](Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue)
+}
+
+function Get-JournaldFieldBlock {
+    # The journald native-protocol field block for one entry (spec section 8), built separately from the
+    # sending for a concrete reason: a Pester mock does NOT receive piped input, so a block piped straight
+    # into `logger --journald` is invisible to tests. Keeping the construction pure means the FIELDS are
+    # asserted directly and the native call only has to be checked for having happened.
+    # SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string] $Tag,
+        [Parameter(Mandatory)][ValidateSet('info', 'warning', 'err')][string] $Priority,
+        [Parameter(Mandatory)][string] $Message,
+        [int] $EventId,
+        [string] $Component
+    )
+    # PRIORITY is the NUMERIC syslog level in the native protocol, not the name systemd-cat takes.
+    $syslogPriority = switch ($Priority) { 'err' { 3 } 'warning' { 4 } default { 6 } }
+    $fields = @("MESSAGE=$Message", "PRIORITY=$syslogPriority", "SYSLOG_IDENTIFIER=$Tag")
+    # Omitted rather than emitted empty, so a consumer can filter on presence.
+    if ($EventId)   { $fields += "CERTRENEWAL_EID=$EventId" }
+    if ($Component) { $fields += "CERTRENEWAL_SCRIPT=$Component" }
+    return ($fields -join "`n")
+}
+
+function Test-LoggerJournaldSupport {
+    # Does this box's logger understand --journald? util-linux/bsdutils does; a BusyBox logger does not.
+    # Probed once and cached, because Write-JournaldEntry is called many times per run and shelling out to
+    # `logger --help` each time would be absurd. SHARED VERBATIM.
+    if ($null -ne $script:LoggerHasJournald) { return $script:LoggerHasJournald }
+    $script:LoggerHasJournald = $false
+    if (Test-NativeCommand 'logger') {
+        try {
+            $help = & logger --help 2>&1
+            $script:LoggerHasJournald = [bool](@($help) -match '--journald')
+        }
+        catch { $script:LoggerHasJournald = $false }
+    }
+    return $script:LoggerHasJournald
+}
+
+function Write-JournaldEntry {
+    # The Linux half of Write-EventLogEntry, split out so the native-command fallback lives in one place and
+    # so tests can mock it. Three transports, best first:
+    #
+    #   logger --journald  writes NATIVE journald fields, so the event id becomes something you can QUERY
+    #                      (`journalctl CERTRENEWAL_EID=1030`) instead of text every consumer has to parse
+    #                      back out of a message. This is what spec section 8 asks for.
+    #   systemd-cat        tag + priority only, no custom fields - the systemd baseline.
+    #   logger -t          plain syslog, for a container with neither of the above.
+    #
+    # The `[EID nnnn]` message prefix is applied by the caller and therefore appears on ALL THREE, so
+    # `journalctl -t CertRenewal` reads identically however the entry got in and nothing depends on which
+    # transport a given box happened to have. The structured fields are a bonus on top, never the only
+    # copy of the id. Throws if it cannot log at all - the caller treats that exactly like a failed Windows
+    # event-log write (DEBUG line, run continues). SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string] $Tag,
+        [Parameter(Mandatory)][ValidateSet('info', 'warning', 'err')][string] $Priority,
+        [Parameter(Mandatory)][string] $Message,
+        [int] $EventId,
+        [string] $Component
+    )
+    # journald's native protocol needs a length-prefixed binary blob for any value containing a newline.
+    # Folding to spaces keeps MESSAGE identical across all three transports and loses nothing that matters
+    # in a one-line event entry (the transcript keeps the full text either way).
+    $flat = ($Message -replace '\r?\n', ' ').Trim()
+
+    if (Test-LoggerJournaldSupport) {
+        Get-JournaldFieldBlock -Tag $Tag -Priority $Priority -Message $flat -EventId $EventId -Component $Component |
+            & logger --journald
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    if (Test-NativeCommand 'systemd-cat') {
+        $flat | & systemd-cat -t $Tag -p $Priority
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    if (Test-NativeCommand 'logger') {
+        & logger -t $Tag -p "user.$Priority" -- $flat
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    throw 'no journald or syslog transport could record the entry'
+}
+
+function Unprotect-Secret {
+    # Read a stored secret value, whichever platform wrote it (issue #23 L1, D2). Windows: a base64
+    # DPAPI-LocalMachine blob. Linux: the literal value behind a 'plain:' tag, in a 0600 root:root file.
+    # Reading BOTH forms on both platforms is deliberate - a file that moves between platforms must not
+    # break the run. Getting it REWRITTEN into the right at-rest form is Sync-SecretsFromVault's job, and
+    # the two directions are not symmetric: a DPAPI blob is unreadable here on Linux, so returning $null
+    # makes it count as changed for free, whereas a 'plain:' value on Windows reads back perfectly and
+    # therefore needs an explicit tag check over there or it would never be re-protected. Never logs the
+    # value. SHARED VERBATIM.
+    param([string] $Stored)
+    if ([string]::IsNullOrWhiteSpace($Stored)) { return $null }
+    if ($Stored.StartsWith('plain:')) { return $Stored.Substring(6) }   # ':' is not in the base64 alphabet
+    if (-not $IsWindowsHost) { return $null }
+    return Unprotect-Dpapi -Base64Blob $Stored
+}
+
+function Protect-Secret {
+    # Store a secret value for this platform (the inverse of Unprotect-Secret). Windows encrypts with
+    # DPAPI-LocalMachine; Linux tags the plain value, because against the only threat that matters here -
+    # someone with root on the box - DPAPI and mode 0600 are equally worthless, the unattended run has to be
+    # able to read it either way, and the product owner ruled a TPM disproportionate for these four values
+    # (2026-09-08). The vault stays the source of truth, so a leak is recovered by rotating there and letting
+    # the daily sync push it out. Empty in -> $null out, matching Protect-Dpapi. SHARED VERBATIM.
+    param([string] $PlainText)
+    if ([string]::IsNullOrEmpty($PlainText)) { return $null }
+    if (-not $IsWindowsHost) { return "plain:$PlainText" }
+    return Protect-Dpapi -PlainText $PlainText
+}
+
+function Set-RestrictedFileAccess {
+    # Lock a secrets file down to the identity the unattended run uses: Administrators + SYSTEM on Windows
+    # (SIDs, not names, for locale independence), 0600 root:root on Linux. chmod/chown rather than
+    # [IO.File]::SetUnixFileMode: .NET has no ownership API at all, so chown is needed whichever way the mode
+    # is set, and one mechanism for both beats two. Never fatal on either platform - a failure is logged and
+    # the run continues, as it always has.
+    # SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        if (-not $IsWindowsHost) {
+            & chmod 0600 -- $Path
+            if ($LASTEXITCODE -ne 0) { throw "chmod 0600 exited $LASTEXITCODE" }
+            # chown only does anything as root, which the systemd unit always is. A non-root context (a test,
+            # an operator poking at it) legitimately cannot chown, and 0600 has already done the real work.
+            & chown root:root -- $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Log "  chown root:root skipped on ${Path} (not root)." -Level DEBUG }
+            else { Write-Log "  Restricted $Path to 0600 root:root." -Level DEBUG }
+            return
+        }
+        $adminSid  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')   # BUILTIN\Administrators
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')        # NT AUTHORITY\SYSTEM
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited rules
+        foreach ($sid in $adminSid, $systemSid) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'Allow')))
+        }
+        $acl.SetOwner($adminSid)
+        Set-Acl -Path $Path -AclObject $acl
+        Write-Log "  Restricted ACL on cert-secrets.json (Administrators + SYSTEM only)." -Level DEBUG
+    }
+    catch { Write-Log "Could not restrict access on ${Path}: $($_.Exception.Message)" -Level WARNING }
+}
+
+function Set-FileOwnerAndMode {
+    # Apply ownership and a mode to a file on Linux. The generalised sibling of Set-RestrictedFileAccess
+    # (which is the fixed 0600 root:root case for secrets): 'Files' deployment needs a CONFIGURABLE mode and
+    # owner so a service account can read the key without a hook. No-op on Windows, where the 'Files' type
+    # inherits the directory ACL and Owner/Group/Mode are meaningless. chmod/chown binaries rather than
+    # [IO.File]::SetUnixFileMode, for the same reason: there is no ownership API, and this one needs both.
+    # Never fatal - a mode that could not be applied is a WARNING, because the certificate itself is
+    # already correctly on disk. SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [string] $Owner = 'root',
+        [string] $Group = 'root',
+        [string] $Mode  = '0640'
+    )
+    if ($IsWindowsHost) { return }
+    try {
+        & chmod $Mode -- $Path
+        if ($LASTEXITCODE -ne 0) { throw "chmod $Mode exited $LASTEXITCODE" }
+        & chown "${Owner}:${Group}" -- $Path 2>$null
+        if ($LASTEXITCODE -ne 0) { Write-Log "  chown ${Owner}:${Group} skipped on ${Path} (not root)." -Level DEBUG }
+    }
+    catch { Write-Log "Could not apply ${Mode} ${Owner}:${Group} to ${Path}: $($_.Exception.Message)" -Level WARNING }
 }
 
 function Unprotect-Dpapi {
@@ -428,15 +669,27 @@ function Save-VerifiedDownload {
         throw "sha256 mismatch for $Label (downloaded $hash, manifest $ExpectedSha256)"
     }
 
-    $auth = Test-AuthenticodeAllowed -FilePath $newPath
-    if (-not $auth.Allowed) {
-        Remove-Item $newPath -Force -ErrorAction SilentlyContinue
-        Write-EventLogEntry $EID.SelfUpdate Error "Self-update signature refused for ${Label}: $($auth.Reason)"
-        throw "signature refused for $Label ($($auth.Reason))"
+    # Authenticode is Windows-only. On Linux the gates are the SIGNED MANIFEST (verified before it was
+    # parsed, issue #23 L0) and the per-file SHA-256 checked just above - so the bytes are still pinned
+    # to a signed statement of what they should be; what is missing is the third, per-file signature.
+    $thumb = $null
+    if ($IsWindowsHost) {
+        $auth = Test-AuthenticodeAllowed -FilePath $newPath
+        if (-not $auth.Allowed) {
+            Remove-Item $newPath -Force -ErrorAction SilentlyContinue
+            Write-EventLogEntry $EID.SelfUpdate Error "Self-update signature refused for ${Label}: $($auth.Reason)"
+            throw "signature refused for $Label ($($auth.Reason))"
+        }
+        $thumb = $auth.Thumbprint
     }
 
-    Move-Item -Path $newPath -Destination $TargetPath -Force   # atomic on NTFS
-    return $auth.Thumbprint
+    Move-Item -Path $newPath -Destination $TargetPath -Force   # atomic within a filesystem
+    if (-not $IsWindowsHost) {
+        # 0755 root:root: pwsh runs the file, but an unprivileged user must not be able to edit what
+        # root executes nightly.
+        Set-FileOwnerAndMode -Path $TargetPath -Owner 'root' -Group 'root' -Mode '0755'
+    }
+    return $thumb
 }
 
 function Backup-CertConfig {
@@ -447,7 +700,7 @@ function Backup-CertConfig {
     param([string] $Reason = 'config update')
     try {
         if (-not (Test-Path -LiteralPath $ConfigPath)) { return }
-        $backupDir = Join-Path $CertRenewalPath 'config-backups'
+        $backupDir = $ConfigBackupDir
         if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
         $slug = ($Reason -replace '[^A-Za-z0-9]+', '-').Trim('-'); if (-not $slug) { $slug = 'save' }
         $dest = Join-Path $backupDir ('cert-config.{0}.{1}.json' -f (Get-Date -Format 'yyyy-MM-dd-HH_mm_ss_fff'), $slug)
@@ -494,22 +747,71 @@ function ConvertTo-Base64Url {
     [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-function Get-TelemetryAccessToken {
-    # Client-certificate assertion (RS256 JWT, no secret) -> AAD token for the Logs Ingestion scope
-    # https://monitor.azure.com/.default. Same flow as the verified tools/Test-TelemetryIngestion.ps1.
-    # Throws on any failure; the Send-Telemetry caller swallows it (best-effort, never blocks the caller).
+function Get-CredentialRefName {
+    # Which credential field this platform actually reads: a thumbprint into LocalMachine\My on Windows,
+    # a PEM path on Linux (D5). The config-validation guards use this so a block carrying only the OTHER
+    # platform's field is reported as incomplete for THIS one, instead of either field silently passing.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule).
+    param([string] $ThumbprintField = 'CertThumbprint', [string] $PathField = 'CertPath')
+    if ($IsWindowsHost) { return $ThumbprintField }
+    return $PathField
+}
+
+function Get-MachineCredential {
+    # Decision D5: load this machine's service-principal certificate AND private key, whichever way the
+    # platform stores it. Windows keeps it in LocalMachine\My and the config references a thumbprint;
+    # Linux has no machine certificate store, so the config references a PEM file holding the certificate
+    # and its PKCS#8 key together (0600 root:root), loaded with CreateFromPemFile (.NET 5+, so pwsh only).
+    #
+    # The two references are MUTUALLY EXCLUSIVE and the one that counts is the one matching the running
+    # platform. A thumbprint cannot be resolved on Linux, and a PEM path is not what the Windows flow
+    # installs, so falling back to the other field would mean authenticating as something the operator did
+    # not configure for this box - refuse instead. Every caller is best-effort and logs the throw.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule).
+    param(
+        [string] $Thumbprint,
+        [string] $Path,
+        [Parameter(Mandatory)][string] $Purpose
+    )
+    $hasThumb = -not [string]::IsNullOrWhiteSpace($Thumbprint)
+    $hasPath  = -not [string]::IsNullOrWhiteSpace($Path)
+    if ($hasThumb -and $hasPath) {
+        throw "$Purpose credential: a thumbprint AND a PEM path are both configured; they are mutually exclusive (thumbprint = Windows, path = Linux)"
+    }
+    if ($IsWindowsHost) {
+        if (-not $hasThumb) { throw "$Purpose credential: no certificate thumbprint configured (Windows reads LocalMachine\My; a PEM path is Linux-only)" }
+        $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $Thumbprint } | Select-Object -First 1
+        if (-not $cert)               { throw "$Purpose cert (thumbprint $Thumbprint) not found in LocalMachine\My - run bootstrap / install the certificate first" }
+        if (-not $cert.HasPrivateKey) { throw "$Purpose cert $Thumbprint has no private key" }
+        return $cert
+    }
+    if (-not $hasPath) { throw "$Purpose credential: no PEM path configured (Linux has no machine certificate store, so a thumbprint cannot be resolved here)" }
+    if (-not (Test-Path -LiteralPath $Path)) { throw "$Purpose cert PEM '$Path' not found - place the certificate + key there, mode 0600 root:root" }
+    $cert = try { [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($Path) }
+            catch { throw "$Purpose cert PEM '$Path' could not be loaded: $($_.Exception.Message)" }
+    if (-not $cert.HasPrivateKey) { throw "$Purpose cert PEM '$Path' has no private key - the file must hold the certificate AND its PKCS#8 private key" }
+    return $cert
+}
+
+function Get-AadTokenByCertAssertion {
+    # One RS256 client-certificate assertion (no client secret) -> AAD app-only token for $Scope. This is
+    # the single implementation behind Get-TelemetryAccessToken (Monitor ingestion), Get-GraphAccessToken
+    # (Graph) and the Linux Key Vault transport: those differed ONLY in scope, and keeping three copies of
+    # a JWT signing routine in step by hand was two copies too many. Throws on any failure; every caller
+    # in these scripts is best-effort and swallows it.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule).
     param(
         [Parameter(Mandatory)][string] $TenantId,
         [Parameter(Mandatory)][string] $AppClientId,
-        [Parameter(Mandatory)][string] $CertThumbprint
+        [Parameter(Mandatory)][object] $Cert,
+        [Parameter(Mandatory)][string] $Scope
     )
-    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-        Where-Object { $_.Thumbprint -eq $CertThumbprint } | Select-Object -First 1
-    if (-not $cert)               { throw "telemetry cert (thumbprint $CertThumbprint) not found in LocalMachine\My" }
-    if (-not $cert.HasPrivateKey) { throw "telemetry cert $CertThumbprint has no private key" }
+    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
+    if (-not $rsa) { throw 'the credential certificate exposes no usable RSA private key' }
 
     $now    = [DateTimeOffset]::UtcNow
-    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = ConvertTo-Base64Url -Bytes $cert.GetCertHash() } | ConvertTo-Json -Compress
+    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = ConvertTo-Base64Url -Bytes $Cert.GetCertHash() } | ConvertTo-Json -Compress
     $claims = @{
         aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
         iss = $AppClientId; sub = $AppClientId
@@ -518,22 +820,48 @@ function Get-TelemetryAccessToken {
     } | ConvertTo-Json -Compress
     $toSign = (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($header))) + '.' +
               (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($claims)))
-    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
     $sig = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($toSign),
         [Security.Cryptography.HashAlgorithmName]::SHA256,
         [Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $jwt = $toSign + '.' + (ConvertTo-Base64Url -Bytes $sig)
 
-    return (Invoke-RestMethod -Method Post `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 20 `
-        -Body @{
-            client_id             = $AppClientId
-            scope                 = 'https://monitor.azure.com/.default'
-            grant_type            = 'client_credentials'
-            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
-            client_assertion      = $jwt
-        }).access_token
+    try {
+        return (Invoke-RestMethod -Method Post `
+            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 20 `
+            -Body @{
+                client_id             = $AppClientId
+                scope                 = $Scope
+                grant_type            = 'client_credentials'
+                client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                client_assertion      = $jwt
+            }).access_token
+    }
+    catch {
+        # Surface the AAD error body (the AADSTSxxxxx code + description) - a bare "(400) Bad Request"
+        # hides the real reason (bad cert/assertion, missing consent, wrong tenant, ...).
+        # Invoke-RestMethod stashes the response body in $_.ErrorDetails.Message on PS 5.1 and 7.
+        # The scope is named because this one message now serves telemetry, Graph AND Key Vault.
+        $detail = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "AAD token request for scope '$Scope' failed: $detail"
+    }
+}
+
+function Get-TelemetryAccessToken {
+    # AAD token for the Logs Ingestion scope (https://monitor.azure.com/.default) via a client-certificate
+    # assertion - same flow as the verified tools/Test-TelemetryIngestion.ps1. The credential is resolved
+    # per platform by Get-MachineCredential: CertThumbprint on Windows, CertPath (PEM) on Linux (D5).
+    # Throws on any failure; the Send-Telemetry caller swallows it (best-effort, never blocks the caller).
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule).
+    param(
+        [Parameter(Mandatory)][string] $TenantId,
+        [Parameter(Mandatory)][string] $AppClientId,
+        [string] $CertThumbprint,
+        [string] $CertPath
+    )
+    $cert = Get-MachineCredential -Thumbprint $CertThumbprint -Path $CertPath -Purpose 'telemetry'
+    return Get-AadTokenByCertAssertion -TenantId $TenantId -AppClientId $AppClientId -Cert $cert `
+        -Scope 'https://monitor.azure.com/.default'
 }
 
 function Get-RuntimeInfo {
@@ -551,7 +879,14 @@ function Get-RuntimeInfo {
     else {
         try { $osVersion = (((Get-Content '/etc/os-release' -ErrorAction Stop) | Where-Object { $_ -like 'PRETTY_NAME=*' } | Select-Object -First 1) -replace '^PRETTY_NAME=', '' -replace '"', '').Trim() } catch { }
         if (-not $osVersion) { try { $osVersion = [string][System.Runtime.InteropServices.RuntimeInformation]::OSDescription } catch { } }
-        try { $account = if ($env:USER) { $env:USER } else { [string]$env:USERNAME } } catch { }
+        # SUDO_USER first: everything here runs through sudo, so $env:USER is 'root' on every box and
+        # the telemetry column would say 'root' for every operator on the fleet - which is exactly the
+        # accountability the schema v2 column exists to provide, thrown away. SUDO_USER names the human.
+        try {
+            $account = if ($env:SUDO_USER) { [string]$env:SUDO_USER }
+                       elseif ($env:USER)  { [string]$env:USER }
+                       else                { [string]$env:USERNAME }
+        } catch { }
     }
     [pscustomobject]@{
         Platform = $platform; OSVersion = $osVersion; Arch = $arch
@@ -603,7 +938,7 @@ function Send-Telemetry {
 
     $t = $Config.Telemetry
     if (-not $t -or -not $t.Enabled) { Write-Log 'Telemetry not enabled (no cert-config.Telemetry block); skipping.' -Level DEBUG; return }
-    foreach ($f in 'TenantId', 'AppClientId', 'DcrImmutableId', 'Stream', 'EndpointUri', 'CertThumbprint') {
+    foreach ($f in 'TenantId', 'AppClientId', 'DcrImmutableId', 'Stream', 'EndpointUri', (Get-CredentialRefName)) {
         if ([string]::IsNullOrWhiteSpace([string]$t.$f)) { Write-Log "Telemetry block missing '$f'; skipping telemetry." -Level WARNING; return }
     }
 
@@ -681,7 +1016,8 @@ function Send-Telemetry {
     }
 
     try {
-        $token = Get-TelemetryAccessToken -TenantId $t.TenantId -AppClientId $t.AppClientId -CertThumbprint $t.CertThumbprint
+        $token = Get-TelemetryAccessToken -TenantId $t.TenantId -AppClientId $t.AppClientId `
+            -CertThumbprint $t.CertThumbprint -CertPath $t.CertPath
         $body  = ConvertTo-Json @($rows) -Depth 10
         $uri   = "$($t.EndpointUri)/dataCollectionRules/$($t.DcrImmutableId)/streams/$($t.Stream)?api-version=2023-01-01"
         $resp  = Invoke-WebRequest -Method Post -Uri $uri -UseBasicParsing -TimeoutSec 20 `
@@ -692,77 +1028,116 @@ function Send-Telemetry {
     catch { Write-Log "Telemetry send failed (non-fatal): $($_.Exception.Message)" -Level WARNING }
 }
 
-function Connect-SecretsVault {
-    # App-only sign-in to Azure with the shared telemetry SP cert (Decision D3) - same auth renewal will
-    # use. No interactive admin sign-in, no fallback. Throws if a module / the cert / the connection is
-    # missing. SP identity comes from the section1 built-in constants (first run has no cert-config yet).
+function New-VaultSession {
+    # Authenticate to Key Vault and return an opaque session for Get-VaultSecretPlainText. Two transports,
+    # because the two platforms cannot authenticate the same way:
+    #
+    #   Windows - Az.Accounts + Az.KeyVault, cert resolved from LocalMachine\My by thumbprint. Unchanged
+    #             and proven: the entire Windows fleet runs this path.
+    #   Linux   - no Az at all. The same RS256 client-certificate assertion used for telemetry, against the
+    #             Key Vault scope, then the Key Vault REST API. Az's only certificate option that works
+    #             off-Windows is -CertificatePath, which would mean writing the SP's private key to disk as
+    #             a PFX on every run; REST avoids that, and also keeps ~100 MB of Az modules (plus their
+    #             Azure.Identity assembly-conflict failure mode) off Linux boxes entirely. Az covers just
+    #             two calls in this product, so there is little else to lose. This supersedes the
+    #             linux-support-spec's original "in-memory PFX" sketch, which is not achievable:
+    #             Connect-AzAccount takes a certificate PATH, never a certificate object.
+    #
+    # The access token lives only in the returned object and is never logged. Throws on any failure; the
+    # best-effort callers swallow it. SHARED VERBATIM across all three scripts (diff-able rule).
     param(
-        [string] $TenantId       = $DefaultSecretsTenantId,
-        [string] $AppId          = $TelemetryAppId,
-        [string] $CertThumbprint = $TelemetrySpCertThumbprint
+        [Parameter(Mandatory)][string] $VaultName,
+        [Parameter(Mandatory)][string] $TenantId,
+        [Parameter(Mandatory)][string] $AppClientId,
+        [string] $CertThumbprint,
+        [string] $CertPath
     )
+    # Resolved up front on BOTH platforms so a missing/ambiguous credential is reported as itself rather
+    # than as an Az connection failure three frames later.
+    $cert = Get-MachineCredential -Thumbprint $CertThumbprint -Path $CertPath -Purpose 'vault SP'
+
+    if (-not $IsWindowsHost) {
+        $token = Invoke-WithRetry -OperationName 'Key Vault token (SP cert assertion)' -ScriptBlock {
+            Get-AadTokenByCertAssertion -TenantId $TenantId -AppClientId $AppClientId -Cert $cert `
+                -Scope 'https://vault.azure.net/.default'
+        }
+        Write-Log "Authenticated to Key Vault '$VaultName' as SP $AppClientId (tenant $TenantId, REST)." -Level SUCCESS
+        return [pscustomobject]@{
+            Transport   = 'Rest'
+            VaultName   = $VaultName
+            BaseUri     = "https://$VaultName.vault.azure.net"
+            AccessToken = $token
+        }
+    }
+
     foreach ($m in 'Az.Accounts', 'Az.KeyVault') {
         if (-not (Get-Module -ListAvailable -Name $m)) { throw "Required module '$m' is not installed (Install-Module $m)." }
     }
     Import-Module Az.Accounts -ErrorAction Stop
     Import-Module Az.KeyVault -ErrorAction Stop
-
-    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-        Where-Object { $_.Thumbprint -eq $CertThumbprint } | Select-Object -First 1
-    if (-not $cert) {
-        throw "SP cert (thumbprint $CertThumbprint) not found in LocalMachine\My - run bootstrap / install the telemetry cert first."
-    }
-
     Invoke-WithRetry -OperationName 'Connect-AzAccount (SP cert)' -ScriptBlock {
-        Connect-AzAccount -ServicePrincipal -ApplicationId $AppId -CertificateThumbprint $CertThumbprint `
+        Connect-AzAccount -ServicePrincipal -ApplicationId $AppClientId -CertificateThumbprint $CertThumbprint `
             -Tenant $TenantId -ErrorAction Stop | Out-Null
     }
-    Write-Log "Connected to Azure as SP $AppId (tenant $TenantId)." -Level SUCCESS
+    Write-Log "Connected to Azure as SP $AppClientId (tenant $TenantId)." -Level SUCCESS
+    return [pscustomobject]@{ Transport = 'Az'; VaultName = $VaultName }
+}
+
+function Connect-SecretsVault {
+    # Thin per-script adapter over New-VaultSession, which holds all the transport logic and IS shared
+    # verbatim. This copy defaults the SP identity to the section-1 built-in constants, because the first
+    # interactive run has no cert-config yet - which is why it is DELIBERATELY not byte-identical with the
+    # renewal's copy, where the identity comes from cert-config.Telemetry.
+    param(
+        [Parameter(Mandatory)][string] $VaultName,
+        [string] $TenantId = $DefaultSecretsTenantId,
+        [string] $AppId    = $TelemetryAppId,
+        [string] $CertThumbprint,
+        [string] $CertPath
+    )
+    # $TelemetrySpCertThumbprint is a LocalMachine\My reference, so default to it on Windows only:
+    # on Linux the caller supplies -CertPath, and defaulting both would trip Get-MachineCredential's
+    # mutual-exclusion refusal. Only default when the caller named neither (L2 will pass a path).
+    if ($IsWindowsHost -and [string]::IsNullOrWhiteSpace($CertThumbprint) -and
+        [string]::IsNullOrWhiteSpace($CertPath)) {
+        $CertThumbprint = $TelemetrySpCertThumbprint
+    }
+    return New-VaultSession -VaultName $VaultName -TenantId $TenantId -AppClientId $AppId `
+        -CertThumbprint $CertThumbprint -CertPath $CertPath
 }
 
 function Get-VaultSecretPlainText {
-    # Fetch one Key Vault secret and return its plaintext (via Marshal so it works across Az versions
-    # and PS 5.1 without -AsPlainText). Throws if the secret is missing.
-    param([Parameter(Mandatory)][string] $VaultName, [Parameter(Mandatory)][string] $Name)
-    $sec = Get-AzKeyVaultSecret -VaultName $VaultName -Name $Name -ErrorAction Stop
-    if (-not $sec) { throw "Secret '$Name' not found in vault '$VaultName'." }
+    # Fetch one Key Vault secret and return its plaintext over whichever transport New-VaultSession
+    # established. Windows goes through Az (via Marshal, so it works across Az versions and on PS 5.1
+    # without -AsPlainText); Linux goes straight to the Key Vault REST API. Throws if the secret is
+    # missing. NEVER logs the value. SHARED VERBATIM across all three scripts (diff-able rule).
+    param([Parameter(Mandatory)][object] $Session, [Parameter(Mandatory)][string] $Name)
+    if ([string]$Session.Transport -eq 'Rest') {
+        $uri = "$($Session.BaseUri)/secrets/$([uri]::EscapeDataString($Name))?api-version=7.4"
+        $r = Invoke-RestMethod -Method Get -Uri $uri -TimeoutSec 20 `
+            -Headers @{ Authorization = "Bearer $($Session.AccessToken)" }
+        if ($null -eq $r -or $null -eq $r.value) { throw "Secret '$Name' not found in vault '$($Session.VaultName)'." }
+        return [string]$r.value
+    }
+    $sec = Get-AzKeyVaultSecret -VaultName $Session.VaultName -Name $Name -ErrorAction Stop
+    if (-not $sec) { throw "Secret '$Name' not found in vault '$($Session.VaultName)'." }
     $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec.SecretValue)
     try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
-}
-
-function Set-SecretsFileAcl {
-    # Restrict cert-secrets.json to Administrators + SYSTEM only (spec section4) so the SYSTEM renewal
-    # task can still decrypt it. SIDs (not names) for locale independence. Never fatal.
-    param([Parameter(Mandatory)][string] $Path)
-    try {
-        $adminSid  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')   # BUILTIN\Administrators
-        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')        # NT AUTHORITY\SYSTEM
-        $acl = New-Object System.Security.AccessControl.FileSecurity
-        $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited rules
-        foreach ($sid in $adminSid, $systemSid) {
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $sid, 'FullControl', 'Allow')))
-        }
-        $acl.SetOwner($adminSid)
-        Set-Acl -Path $Path -AclObject $acl
-        Write-Log "  Restricted ACL on cert-secrets.json (Administrators + SYSTEM only)." -Level DEBUG
-    }
-    catch { Write-Log "Could not set restrictive ACL on ${Path}: $($_.Exception.Message)" -Level WARNING }
 }
 
 function Write-SecretsFile {
     # Write cert-secrets.json: the 3 secret fields DPAPI-LM-encrypted, Email plaintext (spec section4 shape).
     param([Parameter(Mandatory)][hashtable] $Values)
     $obj = [ordered]@{
-        DomeneshopToken  = Protect-Dpapi $Values.DomeneshopToken
-        DomeneshopSecret = Protect-Dpapi $Values.DomeneshopSecret
-        TeamsWebhookUrl  = Protect-Dpapi $Values.TeamsWebhookUrl
+        DomeneshopToken  = Protect-Secret $Values.DomeneshopToken
+        DomeneshopSecret = Protect-Secret $Values.DomeneshopSecret
+        TeamsWebhookUrl  = Protect-Secret $Values.TeamsWebhookUrl
         Email            = $Values.Email
     }
     $json = [pscustomobject]$obj | ConvertTo-Json
     [IO.File]::WriteAllText($SecretsPath, $json, (New-Object Text.UTF8Encoding($false)))   # no BOM
-    Set-SecretsFileAcl -Path $SecretsPath
+    Set-RestrictedFileAccess -Path $SecretsPath
 }
 
 function Sync-SecretsFromVault {
@@ -773,11 +1148,11 @@ function Sync-SecretsFromVault {
     param([Parameter(Mandatory)][string] $VaultName)
 
     Write-Log "Syncing shared secrets from Key Vault '$VaultName'..." -Level INFO
-    Connect-SecretsVault
+    $session = Connect-SecretsVault -VaultName $VaultName
 
     $fetched = @{}
     foreach ($field in $SecretNameMap.Keys) {
-        $fetched[$field] = Get-VaultSecretPlainText -VaultName $VaultName -Name $SecretNameMap[$field]
+        $fetched[$field] = Get-VaultSecretPlainText -Session $session -Name $SecretNameMap[$field]
     }
 
     # Rotation check against the locally-decrypted copy.
@@ -795,10 +1170,21 @@ function Sync-SecretsFromVault {
             # aborting the whole sync and leaving it broken.
             $localVal = $null
             try {
-                $localVal = if ($field -eq 'Email') { [string]$local.$field } else { Unprotect-Dpapi $local.$field }
+                $localVal = if ($field -eq 'Email') { [string]$local.$field } else { Unprotect-Secret $local.$field }
             }
             catch {
                 Write-Log "  Local $field could not be decrypted ($($_.Exception.Message)); treating as changed." -Level WARNING
+                $changed += $field
+                continue
+            }
+            # A 'plain:'-tagged value found on WINDOWS is a Linux-written file that has landed here.
+            # The decrypted values compare equal, so without this it would never be rewritten and the
+            # secret would sit in cleartext on a Windows disk indefinitely. Counting it as changed makes
+            # the next write re-protect it with DPAPI - the mirror image of a DPAPI blob reading as
+            # unusable on Linux, so the tag now heals in BOTH directions. Email is exempt: it is stored
+            # untagged plaintext on both platforms by design (it is not a secret).
+            if ($IsWindowsHost -and $field -ne 'Email' -and ([string]$local.$field).StartsWith('plain:')) {
+                Write-Log "  Local $field is stored unprotected (written on another platform); treating as changed." -Level WARNING
                 $changed += $field
                 continue
             }
@@ -829,18 +1215,254 @@ function Get-ResolvedVaultName {
     return $DefaultSecretsVaultName
 }
 
+function Get-SystemdWritablePaths {
+    # The ReadWritePaths set for certrenewal.service, DERIVED FROM cert-config.json (issue #23 L4).
+    # ProtectSystem=strict mounts the whole hierarchy read-only, so every directory the nightly run writes
+    # to has to be named in the unit, or the write fails inside a read-only mount at 03:00 with nobody
+    # watching. The set is therefore a function of the CONFIG, not a constant:
+    #   * the four layout directories - /opt (self-update writes Renew-Cert.new.ps1 beside itself), /etc
+    #     (the vault secrets refresh and the config self-heal), /var/lib (Posh-ACME, the self-update state,
+    #     config backups and the 'Files' live tree) and /var/log (the transcript);
+    #   * SharedPoshAcmePath, when POSHACME_HOME has been moved out of the state tree;
+    #   * every Domains[].Files.Directory - '/etc/nginx/ssl/<domain>' is a documented, common choice, and
+    #     missing it turns a working renewal into a silent deployment failure.
+    # What a HOOK writes outside that set is the operator's to declare, in a drop-in under
+    # /etc/systemd/system/certrenewal.service.d/ that this code never reads and never rewrites; the ops
+    # guide has the recipe. Deriving hook paths is not possible - a hook is an opaque executable.
+    #
+    # A config-derived allow-list must not be able to widen itself into nothing: a Files.Directory of '/'
+    # or '/etc' would make ProtectSystem=strict meaningless, so system directories and the systemd unit
+    # trees are refused here rather than rendered. Every path is NORMALISED first ('//', '.' and '..'
+    # resolved), because systemd normalises too and a refusal list compared against the raw string can be
+    # walked straight past - see the two lists below.
+    # Returns absolute paths, de-duplicated, with any path an ancestor in the set already covers dropped,
+    # and sorted so the unit text is stable from run to run. Callers @()-wrap the result, as everything
+    # else in these scripts does - one path would otherwise arrive as a bare string with a $null .Count on
+    # PowerShell 5.1. SHARED VERBATIM (diff-able rule).
+    param([object] $Config)
+    if ($IsWindowsHost) { return @() }   # Windows schedules a task; there is no sandbox to describe
+    $layout = Get-PlatformPaths
+    $candidates = @(
+        [pscustomobject]@{ Path = $layout.ScriptsDir; Source = 'the script directory' }
+        [pscustomobject]@{ Path = $layout.ConfigDir;  Source = 'the configuration directory' }
+        [pscustomobject]@{ Path = $layout.StateDir;   Source = 'the state directory' }
+        [pscustomobject]@{ Path = $layout.LogDir;     Source = 'the log directory' }
+    )
+    if ($Config -and $Config.SharedPoshAcmePath) {
+        $candidates += [pscustomobject]@{ Path = [string]$Config.SharedPoshAcmePath; Source = 'SharedPoshAcmePath' }
+    }
+    # @()-wrapped: a one-domain config hands back a lone object, whose .Count is $null on PowerShell 5.1.
+    if ($Config) {
+        foreach ($d in @($Config.Domains)) {
+            if ($d -and $d.Files -and $d.Files.Directory) {
+                $candidates += [pscustomobject]@{ Path = [string]$d.Files.Directory; Source = ("Files.Directory for {0}" -f $d.MainDomain) }
+            }
+        }
+    }
+    # Hard-coded (CLAUDE.md - security gates never relax via input), and in TWO shapes, because the two
+    # kinds of directory are not alike:
+    #   $systemTops   - refused only when named EXACTLY. A subdirectory of these is an ordinary place to
+    #                   put a certificate; '/etc/nginx/ssl/<domain>' is documented and common, so refusing
+    #                   /etc by prefix would break the feature this list exists to protect.
+    #   $systemTrees  - refused for the directory AND everything beneath it, because no subdirectory of
+    #                   them is ever a legitimate deployment target. The unit trees are here because a
+    #                   sandboxed process that can rewrite its own unit - or drop a .conf into its own
+    #                   .service.d - is not sandboxed, which is also why the renewal only REPORTS sandbox
+    #                   drift rather than repairing it.
+    $systemTops  = @('/', '/bin', '/etc', '/home', '/lib', '/lib64', '/media', '/mnt', '/opt', '/root',
+                     '/run', '/sbin', '/srv', '/tmp', '/usr', '/var', '/var/lib', '/var/log', '/var/tmp')
+    $systemTrees = @('/boot', '/dev', '/proc', '/sys',
+                     '/etc/systemd', '/run/systemd', '/usr/lib/systemd', '/lib/systemd')
+    $keep = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($c.Path)) { continue }
+        $raw = ([string]$c.Path).Trim()
+        if (-not $raw.StartsWith('/')) {
+            Write-Log "Ignoring $($c.Source) '$raw' for the systemd sandbox: ReadWritePaths needs an absolute path." -Level WARNING
+            continue
+        }
+        # NORMALISE BEFORE DECIDING ANYTHING. systemd resolves '//', '.' and '..' itself, so a refusal
+        # list matched against the raw string is not a refusal list at all: '/etc//systemd/system' names
+        # exactly the same directory as '/etc/systemd/system' and used to sail straight through. The
+        # ancestor-coverage pass below compares strings too, so it needs the normalised form for the same
+        # reason. Done with string segments rather than Resolve-Path because these directories legitimately
+        # may not exist yet - the whole point of the '-' prefix in the rendered unit.
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($seg in ($raw -split '/')) {
+            if ($seg -eq '' -or $seg -eq '.') { continue }
+            if ($seg -eq '..') { if ($parts.Count -gt 0) { $parts.RemoveAt($parts.Count - 1) }; continue }
+            $parts.Add($seg)
+        }
+        $p = if ($parts.Count -eq 0) { '/' } else { '/' + ($parts -join '/') }
+        # Name both forms when they differ, so the operator can see what their entry actually resolved to.
+        $shown = if ($p -eq $raw) { "'$p'" } else { "'$raw' (which resolves to '$p')" }
+
+        $refused = $systemTops -contains $p
+        if (-not $refused) {
+            foreach ($t in $systemTrees) {
+                if ($p -eq $t -or $p.StartsWith($t + '/')) { $refused = $true; break }
+            }
+        }
+        if ($refused) {
+            Write-Log "Refusing $shown ($($c.Source)) in the systemd sandbox: giving the renewal write access to a system directory or a systemd unit tree would make ProtectSystem=strict pointless. Use a subdirectory of a normal data directory, or declare it in your own certrenewal.service.d drop-in." -Level WARNING
+            continue
+        }
+        if (-not $keep.Contains($p)) { $keep.Add($p) }
+    }
+    # Drop what an ancestor already covers, so the unit names /var/lib/certrenewal once rather than once
+    # per domain living under it.
+    $covered = @($keep | Where-Object { $child = $_; -not @($keep | Where-Object { $_ -ne $child -and $child.StartsWith($_ + '/') }).Count })
+    return @($covered | Sort-Object)
+}
+
+function New-SystemdRenewalUnits {
+    # The Linux half of Register-RenewalTask: a oneshot service plus a daily timer, which is how a Linux
+    # box expresses "run this every morning". Deliberate choices:
+    #   * OnCalendar 03:00 with RandomizedDelaySec - the Windows task fires at a flat 03:00, but a whole
+    #     Linux fleet doing that would hit Let's Encrypt and the vault in one spike. The jitter is capped
+    #     at an hour so the run is still comfortably overnight.
+    #   * Persistent=true - unlike the Windows task's StartWhenAvailable, this catches up a run missed
+    #     because the box was off, which matters for a certificate that expires on a schedule.
+    #   * The service is Type=oneshot with no Restart: the renewal is idempotent and exits 0 even on a
+    #     renewal failure (it reports through telemetry), so a retry loop would be noise, not resilience.
+    # Returns $true when both units are in place and the timer is enabled.
+    param(
+        [Parameter(Mandatory)][string] $ScriptPath,
+        [string] $UnitDir = '/etc/systemd/system',
+        [string] $PwshPath,
+        [object] $Config
+    )
+    # systemd requires an ABSOLUTE ExecStart. /usr/bin/pwsh first when it exists: the distro package
+    # ships it as a STABLE SYMLINK, so it keeps working after an upgrade that moves the real binary
+    # (/opt/microsoft/powershell/7-lts -> .../7), whereas PATH can resolve straight past it to the
+    # versioned directory and pin a unit that breaks silently at 03:00. PATH is the fallback, and it is
+    # what covers the layouts with no such symlink - a snap install is /snap/bin/pwsh.
+    if (-not $PwshPath) {
+        $PwshPath =
+            if (Test-Path -LiteralPath '/usr/bin/pwsh') { '/usr/bin/pwsh' }
+            else {
+                $found = Get-Command 'pwsh' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) { $found.Source }
+                elseif ($PSHOME -and (Test-Path -LiteralPath (Join-Path $PSHOME 'pwsh'))) { Join-Path $PSHOME 'pwsh' }
+                else { '/usr/bin/pwsh' }
+            }
+    }
+    # The sandbox below is only as correct as the config it was rendered from, so read the CURRENT config
+    # when the caller did not hand one over. Best-effort: a first bootstrap has no cert-config.json yet and
+    # simply gets the four layout directories.
+    if (-not $Config) { try { $Config = Get-CertConfig } catch { $Config = $null } }
+    # Every entry is '-'-prefixed. A ReadWritePaths path that does not exist makes systemd refuse to set up
+    # the mount namespace at all (status=226/NAMESPACE) and NOTHING renews - far worse than a sandbox one
+    # directory narrower than intended. Verified on Ubuntu 24.04 / systemd 255. Whitespace needs quoting.
+    $rwPaths = (@(Get-SystemdWritablePaths -Config $Config) |
+        ForEach-Object { if ($_ -match '\s') { '-"' + $_ + '"' } else { '-' + $_ } }) -join ' '
+    $service = @"
+[Unit]
+Description=cert-renewal: renew ACME certificates and deploy them
+Documentation=$($script:GuideUrl)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# -NonInteractive so an unexpected prompt FAILS the run instead of hanging the oneshot until
+# TimeoutStartSec; nothing here is ever meant to ask a question under systemd.
+ExecStart=$PwshPath -NoProfile -NonInteractive -File $ScriptPath
+# The renewal reports failures through telemetry and exits 0; a restart loop would add noise, not safety.
+TimeoutStartSec=2h
+User=root
+
+# --- sandbox (issue #23 L4) ---------------------------------------------------
+# The whole filesystem is read-only except the paths below, which are derived from cert-config.json and
+# re-rendered by bootstrap and Create-New-Cert.ps1. If you add a domain by hand-editing the config,
+# re-run the installer (sh install.sh) so this list is rewritten - the renewal warns nightly when it
+# cannot write somewhere it must, but it cannot fix this file from inside its own sandbox.
+ProtectSystem=strict
+ReadWritePaths=$rwPaths
+# Required, not cosmetic: strict makes /tmp read-only too, and the self-update stages its downloads
+# through [IO.Path]::GetTempFileName().
+PrivateTmp=yes
+# Deliberately OFF. This service is root, so NoNewPrivileges buys it nothing, while pre-renewal and
+# post-renewal hooks are arbitrary operator executables that may legitimately call sudo or a setuid helper.
+NoNewPrivileges=no
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# AF_UNIX for journald and the systemctl D-Bus socket, AF_INET/AF_INET6 for ACME, DNS, Key Vault and
+# Graph, AF_NETLINK because glibc's getaddrinfo uses it for AI_ADDRCONFIG on many systems. AF_PACKET and
+# the exotic families are refused.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# ProtectHome is deliberately NOT set: 'yes' and 'read-only' both abort pwsh at startup with an unhandled
+# IOException when `$HOME/.cache does not exist yet, which is precisely the state of a freshly installed
+# box. ProtectSystem=strict leaves /home and /root writable; add ProtectHome=tmpfs in a drop-in if your
+# hooks never touch them. To widen anything here, add a drop-in - this file is regenerated.
+"@
+    $timer = @"
+[Unit]
+Description=cert-renewal: daily certificate renewal check
+Documentation=$($script:GuideUrl)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Spread a fleet's requests instead of every box hitting the ACME server at exactly 03:00.
+RandomizedDelaySec=1h
+# Catch up a run missed while the box was off - certificates expire on a calendar, not on uptime.
+Persistent=true
+Unit=certrenewal.service
+
+[Install]
+WantedBy=timers.target
+"@
+    $servicePath = "$UnitDir/certrenewal.service"
+    $timerPath   = "$UnitDir/certrenewal.timer"
+
+    if ($DryRun) {
+        Write-Log "[DryRun] WOULD write $servicePath + $timerPath, systemctl daemon-reload, and enable --now certrenewal.timer (daily 03:00 +up to 1h jitter, Persistent)." -Level INFO
+        Write-Log "[DryRun] The unit WOULD sandbox the run with ProtectSystem=strict and ReadWritePaths=$rwPaths." -Level INFO
+        return $true
+    }
+    try {
+        Set-Content -LiteralPath $servicePath -Value $service -Encoding utf8 -NoNewline:$false
+        Set-Content -LiteralPath $timerPath   -Value $timer   -Encoding utf8 -NoNewline:$false
+        Set-FileOwnerAndMode -Path $servicePath -Owner 'root' -Group 'root' -Mode '0644'
+        Set-FileOwnerAndMode -Path $timerPath   -Owner 'root' -Group 'root' -Mode '0644'
+        Write-Log "  Wrote $servicePath and $timerPath." -Level INFO
+
+        & systemctl daemon-reload
+        if ($LASTEXITCODE -ne 0) { throw "systemctl daemon-reload failed (exit $LASTEXITCODE)" }
+        & systemctl enable --now certrenewal.timer
+        if ($LASTEXITCODE -ne 0) { throw "systemctl enable --now certrenewal.timer failed (exit $LASTEXITCODE)" }
+
+        Write-Log "systemd timer 'certrenewal.timer' enabled (daily 03:00, up to 1h jitter)." -Level SUCCESS
+        Write-EventLogEntry $EID.TaskRegistered Information "systemd timer certrenewal.timer enabled"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to install the systemd units: $($_.Exception.Message)" -Level ERROR
+        return $false
+    }
+}
+
 function Register-RenewalTask {
-    # spec section7 - daily SYSTEM task running Renew-Cert.ps1 (ported verbatim from v1 ~3337-3360).
-    # Removes any existing task first. DryRun-gated. Returns $true on success.
+    # spec section7 - the daily unattended run. Windows: a SYSTEM scheduled task (ported verbatim from v1
+    # ~3337-3360). Linux: a systemd service + timer (see New-SystemdRenewalUnits). Removes any existing
+    # task first. DryRun-gated. Returns $true on success.
+    # Never register a run whose target script is missing (e.g. self-update was skipped/failed and the
+    # renewal script was never installed) - it would fail silently every day. Checked on BOTH platforms
+    # before anything is written.
+    if (-not (Test-Path $RenewalScript)) {
+        if ($DryRun) {
+            Write-Log "[DryRun] Renewal script not found at $RenewalScript; the real run would refuse to schedule it." -Level WARNING
+        }
+        else {
+            Write-Log "Cannot schedule the daily run: renewal script not found at $RenewalScript." -Level ERROR
+            return $false
+        }
+    }
+    if (-not $IsWindowsHost) { return (New-SystemdRenewalUnits -ScriptPath $RenewalScript) }
+
     if ($DryRun) {
         Write-Log "[DryRun] WOULD register scheduled task '$RenewalTaskName' (daily 03:00, SYSTEM, RunLevel Highest, $RenewalScript)." -Level INFO
         return $true
-    }
-    # Never register a task whose -File target is missing (e.g. self-update was skipped/failed and the
-    # renewal script was never installed) - it would fail silently every day.
-    if (-not (Test-Path $RenewalScript)) {
-        Write-Log "Cannot register scheduled task: renewal script not found at $RenewalScript." -Level ERROR
-        return $false
     }
     try {
         $action    = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$RenewalScript`""
@@ -886,6 +1508,25 @@ function Resolve-GuideUrl {
     return $url
 }
 
+function Test-HostInteractive {
+    # Is there actually a human on the other end of stdin?
+    #
+    # [Environment]::UserInteractive is NOT the answer on Linux: .NET hardcodes it to $true there, so
+    # it stays $true under systemd, cron, Ansible, cloud-init, a container, or any plain
+    # `sh install.sh < /dev/null`. Every prompt gate built on it alone was therefore dead on Linux,
+    # and Read-Host went on to return $null at EOF - which surfaced as "You cannot call a method on a
+    # null-valued expression", instead of the clear "supply -Abr/-InvoiceCode" message the
+    # non-interactive branch exists to give.
+    #
+    # [Console]::IsInputRedirected is the portable half: $false only when stdin is a real terminal.
+    # BOTH are needed - a Windows service reports UserInteractive $false with stdin not redirected,
+    # and a Linux terminal reports UserInteractive $true with stdin not redirected. SHARED VERBATIM by
+    # the creator + bootstrap; the renewal runs unattended and never prompts, so it has no copy.
+    if (-not [Environment]::UserInteractive) { return $false }
+    try { return (-not [Console]::IsInputRedirected) }
+    catch { return $false }   # no console at all (a hosted runspace): treat as unattended
+}
+
 function Confirm-OperatorEmail {
     # Capture the accountable operator's work email for interactive, config-mutating runs (telemetry schema
     # v2 -> OperatorEmail). Required: re-prompts until a valid address is entered (no skip - that is the
@@ -895,10 +1536,14 @@ function Confirm-OperatorEmail {
     # identity), since the logged-in account is often a shared/generic admin. SHARED VERBATIM by the creator
     # + bootstrap (NOT renewal - the renewal runs unattended and never calls this).
     if (-not [string]::IsNullOrWhiteSpace($script:OperatorEmail)) { return }
-    if ($DryRun -or -not [Environment]::UserInteractive) { return }
+    if ($DryRun -or -not (Test-HostInteractive)) { return }
     Write-Log 'This run is recorded for audit. Enter your work email so the change is attributable.' -Level INFO
     while ($true) {
-        $email = (Read-Host 'Your work email').Trim()
+        $raw = Read-Host 'Your work email'
+        # $null means the input stream ended (EOF). Nothing more is coming, so re-prompting would
+        # spin forever; leave OperatorEmail unset and let the run continue unattributed.
+        if ($null -eq $raw) { Write-Log 'No input available - continuing without an operator email.' -Level WARNING; return }
+        $email = ([string]$raw).Trim()
         if ($email -match '^[^@\s]+@[^@\s]+\.[^@\s]+$') { $script:OperatorEmail = $email; return }
         Write-Log 'Enter a valid email address (e.g. name@firma.no).' -Level WARNING
     }
@@ -953,7 +1598,7 @@ function Set-BootstrapBilling {
         Write-Log '[DryRun] WOULD prompt for the Billing block (no complete block present).' -Level INFO
         return $Config
     }
-    elseif (-not [Environment]::UserInteractive) {
+    elseif (-not (Test-HostInteractive)) {
         throw 'Billing block is missing and bootstrap is running non-interactively. Supply -Abr/-CustomerName/-CustomerNr/-InvoiceCode (and optional -Services), or run bootstrap in an interactive session.'
     }
     else {
@@ -966,11 +1611,84 @@ function Set-BootstrapBilling {
 }
 
 function Test-IsElevated {
-    # True if the current process runs with the Administrators role (required for LocalMachine cert
-    # stores, machine-wide modules, the scheduled task, and the event source).
+    # True when this process can do the privileged work: LocalMachine cert stores, machine-wide modules,
+    # the scheduled task / systemd units, and the event source. On Linux that is simply uid 0 - the systemd
+    # unit runs as root and the whole /opt /etc /var layout is root-owned.
+    if (-not $IsWindowsHost) { return ([int](& id -u) -eq 0) }
     $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Initialize-InstallLayout {
+    # Duty 0 - create the on-disk layout BEFORE anything writes into it (spec section2), and re-assert
+    # its modes on every run.
+    #
+    # This must come first, and it must be FATAL, because nearly everything downstream is best-effort:
+    # on a fresh Linux box a missing /etc/certrenewal makes Save-CertConfig log a WARNING and continue
+    # "with in-memory configuration", makes the vault secrets sync log another - and then the scheduler
+    # installs the timer anyway. The box reports a successful bootstrap and then fails every night with
+    # no config to read. A pre-provisioned lab box cannot surface that; only a genuine first run can.
+    #
+    # Windows keeps everything under one C:\Cert\Renewal tree and inherits its ACL. Linux spreads over
+    # four FHS trees whose MODES are part of the security story, so they are set explicitly - and
+    # REAPPLIED every run, because a directory created once with the wrong mode stays wrong otherwise
+    # (the lesson from the L1c 'Files' ownership bug, which only ever applied its mode at creation).
+    param([Parameter(Mandatory)][object] $Layout)
+
+    $dirs = @(
+        [pscustomobject]@{ Path = $Layout.ScriptsDir; Mode = '0755'; What = 'signed scripts' }
+        [pscustomobject]@{ Path = $Layout.LogDir;     Mode = '0750'; What = 'transcripts' }
+    )
+    if (-not $IsWindowsHost) {
+        # spec section2: config 0750, keys 0700, state 0750. The keys directory holds the telemetry SP and
+        # App Proxy PRIVATE keys, so it is closed to the group as well, as is the Posh-ACME home - that
+        # directory holds the ACME account key and every issued certificate's key.
+        $dirs += [pscustomobject]@{ Path = $Layout.ConfigDir;     Mode = '0750'; What = 'configuration' }
+        $dirs += [pscustomobject]@{ Path = $Layout.KeyDir;        Mode = '0700'; What = 'machine credentials' }
+        # 0751 (traverse, but do not list) on the two directories a SERVICE has to walk through. The
+        # 'Files' Owner/Group recipe has a non-root service read its own key at
+        # <LiveDir>/<domain>/privkey.pem, where the per-domain directory is 0750 root:<group> and the
+        # key 0640 root:<group> - and that only works if every PARENT is traversable by that user.
+        # Spec section2 said 0750 here; taking it literally broke the recipe outright (verified on a
+        # real box: 0750 -> permission denied, 0751 -> reads fine). These two parents were never the
+        # security boundary - the per-domain directory and the file modes are - so all they owe anyone
+        # is passage. The execute-without-read bit still denies enumerating the deployed domains.
+        # This is the L1c directory-traversal bug one level up, and 'reapply every run' would have
+        # made it permanent rather than a one-off.
+        $dirs += [pscustomobject]@{ Path = $Layout.StateDir;      Mode = '0751'; What = 'state' }
+        $dirs += [pscustomobject]@{ Path = $Layout.ConfigBackups; Mode = '0750'; What = 'config backups' }
+        $dirs += [pscustomobject]@{ Path = $Layout.PoshAcmeHome;  Mode = '0700'; What = 'Posh-ACME home (ACME account + cert keys)' }
+        $dirs += [pscustomobject]@{ Path = $Layout.LiveDir;       Mode = '0751'; What = "'Files' deployment root" }
+    }
+
+    foreach ($d in $dirs) {
+        if ([string]::IsNullOrWhiteSpace($d.Path)) { continue }   # KeyDir/LiveDir are $null on Windows
+        $exists = Test-Path -LiteralPath $d.Path
+        if ($DryRun) {
+            # Windows has no mode to talk about (the ACL is inherited), so an existing directory there
+            # means there is genuinely nothing this step would do.
+            if ($IsWindowsHost) {
+                if (-not $exists) { Write-Log "[DryRun] WOULD create $($d.Path) ($($d.What))." -Level INFO }
+            }
+            elseif ($exists) { Write-Log "[DryRun] WOULD re-assert mode $($d.Mode) root:root on $($d.Path) ($($d.What))." -Level INFO }
+            else             { Write-Log "[DryRun] WOULD create $($d.Path) ($($d.What)), mode $($d.Mode) root:root." -Level INFO }
+            continue
+        }
+        if (-not $exists) {
+            # -ErrorAction Stop so the caller's try/catch turns this into a non-zero exit: a box that
+            # cannot create /etc/certrenewal must NOT go on to schedule a renewal that can never run.
+            New-Item -ItemType Directory -Path $d.Path -Force -ErrorAction Stop | Out-Null
+            Write-Log "  Created $($d.Path) ($($d.What))." -Level INFO
+        }
+        # Best-effort by design (Set-FileOwnerAndMode warns rather than throws, and is a no-op on
+        # Windows): the directory exists, which is what the run needs. A mode that could not be applied
+        # is worth reporting, not worth aborting an otherwise good install over.
+        Set-FileOwnerAndMode -Path $d.Path -Owner 'root' -Group 'root' -Mode $d.Mode
+    }
+
+    $where = if ($IsWindowsHost) { $Layout.ScriptsDir } else { '/etc/certrenewal, /opt/certrenewal, /var/lib/certrenewal, /var/log/certrenewal' }
+    Write-Log "Filesystem layout ready ($where)." -Level SUCCESS
 }
 
 function Install-CodeSigningTrust {
@@ -979,6 +1697,15 @@ function Install-CodeSigningTrust {
     # LocalMachine\TrustedPublisher (run under a restrictive policy). Idempotent per store. Must run
     # BEFORE any Save-VerifiedDownload (which requires Get-AuthenticodeSignature Status=Valid).
     param([string] $Url = $DefaultCodeSignCertUrl)
+    # Windows-only: Authenticode, and the LocalMachine\Root / TrustedPublisher stores it needs, do not
+    # exist on Linux. Integrity there rests on the SIGNED MANIFEST (issue #23 L0, verified BEFORE the
+    # manifest is parsed) plus the per-file SHA-256 - two of the three gates a Windows box applies.
+    # Said out loud rather than left implicit, because 'no Authenticode' reads like a weakening until
+    # you can see what still holds.
+    if (-not $IsWindowsHost) {
+        Write-Log 'Skipping the code-signing trust import (Authenticode is Windows-only; the signed manifest + SHA-256 gate the downloads here).' -Level INFO
+        return
+    }
     $tmp = Join-Path $env:TEMP ("codesign-{0}.cer" -f ([guid]::NewGuid().ToString('N')))
     try {
         Write-Log "Downloading code-signing certificate from $Url" -Level INFO
@@ -1019,6 +1746,24 @@ function Install-SpCert {
     # delete the supplied PFX from disk. Idempotent: skip if the thumbprint is already present. Fatal if
     # absent AND no PFX was supplied (the box can't do vault/telemetry auth without it).
     param([string] $PfxPath, [securestring] $Password)
+    if (-not $IsWindowsHost) {
+        # Linux has no machine certificate store, so there is nothing to import: the SP credential is a PEM
+        # the operator places (D5, and the #79 gap - bootstrap cannot fetch it without already having it).
+        # Missing it is a WARNING, not fatal (spec section 9): the box still renews certificates, it just
+        # cannot reach the vault or send telemetry until the file is there. Print the exact commands rather
+        # than a description of them, so this is copy-pasteable at 3am.
+        $pem = (Get-PlatformPaths).KeyDir + '/telemetry-sp.pem'
+        if (Test-Path -LiteralPath $pem) {
+            Write-Log "SP cert PEM already present at $pem." -Level INFO
+            return
+        }
+        Write-Log "No SP credential at $pem - vault sync and telemetry will be skipped until it exists." -Level WARNING
+        Write-Log '  Place it from the telemetry-client.pfx (on a box that has it):' -Level INFO
+        Write-Log "    openssl pkcs12 -in telemetry-client.pfx -nodes -clcerts -out $pem" -Level INFO
+        Write-Log "    chmod 0600 $pem && chown root:root $pem" -Level INFO
+        Write-Log '  -clcerts matters: the loader takes the FIRST certificate in the file, so a chain cert landing first would resolve the wrong identity.' -Level INFO
+        return
+    }
     $existing = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
         Where-Object { $_.Thumbprint -eq $TelemetrySpCertThumbprint } | Select-Object -First 1
     if ($existing) {
@@ -1054,14 +1799,21 @@ function Install-RequiredModules {
     # without it, so it belongs in the baseline set. Born here; the creator's pending interactive "Fix A" copies this (sharing, not duplicating) and
     # wraps it with prompts. Best-effort per module: a failure warns + continues (Connect-SecretsVault /
     # Posh-ACME re-check at use; the box may still be partly usable).
-    param([string[]] $Modules = @('Az.Accounts', 'Az.KeyVault', 'Posh-ACME', 'DnsClient-PS'))
+    # Az is Windows-only for us now: the Linux Key Vault path is REST with a client-certificate assertion
+    # (issue #23 L1c), precisely so a Linux box needs neither Az.Accounts nor Az.KeyVault - ~100MB of
+    # modules and the Azure.Identity assembly-conflict failure mode, for two calls. Supersedes spec
+    # section 9, which still listed them.
+    param([string[]] $Modules = $(if ($IsWindowsHost) { @('Az.Accounts', 'Az.KeyVault', 'Posh-ACME', 'DnsClient-PS') }
+                                  else               { @('Posh-ACME', 'DnsClient-PS') }))
     if ($DryRun) {
         Write-Log "[DryRun] WOULD ensure NuGet + PSGallery trust + install (AllUsers): $($Modules -join ', ')." -Level INFO
         return
     }
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+        # The NuGet PACKAGE PROVIDER is a PowerShellGet-v2-on-Windows concern; pwsh on Linux ships a
+        # PSGallery that needs no provider bootstrap, and Get-PackageProvider may not even be present.
+        if ($IsWindowsHost -and -not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
             Write-Log 'Installing NuGet package provider...' -Level INFO
             Install-PackageProvider -Name NuGet -MinimumVersion '2.8.5.201' -Force -Scope AllUsers | Out-Null
         }
@@ -1141,15 +1893,21 @@ function Install-FleetScripts {
 
 function New-TelemetryBlock {
     # The cert-config Telemetry block (docs/telemetry-log-analytics-setup.md section6) - all non-secret.
-    return [pscustomobject][ordered]@{
+    # The credential reference is platform-specific and the two forms are MUTUALLY EXCLUSIVE (issue #23
+    # L1c): a thumbprint into LocalMachine\My on Windows, a PEM path on Linux. Only the one this platform
+    # actually uses is emitted - carrying both with one null would put a permanent null key in every
+    # Windows box's config, change its hash, and bill a config-change telemetry event for nothing.
+    $block = [ordered]@{
         Enabled        = $true
         TenantId       = $DefaultSecretsTenantId
         AppClientId    = $TelemetryAppId
         DcrImmutableId = $TelemetryDcrImmutableId
         Stream         = $TelemetryStream
         EndpointUri    = $TelemetryEndpointUri
-        CertThumbprint = $TelemetrySpCertThumbprint
     }
+    if ($IsWindowsHost) { $block['CertThumbprint'] = $TelemetrySpCertThumbprint }
+    else                { $block['CertPath']       = (Get-PlatformPaths).KeyDir + '/telemetry-sp.pem' }
+    return [pscustomobject]$block
 }
 
 function Set-TelemetryBlock {
@@ -1216,6 +1974,8 @@ function ConvertTo-V2Config {
 }
 
 function Invoke-V1Migration {
+    # Windows-only by construction: v1 was a Windows-only product, so a Linux box is always a fresh v2
+    # install and there is no v1 config, scheduled task or generated script to carry forward.
     # Duty 6 - migrate an existing v1 install. Backs up cert-config.json -> cert-config.json.pre-2.0.bak
     # (no secrets in it), converts to v2, and persists. The v1 GENERATED Renew-Cert.ps1 was already
     # replaced in place by Install-FleetScripts (Duty 4a runs BEFORE this) - deliberately NO cleartext
@@ -1311,8 +2071,8 @@ function Write-BootstrapNextSteps {
             Write-Log "   Get-ScheduledTask -TaskName '$RenewalTaskName'" -Level INFO
         }
         Write-Log "Step-by-step guide (install, upgrade, day-2, troubleshooting): $($script:GuideUrl)" -Level INFO
-        if ($DryRun -or -not [Environment]::UserInteractive) { return }
-        $answer = (Read-Host 'Open the guide in your browser now? [y/N]').Trim()
+        if ($DryRun -or -not (Test-HostInteractive)) { return }
+        $answer = ([string](Read-Host 'Open the guide in your browser now? [y/N]')).Trim()
         if ($answer -match '^[Yy]') {
             Start-Process $script:GuideUrl | Out-Null
             Write-Log 'Opened the guide in the default browser.' -Level INFO
@@ -1349,10 +2109,9 @@ try {
 
     Confirm-OperatorEmail   # accountability: capture the operator running this setup (skips when unattended)
 
-    if (-not (Test-Path $CertRenewalPath)) {
-        if ($DryRun) { Write-Log "[DryRun] WOULD create config directory $CertRenewalPath." -Level INFO }
-        else { New-Item -ItemType Directory -Path $CertRenewalPath -Force | Out-Null }
-    }
+    # Duty 0 - the directory layout, before any duty that writes into it (see Initialize-InstallLayout
+    # for why this is fatal while most of what follows is best-effort).
+    Initialize-InstallLayout -Layout $Paths
 
     # Duty 1 - code-signing trust (MUST precede the script downloads in Duty 4a).
     Install-CodeSigningTrust -Url $(if ($CodeSignCertUrl) { $CodeSignCertUrl } else { $DefaultCodeSignCertUrl })
@@ -1402,8 +2161,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDzpXpISg1WGxrY
-# LwgfF4UEojnyZXDrLQpFQFt9HoR9BaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB9IZiLc2jMcMey
+# IMlFG4VrEBahn+I7c90fyBFJz8prdaCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1534,31 +2293,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIGtTBBJkHCSJJBMaymGNzcGO8KtbM1kdq+70
-# cP2NT/4PMA0GCSqGSIb3DQEBAQUABIIBgJT4WAE/bMNyMDz6JBpi8qFg4VGPQLxF
-# FcAm4cPJ6I5dXbP0X+PdnCZA/ycfGF6ewH2RWUm7eI4H9qW8iTQzvlZxLtpWykz4
-# etzaFmNMF4Ppun9ANNV99Hfvd1GzflRaRmho0tmQOKSEFKQ/gfH4tHOBodhf+t/r
-# /P7cx7JxmO+vZ+ooUAcXJak5gF0tuMoVEQsrZuTtpgwJbJhGUWPu9kfwu6B7QECf
-# VIAHU3PSmK/b98/RnZnSl40nbq1sump1XpTcc9M5em/F3GHZPa6bwGMu28HW6YXK
-# o5ICaO8wV89xpV6zHDkb5fGaFHHbVHtpwWbEOdz05Irobw2rS25tZiPpnhMoUhtz
-# 1LuS6Be1nBoXvJSQoQOjiTbJQ9mBarTaxU+zCnktCwC1tFfU+YTqLkxOZv3iuC2f
-# uvTeag4Gx3xNbrlC6EzFQ+PheqEStBEmibdSGSpRISYiSyhly42PReLthXnVE7iG
-# AGZM+pUwYdwlbfmWr6FjMGr2h8b0MPB2DqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIPnuPZOYLwgeA2vQvJ9qgwwtNNQguYNYvTo5
+# HRu/xmVKMA0GCSqGSIb3DQEBAQUABIIBgITzvpY9FDN7LAcqGuFzlp9J0U4hpJiF
+# kkzV+/o9/lCTzyJaTXP3Ho3Ac1Pk205zn9+xJ8y6aKEiUy8dduF0/ySMdrGjF0Z4
+# uz7mgPEsjbf3Zkcd4G0hWyYtnxGvW6Kjh1+Hx+BbPY1sikYVPtndIUxY05MXmugT
+# 9xgN5XQSmRXBRsrJjkoG5S6gG8tprShtEULAn7RTqAQwmTj2faTt14E3oEEth9fk
+# rdFm9RgyF5B1M/YJzeE5Ug8JbAPJFu7yTefGk5Yui1fBDLyHRWB/pusVfTWGoY6T
+# 3sbtAHIw7Fnw8G44U0CDl+VMG14JxYhznHKhiv1Mg4TdlkmIIg6sibDyFR4b/sHF
+# jcJgE7NRZZb+krgsJjsJlQ35rPn4Egva4uiOHttvvUWK3SHBkwHCf/rvVuIw7smz
+# 3D83o6BjXU1vr1IOn6M5rw1ZnMqB/Wg3XHM/2bMgR4UoaS7/BQZaqCE+64MbP32B
+# cp8SoTwHyfF8S/PvQs8poBrsfqhKZ7SLX6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjEwODU2MThaMC8GCSqGSIb3DQEJBDEiBCDgcZBNzibiODGq8nbNhGI7
-# 0tTKl4Aq3xLQf5I/PCJKxjANBgkqhkiG9w0BAQEFAASCAgAqtUNRqcsumdERBkCV
-# qCb5aAdZ/1IYioVSP2qDh+IOlvVyIC0oghzQ7kERy9otxCmsKoOZ+7V9JKcKOM+k
-# AX9lm21ThSaJPfFucXyZusaDKU6rAkIwlkijuk7trrx8u2B3hByGK6dn/6BrZ7nI
-# ucY6qqe3DTC8pPVgyfiptm1ZL+Q8pmpXSaKOhxqekwWRxsOTr1g1uW0EkUgVImGL
-# shhxvBHujC/ul2+1teYpCDFCHOyZpyDKjx9rkkKeU1EgzOZkBJEqmRb+DJrFef3+
-# dBt+TtQ4iM8kVhvL/c5G2XD441bsGppRYBlOb5/fSEYQnSs7dJ/44pjhUi/iMCzO
-# 8ccU4lrr7UcezRsV6sP0TgSoWVnNZswLEWcSVvnsS+gZ22oOZy/hlmVeAmiaz1a8
-# rXKBXbk+fUFE8SU9FbZWVI7rX1cDAU/6FaiDUZomDxeDk19gWEy5uPvf0jeZNv0u
-# ynDpx46lZELLOaKzYeQlpISh+OgadCBkZFW5WoR0Y2T4fnXMlohrFyLAWlpbWxnR
-# edaCr4xfI2mdtACbOO0EbVCTj/doBiNmuDVOwfZkRX5eRMYD7zc9aRSDjeLh9G08
-# Zm7EoNK9+WwcrspE6IZA7lc4SdeSh8/a/BeaerFktsG8H8QIb8C6qyyhuTLBpcJB
-# dpzw7IzXlpnU3vxbQ5YhdFEMUQ==
+# Fw0yNjA5MjUwOTE5MjFaMC8GCSqGSIb3DQEJBDEiBCAbbq0G4L7h+mp2yS6gTG4P
+# +N2jArbjOBCeAzxw6i7rpDANBgkqhkiG9w0BAQEFAASCAgCc1Q/N3t+Oh5pTNvQp
+# LTjq8IBnXfWqpDGN3Wx5lE0SMx0ChjDlRGek7Gpevry6ozlePhFdrGEhfNteqjHz
+# CWnSvHckWgti6VJ1sacypf+QtdilgnkqdiQdMG8Lzv0WMUPsQg3Qk0QSjN42vJEI
+# d+E4dqY8V2amElyCg8bGHhIHpU6h/WIZQD4fB/UxHHG9i8HgbMJwPk78aHigXXfN
+# VcbNCtqlmkYLc19Lx0sbs6rRodXsuZYgpUxC49qmpkLIpWSM4CBpDvx1RISjLVnd
+# iDOqAwS6QKZsRNoFOvDHknjWDn/besD22QzIs77jngfdv7CxapLyp+nKQXnZxdPu
+# VZVL0E8wSNnsbzZ08q8Q9fqpDfM2bweEpufrchNzwml7oCeTCgm4ihv3A3c0rQn9
+# 06S5xS+rGElD7j+K8rhBRS2diKPu13oYhjErnUbCzRKypZa4Ei+SNlvW1AYFWsC2
+# E7Z17o9Fbvjbjk+ThN5cBaURcxmYGWeWMwCHzhSMzvi4VAO0ippZA+ep+6nyak5V
+# 42XrjjQhioK7JHNW374aPAh1F66BmDtXOAOaK6Xwowog6Z2P9wMkS4r7bb9lDHRB
+# AFsNpM6TBlldzBVy40v3C3RR0WTkf4hESDM1tWZg9M+pvMogSvIuMstI50w3LBv0
+# r30dkWKfaG36bv5Ak/pNmdynrg==
 # SIG # End signature block

@@ -1,25 +1,30 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-09-21T08:56:24Z",
+  "updatedAt": "2026-09-25T09:19:25Z",
   "creator": {
-    "version": "2.10.0",
+    "version": "2.11.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/Create-New-Cert.ps1",
-    "sha256": "283a6aa0aa04e17e82e3a3088b1a693edfa652ff17e7b9196b004cb9e82a141b"
+    "sha256": "561c9a5ee153679f5e2e51876ddc1d6c8c2f04ec210f741c51936385dd4cddde"
   },
   "renewal": {
-    "version": "2.10.0",
+    "version": "2.11.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/Renew-Cert.ps1",
-    "sha256": "9fdc700ace4a1f83d491bd9843ad618dca08c93d16b5b07768015c12ca1de0b8"
+    "sha256": "06bfe79edbe2a3f47e179ce7d9024df42ad08742ef81c66fc6dcdf694169337f"
   },
   "bootstrap": {
-    "version": "2.10.0",
+    "version": "2.11.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/bootstrap.ps1",
-    "sha256": "e1e19a15500f8b2f534988d040c1e302b814cd30f14549f9f78edad016f726e8"
+    "sha256": "1dfb4ea512e7ca22c42781f8796a874fa62aeeb501f661cbdde2b20f2595469c"
   },
   "appProxySetup": {
-    "version": "2.10.0",
+    "version": "2.11.0",
     "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/Setup-AppProxy.ps1",
-    "sha256": "9bfa6d960e5453e1ef381d9508616b532d03bec456bbda7375229e69fd44273b"
+    "sha256": "2f89112e44c9ae8403df3f7678ecac0de8558c1b69355fb4257713bba441f8f2"
+  },
+  "linuxInstaller": {
+    "version": "2.11.0",
+    "url": "https://raw.githubusercontent.com/iteam-as/public-certrenewal/main/install.sh",
+    "sha256": "e139a27d0cc6d0d959435f9afa5fe56d8d25f07640645bff15d4cfb37c484b8f"
   },
   "docs": {
     "url": "https://github.com/iteam-as/public-certrenewal#readme"
