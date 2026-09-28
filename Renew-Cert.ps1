@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.0'
+$ScriptVersion = '2.11.1'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -2346,44 +2346,110 @@ function Set-AppProxyCertificate {
     }
 }
 
+function New-AuthCertificatePem {
+    # The portable half of D12: mint the auth credential with .NET CertificateRequest and write it as a
+    # PEM, because Linux has no machine certificate store to put it in. Same shape as the Windows mint -
+    # RSA 2048, SHA-256, clientAuth EKU (1.3.6.1.5.5.7.3.2), two years - so the two platforms age
+    # identically and one rotation threshold fits both.
+    #
+    # The CERTIFICATE goes FIRST in the file, then the PKCS#8 key: CreateFromPemFile takes the FIRST
+    # certificate it finds, and bootstrap already documents that trap for telemetry-sp.pem. Written
+    # temp-then-move inside the same directory (atomic, never briefly world-readable) and locked 0600
+    # root:root by the shared Set-RestrictedFileAccess - no new helper, and the same mode as every other
+    # credential on the box.
+    #
+    # Returns the RELOADED certificate, so the caller cannot tell the two platforms apart: everything
+    # downstream (thumbprint, GetCertHash, Export) works on an X509Certificate2 either way.
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Subject)
+    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+    try {
+        $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            $Subject, $rsa, [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $eku = New-Object System.Security.Cryptography.OidCollection
+        $null = $eku.Add((New-Object System.Security.Cryptography.Oid '1.3.6.1.5.5.7.3.2'))
+        $req.CertificateExtensions.Add(
+            (New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension $eku, $false))
+        # Backdated five minutes: a fresh certificate whose NotBefore is in the future is rejected by the
+        # token endpoint on a box whose clock runs slightly behind Entra's.
+        $now  = [DateTimeOffset]::UtcNow
+        $cert = $req.CreateSelfSigned($now.AddMinutes(-5), $now.AddYears(2))
+        $pem  = $cert.ExportCertificatePem() + "`n" + $rsa.ExportPkcs8PrivateKeyPem() + "`n"
+        $tmp  = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $pem)
+        Set-RestrictedFileAccess -Path $tmp
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        Set-RestrictedFileAccess -Path $Path
+        return [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($Path)
+    }
+    finally { $rsa.Dispose() }
+}
+
 function Update-AppProxyAuthCertificate {
-    # Best-effort SYSTEM self-renewal of the shared App Proxy AUTH cert (the credential the renewal uses to
-    # talk to Graph), preserving the AdHoc tool's zero-touch property. When the cert is <= 30 days from
-    # expiry: mint a fresh 2-year self-signed cert in LocalMachine\My, upload its PUBLIC key to the Entra
-    # app (APPEND - keeps the old key for overlap), repoint AppProxyAuth.AuthCertThumbprint, persist the
-    # config. Authenticates the upload with the OLD (still-valid) cert; this run keeps using the old cert,
+    # Best-effort SYSTEM self-renewal of the shared App Proxy AUTH credential (the one the renewal uses to
+    # talk to Graph), preserving the AdHoc tool's zero-touch property. When it is <= 30 days from expiry:
+    # mint a fresh 2-year credential, upload its PUBLIC key to the Entra app (APPEND - keeps the old key
+    # for the overlap), repoint the reference this platform reads, persist the config.
+    #
+    # BOTH platforms as of #23 L3c (D13). The credential differs, the flow does not: a non-exportable cert
+    # in LocalMachine\My on Windows, a 0600 root:root PEM on Linux, minted with the same
+    # New-AuthCertificatePem the setup tool uses. Until L3c this returned early on Linux, which meant a
+    # Linux box quietly STOPPED pushing certificates about two years after setup, with an AADSTS
+    # assertion failure buried in a warning - fire-and-forget, long after whoever set it up had moved on.
+    #
+    # Authenticates the upload with the OLD (still-valid) credential; this run keeps using the old one,
     # the next run uses the new one - which holds because the caller pins its credential BEFORE calling
     # this (#114): $Config.AppProxyAuth is one shared object and the repoint below is visible to it.
-    # Windows-only (mints a machine cert) - the push (Set-AppProxyCertificate) stays portable, the
-    # auth-cert mint does not (spec section8). -DryRun => WOULD + no-op. May throw (Graph/cert errors);
-    # the caller (Invoke-AppProxySyncPass) wraps it so the run never blocks.
+    # -DryRun => WOULD + no-op. May throw (Graph/cert errors); the caller (Invoke-AppProxySyncPass) wraps
+    # it so the run never blocks.
     param([Parameter(Mandatory)][object] $Config, [string] $Webhook, $RenewalEvents)
-    if (-not $IsWindowsHost) {
-        # Minting a machine certificate is Windows-only (spec section 8; the PUSH stays portable).
-        # Without this gate a Linux run reported the auth cert as missing from a store that does not
-        # exist, with an empty thumbprint, and pointed the operator at a setup script that does not
-        # run there. Linux auth-cert lifecycle is L3.
-        Write-Log 'Skipping the App Proxy auth-cert self-renewal (minting a machine certificate is Windows-only).' -Level DEBUG
-        return
-    }
     $auth     = $Config.AppProxyAuth
-    $oldThumb = [string]$auth.AuthCertThumbprint
-    $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-        Where-Object { $_.Thumbprint -eq $oldThumb } | Select-Object -First 1
-    if (-not $cert) { Write-Log "App Proxy auth cert $oldThumb not found in LocalMachine\My; cannot self-renew (re-run Setup-AppProxy.ps1)." -Level WARNING; return }
+    $refField = Get-CredentialRefName -ThumbprintField 'AuthCertThumbprint' -PathField 'AuthCertPath'
+    $oldRef   = [string]$auth.$refField
+    # Locate the credential in whatever form this platform keeps it. Both branches end with $cert (for
+    # the expiry decision) and $oldRef (what the config points at today).
+    if ($IsWindowsHost) {
+        $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $oldRef } | Select-Object -First 1
+        if (-not $cert) { Write-Log "App Proxy auth cert $oldRef not found in LocalMachine\My; cannot self-renew (re-run Setup-AppProxy.ps1)." -Level WARNING; return }
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($oldRef) -or -not (Test-Path -LiteralPath $oldRef)) {
+            Write-Log "App Proxy auth credential '$oldRef' not found; cannot self-renew (re-run Setup-AppProxy.ps1 on this host)." -Level WARNING; return
+        }
+        # A malformed PEM throws here and the caller turns that into a WARNING. Deliberately NOT healed by
+        # minting: without a readable current credential there is nothing to authenticate the upload with,
+        # so the only real repair is Setup-AppProxy.ps1 with an admin present.
+        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($oldRef)
+    }
+    $oldThumb = [string]$cert.Thumbprint
     $days = ($cert.NotAfter - (Get-Date)).Days
-    if ($days -gt 30) { Write-Log "App Proxy auth cert valid for $days more days; no self-renewal needed." -Level DEBUG; return }
+    if ($days -gt 30) { Write-Log "App Proxy auth credential valid for $days more days; no self-renewal needed." -Level DEBUG; return }
 
-    if ($DryRun) { Write-Log "[DryRun] WOULD self-renew the App Proxy auth cert ($days days left): mint a new 2-year cert + upload its public key to Entra app $($auth.ClientId)." -Level INFO; return }
+    if ($DryRun) { Write-Log "[DryRun] WOULD self-renew the App Proxy auth credential ($days days left): mint a new 2-year credential + upload its public key to Entra app $($auth.ClientId)." -Level INFO; return }
 
-    Write-Log "App Proxy auth cert expires in $days days; self-renewing (zero-touch)..." -Level WARNING
+    Write-Log "App Proxy auth credential expires in $days days; self-renewing (zero-touch)..." -Level WARNING
     $appName = if ($auth.ApplicationName) { [string]$auth.ApplicationName } else { 'AppProxy-Certificate-Updater' }
-    $newCert = New-SelfSignedCertificate -Subject "CN=$appName-Auth" -CertStoreLocation 'Cert:\LocalMachine\My' `
-        -KeyExportPolicy NonExportable -KeySpec Signature -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256 `
-        -NotAfter (Get-Date).AddYears(2) -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.2') `
-        -Provider 'Microsoft Enhanced RSA and AES Cryptographic Provider'
+    if ($IsWindowsHost) {
+        $newCert = New-SelfSignedCertificate -Subject "CN=$appName-Auth" -CertStoreLocation 'Cert:\LocalMachine\My' `
+            -KeyExportPolicy NonExportable -KeySpec Signature -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256 `
+            -NotAfter (Get-Date).AddYears(2) -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.2') `
+            -Provider 'Microsoft Enhanced RSA and AES Cryptographic Provider'
+        $newRef = [string]$newCert.Thumbprint
+    }
+    else {
+        # BESIDE the old file, never over it. Overwriting would make the two keys indistinguishable,
+        # destroy the rollback, and - because the config value would not change - leave nothing in
+        # cert-config.json or its backups saying a rotation ever happened. Windows does not delete the
+        # superseded cert from LocalMachine\My either; the symmetry is worth more than tidiness, and the
+        # old file is the rollback if the new key turns out not to have replicated.
+        $newRef  = Join-Path (Split-Path -Parent $oldRef) ('appproxy-auth-{0}.pem' -f (Get-Date -Format 'yyyyMMdd'))
+        $newCert = New-AuthCertificatePem -Path $newRef -Subject "CN=$appName-Auth"
+    }
 
-    $token   = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId -CertThumbprint $oldThumb
+    # Authenticated with the OLD credential, whichever form it takes - see the header.
+    $token   = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId `
+        -CertThumbprint $(if ($IsWindowsHost) { $oldRef } else { '' }) -CertPath $(if ($IsWindowsHost) { '' } else { $oldRef })
     $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
     $appResp = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 30 `
         -Uri ("https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '{0}'" -f $auth.ClientId)
@@ -2395,16 +2461,23 @@ function Update-AppProxyAuthCertificate {
     $patchBody = @{ keyCredentials = @($existing + $newKey) } | ConvertTo-Json -Depth 10
     Invoke-RestMethod -Method Patch -Uri "https://graph.microsoft.com/v1.0/applications/$appObjId" -Headers $headers -Body $patchBody -TimeoutSec 30 | Out-Null
 
-    $auth | Add-Member -NotePropertyName 'AuthCertThumbprint' -NotePropertyValue $newCert.Thumbprint -Force
+    # Repoint the field this platform reads. The OTHER field is never touched: a config carrying both is
+    # refused by Get-MachineCredential, and Setup-AppProxy.ps1 is what removes a stale one.
+    $auth | Add-Member -NotePropertyName $refField -NotePropertyValue $newRef -Force
     $null = Save-CertConfig -Config $Config -Reason 'App Proxy auth-cert self-renewal'
-    Write-Log "App Proxy auth cert self-renewed: $oldThumb -> $($newCert.Thumbprint) (old still valid for $days days)." -Level SUCCESS
-    Write-EventLogEntry $EID.AppProxyAuthCertRenewed Information "App Proxy auth cert renewed: $oldThumb -> $($newCert.Thumbprint)"
-    if ($RenewalEvents) { $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-authcert-renewed' -RunOutcome 'Ok' -Message ("{0} -> {1}" -f $oldThumb, $newCert.Thumbprint))) }
+    Write-Log "App Proxy auth credential self-renewed: $oldRef -> $newRef (thumbprint $oldThumb -> $($newCert.Thumbprint); the old one stays valid for $days days)." -Level SUCCESS
+    Write-EventLogEntry $EID.AppProxyAuthCertRenewed Information "App Proxy auth credential renewed: $oldRef -> $newRef (thumbprint $($newCert.Thumbprint))"
+    # -ne $null, not a truthiness test: an EMPTY List is $false in a boolean context, so `if ($RenewalEvents)`
+    # dropped this work event whenever nothing else had happened in the run yet - which is the normal case
+    # on the day a rotation fires, since a rotation is not triggered by a renewal. The event existed and
+    # was simply never emitted; found by the first test to drive this path with an empty list (L3c).
+    if ($null -ne $RenewalEvents) { $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-authcert-renewed' -RunOutcome 'Ok' -Message ("{0} -> {1}" -f $oldThumb, $newCert.Thumbprint))) }
     $facts = Get-TeamsFacts -Config $Config
     $facts['Old Thumbprint'] = $oldThumb
     $facts['New Thumbprint'] = $newCert.Thumbprint
+    if (-not $IsWindowsHost) { $facts['New Credential'] = $newRef }
     Send-TeamsNotification -WebhookUrl $Webhook -Title 'App Proxy Auth Certificate Renewed' `
-        -Message "The App Proxy auth certificate on $env:COMPUTERNAME was automatically renewed (zero-touch). Future runs use the new certificate." `
+        -Message "The App Proxy auth credential on $env:COMPUTERNAME was automatically renewed (zero-touch). Future runs use the new one; the previous credential stays valid for another $days days." `
         -Severity good -Facts $facts
 }
 
@@ -3213,8 +3286,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCDivHDzLYNdKvT
-# MgzDI94wJ7pIAPmKiRkWsmdY9TFJAKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCNC4byrPiYxQOv
+# clw6j/dU+68V6FnNuXQdgUHhxKY9EqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3345,31 +3418,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIA8KMoOJM1MgaSckMh/maxOzU7JLDuznx9Fu
-# flT342BiMA0GCSqGSIb3DQEBAQUABIIBgJcA1seCG7+eGmLpSKTpQxvD37wD3xjQ
-# uQ3HPhm1Z9RW5VErPQhGauyaM2YvemcUhV3wE9ZJl9sCXk2gZdgdnRzpDg19KFFF
-# Pfzr5q4B8k9r8ugsg08mDr5SiX1Phe//Dkrb1XptDk6syNn7tuPcg+YhdAeBPfR0
-# dasULfikn40k2vY2euNPiNp9AJ/Wz/X+0jx5dpP9xFHC+px2gdP7LmyuFjj70JBq
-# +bz87YalQx3tujcUsMCKrxSzqXW/uUhSF2Pd009PiKxtWPv4yfOuS2ZL61lzKAu+
-# EJD3w5xvxqicWDGaRnUQO/ecMpVeJC1lVJ2rRiXedGyw8TxNXcAodE2Nrz1jLoQG
-# 7FJmQnqLSufwBzuXrooj48Iad792kiJPb3qMBo0F5DM+/u4hJHBuOx9QVcsS6RiD
-# b9Ms4OzfB8Qk+HF2DYJCk/MtdVRZQvaySATymYkcRsxrXhrHr5ZZEwBIlaDbKJJQ
-# 1RHod55XucuQczhPCzZB6U7M7ZPdnf3KFaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEiIkkJ8nDV+5aScVelmkFFglSrYVpXTSUC0
+# 3Rdcnc33MA0GCSqGSIb3DQEBAQUABIIBgA1Ux3JHZFmEx6rhkSxAe4n49POx/aho
+# 51lfZbezxSPlYBTxTSvhieCx7v/CMLb4Y6wOar0DzM2eQug4570R1nHzG4MDFoe7
+# LuLZm2CcuwD3q4rNDJSGrekBvNznr4TubxH1d0cVqr6xUHuXz53PUa/1wjV5pH5i
+# 2BNABy+sXIeDmaxPPMz4ygZllNOmY4IDbQ+05n25MXz/AkR+6KTULWTPcmMpeRIP
+# 8jaU1wB8BKLVyfNgLLLn/qW+gVnndLZ7E2OOFe1SGz6wHqcjJKqNbyJh7ijT+W0z
+# p3JP183T+rJmnh9m2JClK/OJpCdOWPQ1gMyLrz42VLu3Swg/CoJ7TIJ657r+VpQC
+# eMwX98uk+rzOaKViUcHpvryrLMQbp2MejqkUcVrNmHAqfmuNQX9DB1yORAUC5Oez
+# rKzvWWzfncXYAkE60K6hiJIg1LKUwssP7yV0V4/0EXHcWSrKYVefn0tytCoOy/dO
+# YCGuC6oZWy96ntb4CpDq08NdlLF73cBHmKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjUwOTE5MjNaMC8GCSqGSIb3DQEJBDEiBCAbCjFxYXSjD5ycHacfh4cN
-# Tk8PFm/NM24cOpO48hHuQTANBgkqhkiG9w0BAQEFAASCAgC0f9gdGuwXtd8Z38NG
-# InvFEwjRTFkXaz9ngO7243ernWjIUfWc1cLxZbojn+lFw/Z9+lL4BKY0SX5OX1ZL
-# CW9B75u5qrQHkDYRL5U0DLwP5+yzn5Bg5vBtNrNvyDJ6DEdly+DXbTR+3Fg/fHbg
-# UwI4cIf4mW+8OZNxg8EyNcDhDnj06jhv9OxiE+Ni8sUh8D/UaFWsE2y7mHPbo9Ec
-# KLeKTo+VVD+HokWIat7Efp14Sf1XyL3er++/Mk9uvxJMMQY7vEyOWR+Ka1n9KlhA
-# qE7CFLpOBvm3BAbraeDzo8VsdCv1M1vpIS/0qedJT8Zg5rgiQQxnEEZ/Y6TuoXUF
-# OiLM2jUlVqkmID69cJA789DRUHBHQWvHvpcYbAaDh2FvBDKgIvH13jowLRZeKJC/
-# 42hZCiQ6HjBFr4kta7yJBnV9zdlNP/m89UCNQF4AriBH2I+hf+NMnimU1wUXwzYs
-# QGuGv/ETOrgJ7udgRuk2jsn0NCXLW62kd75ctkYsGkLHbOsgexK6cloAJTXnEFyU
-# CDmVzohI+0toDpVPpYCXDbwcZ4cMUYh0lHTyWiVSyVs3/vvQlqPgmqbsluXcbwNo
-# aM82xS/rvTEQ3HYvgatE6c8UivrnEDi1y0XMbxFojUeiVmsucsluytccqVWMwCSC
-# qGu2bVGYNgGnU2hAimhZ9BsH6w==
+# Fw0yNjA5MjgwODAwNDhaMC8GCSqGSIb3DQEJBDEiBCCXIybXvhyBmvEReTY5f7Ux
+# 7134RWDZky40vxbJjOV9/DANBgkqhkiG9w0BAQEFAASCAgCtMR4ESjG6+fucePSC
+# OyDQgyFepNW7CyQPPnlVCngl48hhIYQ/HmVBA2TdkvxV2dFnv0dvZav/zdoRNst7
+# sqHaxCj9iJSb/fc7/rZQ3sY3V1/O8ebaZMFBnNNt+hW5mEWXRpi1iPxzfwjmZWPr
+# BgR69iqfC+BOoQzYiq0aVhehCjRp5VvsXwGwdlVNmZGuHvO1yS3o4Vr57ox8ZqaX
+# VflHsU3aNMc284M0V+LhoClnAdchaolynFUCo0HGnIGyjPuUSg/4uDzGEXN1ooit
+# /r/Z04Hr0CBG/gKRKX+EFO/JHwl7Xei8jnuI/GMGlwY7bINa6NFNFBPH5I8BCmxJ
+# Jk/yMzuI4TbMxkjqFU+Bp4mpcEeOHSzRH4T6n3hvFs1WqEM22DI1jTbc/s5W0p06
+# 6XYg7CzupcCZ3H2rojD6/3oAvJoOf0gfClY5ckakqy7TbQLusbcRrHD8aTkjDwdF
+# niU5haCpaSXJV/uUVb9UoM/+Yfo+9DbLAcg6hmqsuqMFFSNiTg/xu0eVcfbwTCRO
+# h1GH18kzC/dZ2z27727K2zQD6zIq6wYEBQRn0xu9jGivpk48yjgjfA3GZ5tsw68R
+# VWM3Knk2ZHV1FbKlS86LQbc2QUbVsM8bGGCmqpK+k1YywC3m3PbG5xjYkIhA8Odz
+# NbQaCSMFYtiT1SK4Xv+oPr1TrQ==
 # SIG # End signature block

@@ -110,8 +110,15 @@ re-upload, no separate scheduled task.
 
 One-time setup per server. Run it signed in as a **Global Administrator** or **Privileged Role
 Administrator**: the consent step assigns Microsoft Graph application roles to the shared app, which
-Application Administrator / Cloud Application Administrator cannot grant. If you activate the role through
-PIM, do it *before* the sign-in prompt (a token issued earlier does not carry it).
+Application Administrator / Cloud Application Administrator cannot grant. The setup checks that one of
+those roles is *active* right after sign-in and stops before creating anything if not. If you activate the
+role through PIM, do it *before* the sign-in prompt (a token issued earlier does not carry it).
+
+If the consent step is still refused (the setup retries it for about 90 seconds first, because a brand-new
+service principal can take a moment to replicate), grant it by hand and rerun: Entra admin center →
+**Enterprise applications** → `AppProxy-Certificate-Updater` → **Permissions** → **Grant admin consent**,
+then run `Setup-AppProxy.ps1` again. The rerun reuses the app, the service principal and the certificate it
+already created and finds the roles granted.
 
 ```powershell
 # Fresh setup: registers the shared Entra app, mints a per-machine auth cert, writes the AppProxyAuth block
@@ -122,10 +129,35 @@ PIM, do it *before* the sign-in prompt (a token issued earlier does not carry it
 & 'C:\Cert\Renewal\Setup-AppProxy.ps1' -Migrate      # add -DryRun first to see the plan
 ```
 
+On **Linux** it is the same tool and the same one-time setup, with three differences:
+
+```sh
+sudo pwsh /opt/certrenewal/Setup-AppProxy.ps1        # add -DryRun first to see the plan
+```
+
+- **Sign-in uses a device code.** A server has no browser, so the tool prints a code and a URL to
+  complete on your own workstation. Run it from a real terminal — over SSH use `ssh -t` — because a
+  piped or scripted session cannot show you the code, and the tool refuses rather than hanging.
+- **The auth credential is a file, not a certificate store entry**:
+  `/etc/certrenewal/keys/appproxy-auth.pem`, `0600 root:root`, holding the certificate and its private
+  key. The config then carries `AppProxyAuth.AuthCertPath` instead of `AuthCertThumbprint` — the two are
+  mutually exclusive, and running the tool rewrites the block with the one this platform reads. Back it
+  up as you would any other credential; if it is lost, re-run the tool and a new one is minted and
+  registered (the old public key stays on the app, harmlessly, until it expires).
+- **`-Migrate` is refused**, because the AdHoc tool it adopts only ever existed on Windows.
+
+The per-server auth credential is per server on both platforms: each box mints its own and appends its
+own public key to the one shared Entra app, so a Linux box that publishes through App Proxy has to run
+this locally.
+
 Then, per certificate, choose the App Proxy app at the creator's **[A]dd** or **[U]pdate** prompt
 (*Sync this certificate to an Entra Application Proxy app?*). From then on the daily renewal pushes the
 new certificate after a renewal **and** reconciles drift on every run, so a missed push heals itself. It
-also renews its own auth certificate before expiry. A successful push raises a Teams card; a failure
+also renews its own auth credential before expiry, on both platforms: within 30 days of expiry it mints
+a replacement, registers it alongside the current one and switches to it on the **next** run, so the
+overlap covers Entra's replication. On Linux the new credential is written **beside** the old one as
+`/etc/certrenewal/keys/appproxy-auth-<yyyyMMdd>.pem` and the old file is kept — it is the rollback, and
+it is the only on-disk trace that a rotation happened. A successful push raises a Teams card; a failure
 raises a warning card and never blocks the renewal. If App Proxy is not set up on a box, the prompt is
 simply skipped.
 

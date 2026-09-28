@@ -27,21 +27,28 @@
 .PARAMETER Migrate
   Adopt an existing AdHoc App Proxy install instead of a fresh registration (see -OldAppProxyConfigPath).
 .PARAMETER ConfigPath
-  cert-config.json to update (default C:\Cert\Renewal\cert-config.json).
+  cert-config.json to update. Defaults to this platform's layout:
+  C:\Cert\Renewal\cert-config.json on Windows, /etc/certrenewal/cert-config.json on Linux.
 .PARAMETER OldAppProxyConfigPath
   The AdHoc tool's config to migrate from (default C:\Cert\AppProxy\AppProxyConfig.json). -Migrate only.
 .NOTES
   Source of truth : iteam-as/private-certrenewal (this repo, src/). Published (signed) to
   iteam-as/public-certrenewal by .github/workflows/release.yml on a v*.*.* tag. Do NOT edit the
-  public copy by hand. Self-contained: helpers (Write-Log, Write-EventLogEntry, Test-IsElevated,
-  Get-CertConfig) mirror Renew-Cert.ps1's; the config writer is intentionally telemetry-free (the renewal
-  owns the telemetry path). Event IDs: Setup-AppProxy owns 1300-1350.
+  public copy by hand. It shares the platform block (Write-Log, the journald transport,
+  Write-EventLogEntry, Test-IsElevated, Get-PlatformPaths, $IsWindowsHost) with the three core scripts
+  BYTE-FOR-BYTE under the diff-able rule, enforced by tests/ManifestSignature.Tests.ps1 - it is the
+  fourth script in that test as of #23 L3 (D10). Its own Get-CertConfig / Backup-Config / Save-Config
+  deliberately do NOT match the core's: they are keyed on this script's -ConfigPath and are
+  telemetry-free by design (the renewal owns the telemetry path). Event IDs: 1300-1350.
 #>
 [CmdletBinding()]
 param(
     [switch] $DryRun,
     [switch] $Migrate,
-    [string] $ConfigPath            = 'C:\Cert\Renewal\cert-config.json',
+    # Empty on purpose, resolved in Main from Get-PlatformPaths. A param() default is bound BEFORE the
+    # script body runs, so it cannot call a function this script defines - the same load-order
+    # constraint the core scripts hit with their path constants, seen from the other side.
+    [string] $ConfigPath            = '',
     [string] $OldAppProxyConfigPath = 'C:\Cert\AppProxy\AppProxyConfig.json'
 )
 
@@ -49,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # CI replaces 'DEV' with the release tag (e.g. 2.7.0) at publish time.
-$ScriptVersion = '2.11.0'
+$ScriptVersion = '2.11.1'
 
 # The shared Entra app (one per tenant) the fleet authenticates as to update App Proxy certs.
 $AppName = 'AppProxy-Certificate-Updater'
@@ -62,6 +69,22 @@ $GraphModules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Application
 # assignments. Verified against Get-MgContext after Connect-MgGraph (a cached token can lack them).
 $RequiredGraphScopes = @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'Directory.ReadWrite.All')
 
+# Directory roles that may grant Microsoft Graph APPLICATION roles (the consent step). Application
+# Administrator / Cloud Application Administrator explicitly cannot. Checked ACTIVE right after sign-in,
+# before anything is created (#128). Keyed by roleTemplateId, which is the same in every tenant.
+$RequiredDirectoryRoles = @{
+    '62e90394-69f5-4237-9190-012177145e10' = 'Global Administrator'
+    'e8611ab8-c189-46e8-94e1-60213ab1f814' = 'Privileged Role Administrator'
+}
+
+# The consent grant is retried on a refusal: a grant posted seconds after New-MgServicePrincipal has been
+# answered with 403 Authorization_RequestDenied for a permanent Global Administrator and then succeeded from
+# the portal minutes later (#128), which is what a not-yet-replicated service principal looks like. ~90 s.
+$GrantRetryDelaysSeconds = @(5, 10, 15, 30, 30)
+
+# What the operator does by hand when the grant step still fails; the rerun then finds the roles granted.
+$PortalConsentFallback = "Fallback: in the Entra admin center open Enterprise applications > $AppName > Permissions > 'Grant admin consent', then run this setup again - it reuses everything already created."
+
 # Graph app-role ids (well-known): Application.ReadWrite.All + Directory.ReadWrite.All on the Graph SP.
 $GraphResourceId       = '00000003-0000-0000-c000-000000000000'
 $AppReadWriteAllRole   = '1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9'
@@ -70,15 +93,75 @@ $DirectoryReadWriteAll = '19dbc75e-c2e2-444c-a770-ec69d8559fc7'
 # The AdHoc install we migrate from (-Migrate).
 $OldAppProxyTaskName = 'AppProxy-CertificateUpdate'
 
-# Windows Event Log (source shared with renewal/creator/bootstrap; Setup-AppProxy owns 1300-1350).
+# --- Platform gate (issue #23 L3, D10) ---------------------------------------
+# $IsWindows is UNDEFINED on Windows PowerShell 5.1 - it reads as $null, i.e. falsy - so the edition has to
+# be tested first or every 5.1 box would decide it was running on Linux. SHARED VERBATIM (diff-able rule).
+$IsWindowsHost = ($PSVersionTable.PSEdition -ne 'Core') -or [bool]$IsWindows
+
+# Event log (Windows) / journald (Linux). The source is shared with renewal/creator/bootstrap and
+# Setup-AppProxy owns 1300-1350; $ScriptComponent is the CERTRENEWAL_SCRIPT journald field, and it is the
+# one constant that must DIFFER from the other three scripts' - `journalctl CERTRENEWAL_SCRIPT=appproxy-setup`.
 $EventLogName   = 'Application'
 $EventLogSource = 'CertRenewal'
+$ScriptComponent = 'appproxy-setup'
 $EID = @{ Start = 1300; AppRegistered = 1310; AuthCertMinted = 1320; ConfigWritten = 1330; Migrated = 1340; Failed = 1350 }
 
 #region Helpers ---------------------------------------------------------------
 
+# --- Shared platform block (issue #23 L3, D10) ------------------------------
+# Everything down to Test-IsElevated is COPIED BYTE-FOR-BYTE from the core scripts (Write-Log and the
+# logging family from Renew-Cert.ps1, Test-IsElevated from bootstrap.ps1, which is the only other script
+# that needs it) and is ENFORCED by the byte-identity test in tests/ManifestSignature.Tests.ps1 - this
+# script is the fourth one that test covers. Change a copy here and you change it in all four, or CI
+# fails: the comment is the claim, the test is the enforcement.
+#
+# The reason this tool joined the diff-able core at all: the moment it needs a $IsWindowsHost gate, the
+# alternative is a SECOND, divergent copy of the journald transport living in the least-exercised script
+# in the product. Its Write-Log used to differ from the core's by one comment line - drift of exactly the
+# kind this prevents, and nothing was watching.
+
+function Get-PlatformPaths {
+    # The on-disk layout for this host (spec section 2). Windows keeps the single C:\Cert\Renewal root it has
+    # always had, so nothing about an existing box changes. Linux uses the split tree: /opt for the
+    # self-updating vendor scripts, /etc for config an admin edits, /var/lib for state, /var/log for
+    # transcripts. Every value is a DEFAULT - cert-config overrides (SharedPoshAcmePath, per-domain
+    # Files.Directory) still win. Defined ABOVE the path constants on purpose: they call this at load time,
+    # and a function is only callable once execution has passed its definition. SHARED VERBATIM.
+    if ($IsWindowsHost) {
+        $root = 'C:\Cert\Renewal'
+        return [pscustomobject]@{
+            ScriptsDir      = $root
+            ConfigDir       = $root
+            StateDir        = $root
+            # Literal concatenation, not Join-Path: Join-Path resolves against the running host's
+            # providers, so a 'C:\...' base THROWS on Linux ("A drive with the name 'C' does not exist").
+            # Keeping this function pure means the Linux CI leg can verify the Windows layout too.
+            Config          = "$root\cert-config.json"
+            Secrets         = "$root\cert-secrets.json"
+            SelfUpdateState = "$root\selfupdate-state.json"
+            LogDir          = "$root\log"
+            ConfigBackups   = "$root\config-backups"
+            PoshAcmeHome    = 'C:\ProgramData\Posh-ACME'
+            KeyDir          = $null    # Windows keeps machine credentials in LocalMachine\My, not as files
+            LiveDir         = $null    # 'Files' deployment is Linux-only for now (D9)
+        }
+    }
+    return [pscustomobject]@{
+        ScriptsDir      = '/opt/certrenewal'
+        ConfigDir       = '/etc/certrenewal'
+        StateDir        = '/var/lib/certrenewal'
+        Config          = '/etc/certrenewal/cert-config.json'
+        Secrets         = '/etc/certrenewal/cert-secrets.json'
+        SelfUpdateState = '/var/lib/certrenewal/selfupdate-state.json'
+        LogDir          = '/var/log/certrenewal'
+        ConfigBackups   = '/var/lib/certrenewal/config-backups'
+        PoshAcmeHome    = '/var/lib/certrenewal/posh-acme'
+        KeyDir          = '/etc/certrenewal/keys'
+        LiveDir         = '/var/lib/certrenewal/live'
+    }
+}
+
 function Write-Log {
-    # Mirrors Renew-Cert.ps1's Write-Log (kept identical so the four scripts read the same).
     param(
         [Parameter(Mandatory)][string] $Message,
         [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR', 'DEBUG')][string] $Level = 'INFO'
@@ -94,24 +177,193 @@ function Write-Log {
 }
 
 function Write-EventLogEntry {
-    # Mirrors Renew-Cert.ps1's Write-EventLogEntry. Best-effort; never fatal.
     param(
         [Parameter(Mandatory)][int] $EventId,
         [ValidateSet('Information', 'Warning', 'Error')][string] $EntryType = 'Information',
         [Parameter(Mandatory)][string] $Message
     )
     try {
+        if (-not $IsWindowsHost) {
+            # journald is the Linux event log. The -t tag keeps `journalctl -t CertRenewal` working as the
+            # Get-WinEvent equivalent, and the [EID nnnn] prefix preserves the IDs dashboards key on - the
+            # ranges are unchanged across platforms (renewal 1000-1050, creator 1100-1150, bootstrap
+            # 1200-1250, App Proxy setup 1300-1350).
+            $prio = switch ($EntryType) { 'Error' { 'err' } 'Warning' { 'warning' } default { 'info' } }
+            Write-JournaldEntry -Tag $EventLogSource -Priority $prio -Message "[EID $EventId] $Message" `
+                -EventId $EventId -Component $ScriptComponent
+            return
+        }
         if (-not [System.Diagnostics.EventLog]::SourceExists($EventLogSource)) {
             New-EventLog -LogName $EventLogName -Source $EventLogSource -ErrorAction Stop
         }
         Write-EventLog -LogName $EventLogName -Source $EventLogSource -EventId $EventId -EntryType $EntryType -Message $Message -ErrorAction Stop
     }
-    catch { Write-Log "Event Log write skipped (id $EventId): $($_.Exception.Message)" -Level DEBUG }
+    catch {
+        # Event Log needs admin to create the source; never fatal - transcript still captures everything.
+        Write-Log "Event Log write skipped (id $EventId): $($_.Exception.Message)" -Level DEBUG
+    }
+}
+
+function Test-NativeCommand {
+    # Is this native binary actually present? Split into its own function for a testing reason worth
+    # stating: a Pester stub or mock is a FUNCTION, so a `-CommandType Application` check can never see
+    # it - which would leave every transport-selection branch below unreachable in tests anywhere but a
+    # real Linux box. Mocking this one predicate instead keeps the production check strict (a PowerShell
+    # function called `logger` must not be mistaken for the binary) while making the branches testable.
+    # SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Name)
+    return [bool](Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue)
+}
+
+function Get-JournaldFieldBlock {
+    # The journald native-protocol field block for one entry (spec section 8), built separately from the
+    # sending for a concrete reason: a Pester mock does NOT receive piped input, so a block piped straight
+    # into `logger --journald` is invisible to tests. Keeping the construction pure means the FIELDS are
+    # asserted directly and the native call only has to be checked for having happened.
+    # SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string] $Tag,
+        [Parameter(Mandatory)][ValidateSet('info', 'warning', 'err')][string] $Priority,
+        [Parameter(Mandatory)][string] $Message,
+        [int] $EventId,
+        [string] $Component
+    )
+    # PRIORITY is the NUMERIC syslog level in the native protocol, not the name systemd-cat takes.
+    $syslogPriority = switch ($Priority) { 'err' { 3 } 'warning' { 4 } default { 6 } }
+    $fields = @("MESSAGE=$Message", "PRIORITY=$syslogPriority", "SYSLOG_IDENTIFIER=$Tag")
+    # Omitted rather than emitted empty, so a consumer can filter on presence.
+    if ($EventId)   { $fields += "CERTRENEWAL_EID=$EventId" }
+    if ($Component) { $fields += "CERTRENEWAL_SCRIPT=$Component" }
+    return ($fields -join "`n")
+}
+
+function Test-LoggerJournaldSupport {
+    # Does this box's logger understand --journald? util-linux/bsdutils does; a BusyBox logger does not.
+    # Probed once and cached, because Write-JournaldEntry is called many times per run and shelling out to
+    # `logger --help` each time would be absurd. SHARED VERBATIM.
+    if ($null -ne $script:LoggerHasJournald) { return $script:LoggerHasJournald }
+    $script:LoggerHasJournald = $false
+    if (Test-NativeCommand 'logger') {
+        try {
+            $help = & logger --help 2>&1
+            $script:LoggerHasJournald = [bool](@($help) -match '--journald')
+        }
+        catch { $script:LoggerHasJournald = $false }
+    }
+    return $script:LoggerHasJournald
+}
+
+function Write-JournaldEntry {
+    # The Linux half of Write-EventLogEntry, split out so the native-command fallback lives in one place and
+    # so tests can mock it. Three transports, best first:
+    #
+    #   logger --journald  writes NATIVE journald fields, so the event id becomes something you can QUERY
+    #                      (`journalctl CERTRENEWAL_EID=1030`) instead of text every consumer has to parse
+    #                      back out of a message. This is what spec section 8 asks for.
+    #   systemd-cat        tag + priority only, no custom fields - the systemd baseline.
+    #   logger -t          plain syslog, for a container with neither of the above.
+    #
+    # The `[EID nnnn]` message prefix is applied by the caller and therefore appears on ALL THREE, so
+    # `journalctl -t CertRenewal` reads identically however the entry got in and nothing depends on which
+    # transport a given box happened to have. The structured fields are a bonus on top, never the only
+    # copy of the id. Throws if it cannot log at all - the caller treats that exactly like a failed Windows
+    # event-log write (DEBUG line, run continues). SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string] $Tag,
+        [Parameter(Mandatory)][ValidateSet('info', 'warning', 'err')][string] $Priority,
+        [Parameter(Mandatory)][string] $Message,
+        [int] $EventId,
+        [string] $Component
+    )
+    # journald's native protocol needs a length-prefixed binary blob for any value containing a newline.
+    # Folding to spaces keeps MESSAGE identical across all three transports and loses nothing that matters
+    # in a one-line event entry (the transcript keeps the full text either way).
+    $flat = ($Message -replace '\r?\n', ' ').Trim()
+
+    if (Test-LoggerJournaldSupport) {
+        Get-JournaldFieldBlock -Tag $Tag -Priority $Priority -Message $flat -EventId $EventId -Component $Component |
+            & logger --journald
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    if (Test-NativeCommand 'systemd-cat') {
+        $flat | & systemd-cat -t $Tag -p $Priority
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    if (Test-NativeCommand 'logger') {
+        & logger -t $Tag -p "user.$Priority" -- $flat
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    throw 'no journald or syslog transport could record the entry'
+}
+
+function Get-CredentialRefName {
+    # Which credential field this platform actually reads: a thumbprint into LocalMachine\My on Windows,
+    # a PEM path on Linux (D5). The config-validation guards use this so a block carrying only the OTHER
+    # platform's field is reported as incomplete for THIS one, instead of either field silently passing.
+    # SHARED VERBATIM across Renew-Cert / Create-New-Cert / bootstrap (diff-able rule).
+    param([string] $ThumbprintField = 'CertThumbprint', [string] $PathField = 'CertPath')
+    if ($IsWindowsHost) { return $ThumbprintField }
+    return $PathField
+}
+
+function Set-RestrictedFileAccess {
+    # Lock a secrets file down to the identity the unattended run uses: Administrators + SYSTEM on Windows
+    # (SIDs, not names, for locale independence), 0600 root:root on Linux. chmod/chown rather than
+    # [IO.File]::SetUnixFileMode: .NET has no ownership API at all, so chown is needed whichever way the mode
+    # is set, and one mechanism for both beats two. Never fatal on either platform - a failure is logged and
+    # the run continues, as it always has.
+    # SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        if (-not $IsWindowsHost) {
+            & chmod 0600 -- $Path
+            if ($LASTEXITCODE -ne 0) { throw "chmod 0600 exited $LASTEXITCODE" }
+            # chown only does anything as root, which the systemd unit always is. A non-root context (a test,
+            # an operator poking at it) legitimately cannot chown, and 0600 has already done the real work.
+            & chown root:root -- $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Log "  chown root:root skipped on ${Path} (not root)." -Level DEBUG }
+            else { Write-Log "  Restricted $Path to 0600 root:root." -Level DEBUG }
+            return
+        }
+        $adminSid  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')   # BUILTIN\Administrators
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')        # NT AUTHORITY\SYSTEM
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited rules
+        foreach ($sid in $adminSid, $systemSid) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'Allow')))
+        }
+        $acl.SetOwner($adminSid)
+        Set-Acl -Path $Path -AclObject $acl
+        Write-Log "  Restricted ACL on cert-secrets.json (Administrators + SYSTEM only)." -Level DEBUG
+    }
+    catch { Write-Log "Could not restrict access on ${Path}: $($_.Exception.Message)" -Level WARNING }
+}
+
+function Test-HostInteractive {
+    # Is there actually a human on the other end of stdin?
+    #
+    # [Environment]::UserInteractive is NOT the answer on Linux: .NET hardcodes it to $true there, so
+    # it stays $true under systemd, cron, Ansible, cloud-init, a container, or any plain
+    # `sh install.sh < /dev/null`. Every prompt gate built on it alone was therefore dead on Linux,
+    # and Read-Host went on to return $null at EOF - which surfaced as "You cannot call a method on a
+    # null-valued expression", instead of the clear "supply -Abr/-InvoiceCode" message the
+    # non-interactive branch exists to give.
+    #
+    # [Console]::IsInputRedirected is the portable half: $false only when stdin is a real terminal.
+    # BOTH are needed - a Windows service reports UserInteractive $false with stdin not redirected,
+    # and a Linux terminal reports UserInteractive $true with stdin not redirected. SHARED VERBATIM by
+    # the creator + bootstrap; the renewal runs unattended and never prompts, so it has no copy.
+    if (-not [Environment]::UserInteractive) { return $false }
+    try { return (-not [Console]::IsInputRedirected) }
+    catch { return $false }   # no console at all (a hosted runspace): treat as unattended
 }
 
 function Test-IsElevated {
-    # True if the current process runs with the Administrators role (required for LocalMachine cert
-    # stores, machine-wide modules, and unregistering the AdHoc scheduled task).
+    # True when this process can do the privileged work: LocalMachine cert stores, machine-wide modules,
+    # the scheduled task / systemd units, and the event source. On Linux that is simply uid 0 - the systemd
+    # unit runs as root and the whole /opt /etc /var layout is root-owned.
+    if (-not $IsWindowsHost) { return ([int](& id -u) -eq 0) }
     $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -239,7 +491,10 @@ function Install-GraphModules {
     # On demand, mirroring bootstrap's Install-RequiredModules. DryRun-gated.
     if ($DryRun) { Write-Log "[DryRun] WOULD ensure NuGet + PSGallery trust + install (AllUsers): $($GraphModules -join ', ')." -Level INFO; return }
     try {
-        if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+        # The NuGet PACKAGE PROVIDER is a PowerShellGet-v2-on-Windows concern; pwsh on Linux ships a
+        # PSGallery that needs no provider bootstrap, and Get-PackageProvider may not even be present.
+        # Same gate, same reason, as bootstrap.ps1's Install-RequiredModules (D11).
+        if ($IsWindowsHost -and -not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
             Write-Log 'Installing NuGet package provider...' -Level INFO
             Install-PackageProvider -Name NuGet -MinimumVersion '2.8.5.201' -Force -Scope AllUsers | Out-Null
         }
@@ -272,19 +527,50 @@ function Get-MissingGraphScopes {
     return @($RequiredScopes | Where-Object { $granted -notcontains $_.ToLowerInvariant() })
 }
 
+function Test-HasRequiredDirectoryRole {
+    # True when at least one ACTIVE role template id is a role that can grant Graph application roles.
+    param([AllowNull()][string[]] $ActiveRoleTemplateIds, [Parameter(Mandatory)][hashtable] $RequiredRoles)
+    foreach ($id in @($ActiveRoleTemplateIds)) {
+        if ($id -and $RequiredRoles.ContainsKey(([string]$id).ToLowerInvariant())) { return $true }
+    }
+    return $false
+}
+
+function Get-ActiveDirectoryRoles {
+    # The signed-in account's ACTIVE directory roles as @(@{ TemplateId; DisplayName }), read through
+    # transitiveMemberOf so a role held via a role-assignable group counts and a PIM role counts only while
+    # it is activated. Uses the raw request cmdlet from the Authentication module (no Users module) and the
+    # Directory.ReadWrite.All scope already requested. Returns $null when the read itself fails: this is a
+    # pre-flight diagnostic and must not hide the real step's error behind its own.
+    $roles = @()
+    $uri = 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?$select=roleTemplateId,displayName'
+    try {
+        while ($uri) {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+            $roles += @(@($page.value) | ForEach-Object { @{ TemplateId = [string]$_.roleTemplateId; DisplayName = [string]$_.displayName } })
+            $uri = [string]$page.'@odata.nextLink'
+        }
+    }
+    catch {
+        Write-Log "Could not read the signed-in account's directory roles ($(@(([string]$_.Exception.Message) -split '\r?\n')[0])). Continuing without the pre-flight role check." -Level WARNING
+        return $null
+    }
+    return ,$roles
+}
+
 function ConvertTo-GraphFailureMessage {
     # One line the operator can act on. A 403 Authorization_RequestDenied from a Graph call means Entra
     # refused the SIGNED-IN ACCOUNT for that operation - the delegated scope only lets the user do what the
-    # user could already do. On a Global Administrator that is almost always a token that predates a PIM
-    # activation, so say so instead of leaving the operator staring at "Insufficient privileges".
+    # user could already do. Say which role that takes and the one token trap (a role activated through
+    # PIM after the sign-in), instead of leaving the operator staring at "Insufficient privileges".
     param([Parameter(Mandatory)][string] $Step, [Parameter(Mandatory)][System.Management.Automation.ErrorRecord] $ErrorRecord)
     $detail = [string]$ErrorRecord.Exception.Message
     $msg = "$Step failed: $(@($detail -split '\r?\n')[0])"   # first line only - the SDK appends status + headers
     if ($detail -match 'Authorization_RequestDenied|Insufficient privileges' -or [string]$ErrorRecord.FullyQualifiedErrorId -like 'Authorization_RequestDenied*') {
-        $msg += ' Entra refused the signed-in account for this operation. The account needs Global Administrator or' +
-                ' Privileged Role Administrator (the consent step assigns Microsoft Graph application roles, which' +
-                ' Application Administrator / Cloud Application Administrator cannot grant). If the role was activated' +
-                ' through PIM after signing in, the token predates it: run Disconnect-MgGraph, then run this setup again.'
+        $msg += ' Entra refused the signed-in account for this operation. Granting Microsoft Graph application roles' +
+                ' needs an ACTIVE Global Administrator or Privileged Role Administrator role in the session this setup' +
+                ' signed in with (Application Administrator / Cloud Application Administrator cannot). A role activated' +
+                ' through PIM after the sign-in is not in the token: run Disconnect-MgGraph, then run this setup again.'
     }
     return $msg
 }
@@ -293,6 +579,13 @@ function Connect-Graph {
     # Interactive Graph sign-in for the admin running setup. Returns the tenant id. The scopes are the ones
     # needed to register the app, upload the cert, and grant the app-role assignments.
     if ($DryRun) { Write-Log "[DryRun] WOULD Connect-MgGraph ($($RequiredGraphScopes -join ', '))." -Level INFO; return $null }
+    # The device-code flow prints a code the operator has to type somewhere else, so a non-interactive
+    # Linux session (a pipe, a unit, a CI step) would hang on a prompt nobody can see. Refuse clearly
+    # instead. [Environment]::UserInteractive is hard-coded $true on Unix, which is why this goes
+    # through the shared Test-HostInteractive.
+    if (-not $IsWindowsHost -and -not (Test-HostInteractive)) {
+        throw 'Setup-AppProxy needs an interactive terminal on Linux: the sign-in prints a device code you have to enter on your workstation. Run it from a terminal (ssh -t ...), not from a pipe, a script or a unit.'
+    }
     # Suppress the SDK's welcome / connection banner on EVERY stream it might use: -NoWelcome is honored
     # inconsistently across Graph SDK versions, and the banner has been observed on the Information stream
     # (6) AND the success stream. Redirect both (6>$null + Out-Null) and silence Information at the source
@@ -301,8 +594,23 @@ function Connect-Graph {
     # producing an "Invalid URL" 400 when the renewal built the token endpoint from it.
     # -ContextScope Process: the admin's token lives in this process only - never reused from (or left in)
     # the on-disk cache of an earlier session on the server, which is how a stale token gets a 403.
-    Connect-MgGraph -Scopes $RequiredGraphScopes -ContextScope Process `
-        -NoWelcome -ErrorAction Stop -InformationAction SilentlyContinue 6>$null | Out-Null
+    #
+    # D11: a Linux fleet server is administered over SSH and has no browser, so it signs in with the
+    # DEVICE CODE flow - the SDK prints a code and a URL for the admin to complete on their own
+    # workstation. That output must reach the operator, so the Information stream is NOT silenced on
+    # that branch; the banner it also carries is cosmetic, and Main reads the tenant id off Get-MgContext
+    # rather than off this function's return value precisely because the banner cannot be trusted.
+    # Written as two full calls rather than a splat on purpose: every Graph SDK call in this script has
+    # to carry a visible -ErrorAction (#117), and a splatted one hides it from the check that enforces it.
+    if ($IsWindowsHost) {
+        Connect-MgGraph -Scopes $RequiredGraphScopes -ContextScope Process `
+            -NoWelcome -ErrorAction Stop -InformationAction SilentlyContinue 6>$null | Out-Null
+    }
+    else {
+        Write-UiResult 'no browser on this host - signing in with a device code; the code and URL follow' -Kind Note
+        Connect-MgGraph -Scopes $RequiredGraphScopes -ContextScope Process -UseDeviceCode `
+            -NoWelcome -ErrorAction Stop | Out-Null
+    }
     $ctx = Get-MgContext -ErrorAction Stop
     if (-not $ctx) { throw 'Connect-MgGraph did not establish a context.' }
     # Guard: the tenant id is written into cert-config.json and used to build the AAD token URL, so it MUST
@@ -315,15 +623,128 @@ function Connect-Graph {
     # that reads like a role problem when it is a consent/token problem.
     $missing = Get-MissingGraphScopes -GrantedScopes $ctx.Scopes -RequiredScopes $RequiredGraphScopes
     if ($missing.Count -gt 0) {
-        throw "The Graph sign-in does not carry the scope(s) $($missing -join ', '). Consent was not granted for them - sign in again and accept the consent prompt (as an account that can consent on behalf of the organisation)."
+        throw "The Graph sign-in does not carry the scope(s) $($missing -join ', '). This tenant has not consented them to 'Microsoft Graph Command Line Tools' (the app Connect-MgGraph signs in as). A Global Administrator grants that once per tenant: Entra admin center > Enterprise applications > Microsoft Graph Command Line Tools > Permissions > 'Grant admin consent' - then run this setup again."
     }
     Write-UiResult "connected as $($ctx.Account) (tenant $tid)" -Kind Ok
+    # Guard (#128): the consent step assigns Microsoft Graph application roles, which only an ACTIVE Global
+    # Administrator / Privileged Role Administrator may do. Find out now, before anything has been created,
+    # instead of four writes later. The roles and scopes go to the log so a refusal report is conclusive.
+    $activeRoles = Get-ActiveDirectoryRoles
+    if ($null -ne $activeRoles) {
+        $names = if ($activeRoles.Count) { @($activeRoles | ForEach-Object { $_.DisplayName }) -join ', ' } else { '(none)' }
+        Write-Log "Signed in as $($ctx.Account). Active directory roles: $names. Token scopes: $($ctx.Scopes -join ' ')." -Level INFO
+        if (-not (Test-HasRequiredDirectoryRole -ActiveRoleTemplateIds @($activeRoles | ForEach-Object { $_.TemplateId }) -RequiredRoles $RequiredDirectoryRoles)) {
+            throw "The signed-in account ($($ctx.Account)) has no ACTIVE Global Administrator or Privileged Role Administrator role (active: $names). Those are the only roles that can grant the Microsoft Graph application roles this setup needs. Activate the role first (PIM), then run this setup again - nothing has been created."
+        }
+        Write-UiResult "active role allows granting Graph application roles ($names)" -Kind Ok
+    }
     return $tid
 }
 
+function Get-AuthCertPemPath {
+    # WHICH credential file this box is on (D12). keys/ is 0700 and is created and re-asserted by
+    # bootstrap's Initialize-InstallLayout - this tool does not create it, so a box that never ran
+    # bootstrap is told to run bootstrap rather than quietly getting a directory with the wrong mode.
+    #
+    # The CONFIG wins over the default name whenever it points at a file that is really there, because
+    # the renewal's zero-touch rotation (L3c/D13) mints appproxy-auth-<yyyyMMdd>.pem BESIDE the original
+    # and repoints AuthCertPath at it. Reading the default name after a rotation would mean a re-run of
+    # this tool inspected a SUPERSEDED credential, minted over the file the rotation kept as its
+    # rollback, uploaded a third public key, and pointed the config back at the old filename.
+    param([AllowEmptyString()][string] $ConfiguredPath = '')
+    $keyDir = (Get-PlatformPaths).KeyDir
+    if (-not (Test-Path -LiteralPath $keyDir)) {
+        throw "Key directory $keyDir does not exist - run bootstrap.ps1 (or sh install.sh) on this host first; it creates the 0700 keys/ directory this credential belongs in."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConfiguredPath) -and (Test-Path -LiteralPath $ConfiguredPath)) {
+        return $ConfiguredPath
+    }
+    return (Join-Path $keyDir 'appproxy-auth.pem')
+}
+
+function New-AuthCertificatePem {
+    # The portable half of D12: mint the auth credential with .NET CertificateRequest and write it as a
+    # PEM, because Linux has no machine certificate store to put it in. Same shape as the Windows mint -
+    # RSA 2048, SHA-256, clientAuth EKU (1.3.6.1.5.5.7.3.2), two years - so the two platforms age
+    # identically and one rotation threshold fits both.
+    #
+    # The CERTIFICATE goes FIRST in the file, then the PKCS#8 key: CreateFromPemFile takes the FIRST
+    # certificate it finds, and bootstrap already documents that trap for telemetry-sp.pem. Written
+    # temp-then-move inside the same directory (atomic, never briefly world-readable) and locked 0600
+    # root:root by the shared Set-RestrictedFileAccess - no new helper, and the same mode as every other
+    # credential on the box.
+    #
+    # Returns the RELOADED certificate, so the caller cannot tell the two platforms apart: everything
+    # downstream (thumbprint, GetCertHash, Export) works on an X509Certificate2 either way.
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Subject)
+    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+    try {
+        $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            $Subject, $rsa, [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $eku = New-Object System.Security.Cryptography.OidCollection
+        $null = $eku.Add((New-Object System.Security.Cryptography.Oid '1.3.6.1.5.5.7.3.2'))
+        $req.CertificateExtensions.Add(
+            (New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension $eku, $false))
+        # Backdated five minutes: a fresh certificate whose NotBefore is in the future is rejected by the
+        # token endpoint on a box whose clock runs slightly behind Entra's.
+        $now  = [DateTimeOffset]::UtcNow
+        $cert = $req.CreateSelfSigned($now.AddMinutes(-5), $now.AddYears(2))
+        $pem  = $cert.ExportCertificatePem() + "`n" + $rsa.ExportPkcs8PrivateKeyPem() + "`n"
+        $tmp  = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $pem)
+        Set-RestrictedFileAccess -Path $tmp
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        Set-RestrictedFileAccess -Path $Path
+        return [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($Path)
+    }
+    finally { $rsa.Dispose() }
+}
+
 function Get-OrCreateAuthCertificate {
-    # Mint (or reuse) the non-exportable self-signed auth cert in LocalMachine\My (CN=<AppName>-Auth).
-    # Reuses an existing cert with >30 days left. Lifted from the AdHoc manager. DryRun returns $null.
+    # Mint (or reuse) the auth credential in whatever form this platform keeps one (D12): a non-exportable
+    # cert in LocalMachine\My on Windows, a 0600 root:root PEM on Linux. Reuses an existing credential
+    # with more than 30 days left on either - the same threshold the renewal's zero-touch rotation uses,
+    # so a re-run right after a rotation does not mint a third credential. DryRun returns $null.
+    #
+    # -Config is read on Linux only, for AppProxyAuth.AuthCertPath: it is the one place that knows which
+    # file this box is on after a rotation renamed it. Windows needs no equivalent - its reuse search
+    # filters the whole store by subject and expiry, so a rotated certificate is found either way. The
+    # certificate comes back carrying a CredentialPath note property, so the caller records the file that
+    # was actually used instead of re-deriving a path a mint-beside has just invalidated.
+    param([object] $Config)
+    if (-not $IsWindowsHost) {
+        $configured = if ($Config -and $Config.AppProxyAuth) { [string]$Config.AppProxyAuth.AuthCertPath } else { '' }
+        $pemPath = Get-AuthCertPemPath -ConfiguredPath $configured
+        $subject = "CN=$AppName-Auth"
+        if ($DryRun) { Write-Log "[DryRun] WOULD mint/reuse the auth credential $subject at $pemPath (RSA 2048, clientAuth, 2y, 0600 root:root)." -Level INFO; return $null }
+        if (Test-Path -LiteralPath $pemPath) {
+            try {
+                $existing = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($pemPath)
+                if ($existing.NotAfter -gt (Get-Date).AddDays(30)) {
+                    Write-UiResult "reusing existing auth credential $($existing.Thumbprint) at $pemPath (expires $($existing.NotAfter.ToString('yyyy-MM-dd')))" -Kind Ok
+                    $existing | Add-Member -NotePropertyName 'CredentialPath' -NotePropertyValue $pemPath -Force
+                    return $existing
+                }
+                Write-UiResult "the auth credential at $pemPath expires $($existing.NotAfter.ToString('yyyy-MM-dd')) - minting a replacement" -Kind Note
+            }
+            catch {
+                # An unreadable or malformed PEM is not a reason to stop: it is a reason to replace it. The
+                # old public key stays on the Entra app either way, so nothing is lost by minting.
+                Write-Log "Could not read the existing auth credential at ${pemPath}: $($_.Exception.Message). Minting a new one." -Level WARNING
+            }
+            # Replacing something that is still on disk: mint BESIDE it, under the same dated name the
+            # rotation uses, and leave the old file alone. Overwriting would destroy the rollback and -
+            # because the filename would not change - leave nothing on disk saying anything happened.
+            $pemPath = Join-Path (Split-Path -Parent $pemPath) ('appproxy-auth-{0}.pem' -f (Get-Date -Format 'yyyyMMdd'))
+        }
+        Write-UiResult "minting a new auth credential ($subject, 2 years) at $pemPath..." -Kind Note
+        $cert = New-AuthCertificatePem -Path $pemPath -Subject $subject
+        Write-UiResult "minted auth credential $($cert.Thumbprint) (expires $($cert.NotAfter.ToString('yyyy-MM-dd')))" -Kind Ok
+        Write-EventLogEntry $EID.AuthCertMinted Information "App Proxy auth credential minted ($($cert.Thumbprint)) at $pemPath"
+        $cert | Add-Member -NotePropertyName 'CredentialPath' -NotePropertyValue $pemPath -Force
+        return $cert
+    }
     if ($DryRun) { Write-Log "[DryRun] WOULD mint/reuse the auth certificate CN=$AppName-Auth in LocalMachine\My (non-exportable, 2y)." -Level INFO; return $null }
     $subject = "CN=$AppName-Auth"
     $existing = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue | Where-Object {
@@ -423,8 +844,7 @@ function Get-OrCreateEntraApp {
             Write-UiResult "Graph app-role $roleId already granted" -Kind Note
             continue
         }
-        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $roleId -ErrorAction Stop | Out-Null }
-        catch { throw (ConvertTo-GraphFailureMessage -Step "Granting Graph app-role $roleId (admin consent)" -ErrorRecord $_) }
+        $null = Grant-GraphAppRole -ServicePrincipalId $sp.Id -GraphServicePrincipalId $graphSp.Id -RoleId $roleId
         Write-UiResult "granted Graph app-role $roleId" -Kind Ok
     }
 
@@ -432,14 +852,51 @@ function Get-OrCreateEntraApp {
     return @{ AppId = [string]$app.AppId; ObjectId = [string]$app.Id }
 }
 
+function Grant-GraphAppRole {
+    # Assign one Microsoft Graph app-role to the app's service principal, retrying a refusal. A grant posted
+    # seconds after New-MgServicePrincipal has been answered with 403 Authorization_RequestDenied for a
+    # permanent Global Administrator and then succeeded from the portal minutes later (#128): the new SP had
+    # not replicated to whatever answered. Retries 403 / 404 only, on the $GrantRetryDelaysSeconds schedule;
+    # anything else fails at once. The final failure carries the portal fallback. Returns the retry count.
+    param(
+        [Parameter(Mandatory)][string] $ServicePrincipalId,
+        [Parameter(Mandatory)][string] $GraphServicePrincipalId,
+        [Parameter(Mandatory)][string] $RoleId
+    )
+    $attempt = 0
+    while ($true) {
+        try {
+            New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ServicePrincipalId -PrincipalId $ServicePrincipalId -ResourceId $GraphServicePrincipalId -AppRoleId $RoleId -ErrorAction Stop | Out-Null
+            return $attempt
+        }
+        catch {
+            $retryable = (([string]$_.Exception.Message) + ' ' + ([string]$_.FullyQualifiedErrorId)) -match 'Authorization_RequestDenied|Request_ResourceNotFound'
+            if ($retryable -and $attempt -lt $GrantRetryDelaysSeconds.Count) {
+                $delay = [int]$GrantRetryDelaysSeconds[$attempt]
+                $attempt++
+                Write-UiResult "grant of $RoleId refused (attempt $attempt of $($GrantRetryDelaysSeconds.Count + 1)); the new service principal may not have replicated yet - retrying in ${delay}s" -Kind Warn
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw ((ConvertTo-GraphFailureMessage -Step "Granting Graph app-role $RoleId (admin consent)" -ErrorRecord $_) + ' ' + $PortalConsentFallback)
+        }
+    }
+}
+
 function Set-AppProxyAuthBlock {
-    # Write/refresh the shared AppProxyAuth block on the cert-config object (thumbprint is a public
-    # reference - no secret stored, golden rule). Idempotent.
+    # Write/refresh the shared AppProxyAuth block on the cert-config object (both credential references
+    # are public - no secret stored, golden rule). Idempotent.
+    #
+    # D12/D5: the block carries the field THIS platform reads - AuthCertThumbprint on Windows,
+    # AuthCertPath on Linux - and REMOVES the other if it is present, because Get-MachineCredential
+    # refuses a block carrying both rather than resolving by precedence. That matters on a re-run
+    # against a config copied from a Windows box, which is exactly how a fleet ends up with both.
     param(
         [Parameter(Mandatory)][object] $Config,
         [Parameter(Mandatory)][string] $TenantId,
         [Parameter(Mandatory)][string] $ClientId,
-        [Parameter(Mandatory)][string] $AuthCertThumbprint
+        [AllowEmptyString()][string] $AuthCertThumbprint = '',
+        [AllowEmptyString()][string] $AuthCertPath = ''
     )
     # Defence-in-depth: TenantId + ClientId are written here and used to build the AAD token URL at renewal
     # time. Refuse to persist anything that isn't a GUID (e.g. a Graph SDK welcome banner that leaked into
@@ -452,13 +909,18 @@ function Set-AppProxyAuthBlock {
             }
         }
     }
+    $refField = Get-CredentialRefName -ThumbprintField 'AuthCertThumbprint' -PathField 'AuthCertPath'
+    $refValue = if ($refField -eq 'AuthCertPath') { $AuthCertPath } else { $AuthCertThumbprint }
+    if (-not $DryRun -and [string]::IsNullOrWhiteSpace($refValue)) {
+        throw "Refusing to write AppProxyAuth: $refField is empty, and it is the credential reference this platform reads."
+    }
     $block = [pscustomobject][ordered]@{
         Enabled            = $true
         TenantId           = $TenantId
         ClientId           = $ClientId
-        AuthCertThumbprint = $AuthCertThumbprint
         ApplicationName    = $AppName
     }
+    $block | Add-Member -NotePropertyName $refField -NotePropertyValue $refValue
     $Config | Add-Member -NotePropertyName 'AppProxyAuth' -NotePropertyValue $block -Force
     return $Config
 }
@@ -515,6 +977,9 @@ $exitCode = 0
 # Console-UI glyphs: Unicode rules/marks on a UTF-8 console, ASCII elsewhere (mirrors the creator's Main).
 try { $script:UiUnicode = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { $script:UiUnicode = $false }
 try {
+    # -ConfigPath defaults to '' (see param) so the layout is resolved HERE, where Get-PlatformPaths
+    # exists: C:\Cert\Renewal on Windows, /etc/certrenewal on Linux. An explicit -ConfigPath still wins.
+    if (-not $ConfigPath) { $ConfigPath = (Get-PlatformPaths).Config }
     Write-EventLogEntry $EID.Start Information "Setup-AppProxy v$ScriptVersion starting (Migrate=$Migrate)"
     $dot     = Get-UiGlyph Dot
     $modeStr = if ($Migrate) { 'migrate an existing AdHoc install' } else { 'fresh setup' }
@@ -524,7 +989,14 @@ try {
     Write-UiField 'Dry run' $(if ($DryRun) { 'yes (no changes will be made)' } else { 'no' })
     Write-UiRule
 
-    if (-not (Test-IsElevated)) { throw 'Setup-AppProxy must run elevated (Administrator) - it writes LocalMachine certs and may unregister a scheduled task.' }
+    if (-not (Test-IsElevated)) { throw 'Setup-AppProxy must run elevated (Administrator on Windows, root on Linux) - it writes machine credentials and may unregister a scheduled task.' }
+
+    # D14: there is nothing to migrate FROM on Linux. The AdHoc tool this adopts was a Windows product -
+    # a C:\Cert\AppProxy folder and a Windows scheduled task - so refuse here, in one line that names the
+    # reason, rather than failing somewhere deep in the flow at Get-ScheduledTask.
+    if ($Migrate -and -not $IsWindowsHost) {
+        throw '-Migrate adopts an existing AdHoc App Proxy install, which only ever existed on Windows (C:\Cert\AppProxy plus a scheduled task). There is no Linux install to adopt - run without -Migrate for a fresh setup.'
+    }
 
     $config = Get-CertConfig
 
@@ -538,12 +1010,21 @@ try {
     $tenantId = if ($DryRun) { $null } else { [string](Get-MgContext -ErrorAction Stop).TenantId }
 
     Write-UiHeader 'Authentication certificate'
-    $authCert = Get-OrCreateAuthCertificate
+    $authCert = Get-OrCreateAuthCertificate -Config $config
 
     Write-UiHeader 'Entra application'
     $entraApp = Get-OrCreateEntraApp -AuthCertificate $authCert
 
+    # The two credential references, mutually exclusive by platform (D5/D12). Set-AppProxyAuthBlock
+    # persists the one Get-CredentialRefName names and drops the other; under -DryRun nothing is minted,
+    # so the thumbprint is a placeholder while the PATH is still real - it is where the credential WOULD
+    # have been written, and printing it is the only way a dry run can show the operator that.
     $authThumb = if ($authCert) { $authCert.Thumbprint } else { '(dry-run)' }
+    # The file the mint actually used, not a re-derived one - a mint-beside has just changed which file
+    # that is. Only -DryRun (no certificate) falls back to resolving it, and nothing is persisted then.
+    $authPath  = if ($IsWindowsHost) { '' }
+                 elseif ($authCert -and $authCert.CredentialPath) { [string]$authCert.CredentialPath }
+                 else { Get-AuthCertPemPath -ConfiguredPath ([string]$config.AppProxyAuth.AuthCertPath) }
     $clientId  = $entraApp.AppId
     $tenant    = if ($tenantId) { $tenantId } else { '(dry-run)' }
     $mapped = 0; $unmapped = @()
@@ -558,7 +1039,7 @@ try {
         if ($old.TenantId)                 { $tenant   = [string]$old.TenantId }
         if ($old.AuthCertificateThumbprint -and ($authThumb -eq '(dry-run)')) { $authThumb = [string]$old.AuthCertificateThumbprint }
 
-        $config = Set-AppProxyAuthBlock -Config $config -TenantId $tenant -ClientId $clientId -AuthCertThumbprint $authThumb
+        $config = Set-AppProxyAuthBlock -Config $config -TenantId $tenant -ClientId $clientId -AuthCertThumbprint $authThumb -AuthCertPath $authPath
 
         # Map each old AppProxies[] entry onto a Domains[] entry by certificate subject/SAN.
         $map = Add-MigratedAppProxyBindings -Config $config -OldConfig $old
@@ -572,12 +1053,17 @@ try {
         Save-Config -Config $config -Reason 'AppProxy migration'
 
         # Unregister the AdHoc scheduled task + archive its scripts/config (the renewal handles it inline now).
-        $task = Get-ScheduledTask -TaskName $OldAppProxyTaskName -ErrorAction SilentlyContinue
-        if ($task) {
-            if ($DryRun) { Write-Log "[DryRun] WOULD unregister the AdHoc scheduled task '$OldAppProxyTaskName'." -Level INFO }
-            else { Unregister-ScheduledTask -TaskName $OldAppProxyTaskName -Confirm:$false; Write-UiResult "unregistered the AdHoc scheduled task '$OldAppProxyTaskName'" -Kind Ok }
+        # Gated on the host rather than leaning on -Migrate being refused on Linux further up: these two
+        # cmdlets do not exist there at all, and a gate you can only reach by reasoning about an earlier
+        # refusal is not one a structural test can see - which made that test vacuous for all of Main.
+        if ($IsWindowsHost) {
+            $task = Get-ScheduledTask -TaskName $OldAppProxyTaskName -ErrorAction SilentlyContinue
+            if ($task) {
+                if ($DryRun) { Write-Log "[DryRun] WOULD unregister the AdHoc scheduled task '$OldAppProxyTaskName'." -Level INFO }
+                else { Unregister-ScheduledTask -TaskName $OldAppProxyTaskName -Confirm:$false; Write-UiResult "unregistered the AdHoc scheduled task '$OldAppProxyTaskName'" -Kind Ok }
+            }
+            else { Write-UiResult "no AdHoc scheduled task '$OldAppProxyTaskName' (already removed?)" -Kind Note }
         }
-        else { Write-UiResult "no AdHoc scheduled task '$OldAppProxyTaskName' (already removed?)" -Kind Note }
 
         $oldDir = Split-Path -Parent $OldAppProxyConfigPath
         if ($oldDir -and (Test-Path $oldDir)) {
@@ -593,7 +1079,7 @@ try {
     }
     else {
         # Fresh setup: just write the shared AppProxyAuth block. Per-domain wiring is done in the creator.
-        $config = Set-AppProxyAuthBlock -Config $config -TenantId $tenant -ClientId $clientId -AuthCertThumbprint $authThumb
+        $config = Set-AppProxyAuthBlock -Config $config -TenantId $tenant -ClientId $clientId -AuthCertThumbprint $authThumb -AuthCertPath $authPath
         Save-Config -Config $config -Reason 'AppProxy fresh setup'
     }
 
@@ -604,7 +1090,7 @@ try {
     Write-UiHeader 'Summary'
     Write-UiField 'Tenant'      $tenant
     Write-UiField 'Application' ("{0} ({1})" -f $AppName, $clientId)
-    Write-UiField 'Auth cert'   $authThumb
+    Write-UiField 'Auth cert'   $(if ($IsWindowsHost) { $authThumb } else { "$authThumb ($authPath)" })
     if ($Migrate) { Write-UiField 'Mapped' ("{0} App Proxy app(s){1}" -f $mapped, $(if ($unmapped.Count) { ", $($unmapped.Count) unmapped" } else { '' })) }
     Write-UiRule
     if ($Migrate) {
@@ -628,8 +1114,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDfE2+hees2sw/h
-# NN2cq2h1ccJEO4oDsP91WRFxCnuIRKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCfsolmVme51GGK
+# QD7iPiR+ndrgSdJA6V2F90JJB1AulqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -760,31 +1246,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBTc5tXlpPpjNArgf3HIku1NMF21VA2N7Fj4
-# ZfkucY0TMA0GCSqGSIb3DQEBAQUABIIBgIevTGwFvptqXlyT06FYePbOHeKpAers
-# 1u8A7XiE8a8RyfZa0pCyRdrcNXwShwrqG4nBh6tsXf9822UGpPj1pkGAfVoU+7JP
-# NUwLLAllIz67LmzkuoZiuTbBhimmjZBVFl6HMgL1Hjs54CkolGj7jr9Om6CXfir5
-# B6VasBO4Fdox8TpyrG5KQ6RjFB2bg7Z4Gi9DLZD1NeylG77RwbAMFx2hJZrDnk1e
-# Syig+wu+fzrkEvMeuMkAaDFtXB+zud9kKlM3J1fp0mDvNsmYt7AlNW8l4xvd9jjn
-# 53HmFOaske8SV0HopVpP+JAwig6nm0+gW101/eYeuYqVk/U/5et8/rpSaKNp7AJE
-# 9loBz17LAPOxw6EVZYkG9Pi5HS32KqBOXPvXnn4ld8hcBbUcYaDrj9r6HkPN/Djs
-# KmITy0k+wNjXh397uFcjKf+ys1K5FHl+vMDEAdC6qvkkwUiJGtPLC9u9oIWNNVhi
-# SB+YMrOzyOGClmhLYzmvMRFDOMeEFAR6s6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIPuVcmIxO/788D76c4JrbyIW9DR6QFi0E7Md
+# BHIHSeXGMA0GCSqGSIb3DQEBAQUABIIBgIQg4whcjXHmkocuRJ0yTyvNBV8jUcXe
+# rxB55XVDl/sAel6wlDiRIdf1HzBZDbftui6KQfCuBCW8DKV/HsoqSDKCwTp9fJ1K
+# ygaMk++fVdMOh3HFGMkoP92Aa8ApgBaQ3qz+SB9ubUmw7Ew6yMkq/Q/KV3+Lv5fs
+# RyjwT/EvYBjbd7KaD6UfmkGInxrW5flXu0dDlW/s/3mDnVSNNU+cfVwvui7M/zu3
+# na7CrVuhBfU1zscK1qpMoFL5Ww+5EsYc24MwImBIMDlPHk5Vbs//UQw1W8r5vMjc
+# APqhBHsrp6C3wYrHFzshWtT0xxCQTV089pZ/fYFXd9sTelxkw+b2MQyhliOtdN2O
+# ogN5SNHsZcfLivNdW1PPJjtBKtPkpOAJh8WqRd2cqjdv7glKz6wEGNUEl8HBnkf7
+# QL2WzBXMPM/1tAWBVYt2duG8benfbqQGC23x84FekikMTYKaz/fVOuZs23AdQFyI
+# q6o4Kbx9SfieQpnsnUcdx16crkaXWro/U6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjUwOTE5MjRaMC8GCSqGSIb3DQEJBDEiBCD+fetkbTBz+EvnrYVIeMl6
-# jYK1GOZxHMqhn3L4TjJ8wzANBgkqhkiG9w0BAQEFAASCAgAbhx8Q2YYqXHU5kZiM
-# pwfc4X9kWIQkI9sPDlfUgiHH9R2bvu7nQJ1SxWg+qUKLEzr9lgA5eDwnCeMzvmkl
-# 097fVhx75lyPxliIMRQUL193STGFsPEgFqTte5ntrChZx/4fElTI27D2Vhkg2Iei
-# tntAjKC8B6HWqXXvajpNA8WIYQKeq5KqhRVRgOPxApf8QTpjXq0xDkGfAOFiEK6o
-# irok8gJ600vDrRVyw8PJxTqcgPLNyORK53qh6eYSJM93/UFuiPcvvWuoZiS+hM8u
-# toT6tXzzU5cuYdVxbNuuIrlCxnbvxMw/gx1B73NDKevctckeLPLM5PopcF++XCNa
-# OrMaCtz9yBKlHwjbRPq7fI7WByZwYkvJF1+6g5rYdwhsGmwpZ6IQgFsgkOyjTX5Q
-# 16MNtVU0MV7krVibSlQEYCtfRh7vMvKDbyzoTar+Ce6EKoE+i+zmIOFAR0wjwEyj
-# 1/A7/9cTaDYzYGwV5oCXCxOAI6AIGSnqLWg8ew8+SDydL/ShjYChhxgCAijdQEHc
-# U8Pj4+9d7zxSZcfjyRGqTzFidWVvukdlpFncIdlld5SgAfX6gbKYjsLNDW4uLS6Y
-# QeHGSXXVmXxCxtw4P18fU5A1pMxy1L3TOuZF0geArUPXmY2lKwtnpl9pBffS/Qgo
-# njfHhgX7mPK8Q4ck1t/FbfWAvA==
+# Fw0yNjA5MjgwODAwNDlaMC8GCSqGSIb3DQEJBDEiBCCAlNqiwbOMqhiz8vlWZ01N
+# Y0Rvp1xNJnIoEklh7F8C1TANBgkqhkiG9w0BAQEFAASCAgBdNUgAt8He/WoaCV8N
+# kSNG3uIRhzUiqOZ8PlHLc2AoSEYSxgakoWOPmPhnhRQrC9pLlAq7x5RKWzY/ngNv
+# YWb732sV/EVv2YnVkICcCOsCrJB02GOh9vYE8vb8dFzwCfX6bfg6gejEJYYqFyam
+# b0w2OCbpMI9/a41kQ6J3aBaCLx9yYU3k9lAnRAHtr8uKGyH+IqFemrmVpwLbHGof
+# fmnvCP8O+QP7dRB9M9y7ySDPNNXu3o3grCpf8xanSYRPkETy8sm7t7S0Wd79OkcF
+# D1ClbAkm37Qv/PmfVGKIF7hp4LLXQ4Uqg5WUS08gxINpBNEvpncBxxEcF3s6egz2
+# awSZaXoi5V+zx/3+mOiG1V357E+HFv1yaztWv2o/dUkmroO/0jkigOaAR4sbDWEW
+# aaGrEUVcepP2Y8W89uOEntfEfPII4bGOm/cIjwYwId0sAUe+82jCq1hsDhgmNxiv
+# fvJDhaHmWwZ2C/TzQADeBvyumsQ36xKOsP43pD4WCMlyO+1VSBZytWoQ4c0wuhzx
+# dB+eCzHobSpRUlle/pIVdlVADMTZYJon1aLV3iPXTeNHCWBphPs4zXWkzI7IWumf
+# s5yK9fOpZJf/oMEnNNo9hRDWiOTBhq5rb0Ri0yUysElRMwDsGVWpJbCc6CfNCd3f
+# ctNkmwsMvNeSWfagjFVoXROrOA==
 # SIG # End signature block
