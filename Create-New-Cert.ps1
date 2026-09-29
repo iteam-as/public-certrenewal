@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.1'
+$ScriptVersion = '2.11.2'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1006,7 +1006,10 @@ function Send-Telemetry {
         elseif ($o.NextExpiry) { try { $days = [int]((([datetime]$o.NextExpiry) - (Get-Date)).TotalDays) } catch { } }
         [ordered]@{
             TimeGenerated        = $stamp
-            ServerName           = $env:COMPUTERNAME
+            # [Environment]::MachineName, not $env:COMPUTERNAME: that variable is set by Windows and by
+            # nothing else, so every Linux run reported an EMPTY ServerName - the column the fleet is
+            # counted by (`distinct ServerName`) and identified by downstream (#125). SHARED VERBATIM.
+            ServerName           = [Environment]::MachineName
             Abr                  = [string]$billing.Abr
             CustomerName         = [string]$billing.CustomerName
             CustomerNr           = [string]$billing.CustomerNr
@@ -1752,10 +1755,26 @@ function Sync-SecretsFromVault {
     # cert-secrets.json IFF the file is absent or a value rotated. Idempotent (no change -> no rewrite).
     # Logs changed FIELD NAMES only, never values. Returns $true if it rewrote the file. Throws if the
     # vault is unreachable - the caller aborts before issuance (must not issue with a stale token).
-    param([Parameter(Mandatory)][string] $VaultName)
+    #
+    # -Config supplies the Linux credential (#132). The vault SP is the telemetry SP, and on Linux its
+    # only form is the PEM that Telemetry.CertPath names - Connect-SecretsVault defaults a THUMBPRINT on
+    # Windows and nothing on Linux, where it expects the caller to pass the path. Until #132 no caller in
+    # the creator or bootstrap did, so the creator's [A]dd (whose sync is fatal by design) could never
+    # issue on Linux, and bootstrap's best-effort sync always warned. The renewal's own copy has always
+    # passed the path. With no Telemetry block yet, fall back to where bootstrap places the PEM.
+    # Windows passes no path, so its thumbprint default is exactly what it was.
+    param(
+        [Parameter(Mandatory)][string] $VaultName,
+        [object] $Config
+    )
 
     Write-Log "Syncing shared secrets from Key Vault '$VaultName'..." -Level INFO
-    $session = Connect-SecretsVault -VaultName $VaultName
+    $vaultCertPath = ''
+    if (-not $IsWindowsHost) {
+        $vaultCertPath = if ($Config -and $Config.Telemetry -and $Config.Telemetry.CertPath) { [string]$Config.Telemetry.CertPath }
+                         else { (Get-PlatformPaths).KeyDir + '/telemetry-sp.pem' }
+    }
+    $session = Connect-SecretsVault -VaultName $VaultName -CertPath $vaultCertPath
 
     $fetched = @{}
     foreach ($field in $SecretNameMap.Keys) {
@@ -1832,7 +1851,7 @@ function Initialize-VaultSecrets {
     if ($script:VaultSecretsSynced) { return }
     $vaultName = Get-ResolvedVaultName -Config $Config
     try {
-        $changed = Sync-SecretsFromVault -VaultName $vaultName
+        $changed = Sync-SecretsFromVault -VaultName $vaultName -Config $Config
         Send-Telemetry -Config $Config -Outcome ([pscustomobject]@{ Action = 'secrets-sync'; RunOutcome = $(if ($changed) { 'Refreshed' } else { 'NoChange' }) })
         $script:VaultSecretsSynced = $true
     }
@@ -3902,8 +3921,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBwq/fblG0mrxMI
-# vjSKjCP7MRQ4SKZr6XENsFLt2CPyFKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDExt3wRSSLjVnP
+# cOCm+wNOoEu1CMcelK2cER9DbME1r6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -4034,31 +4053,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIHzoLYenehcpT6ITe25Y+xt100Aq5vy9q4EU
-# wVyzne1aMA0GCSqGSIb3DQEBAQUABIIBgMWMS7iCqL5wPjNWdBV3iyw8uMFQHVjQ
-# F2nZPzB2tNtKX7jOdIDlJ6B6Axi/s2KDdaxsx4xOt6QwQ3xf8OKogkx6rkVVU9bZ
-# 4Gqnm5uzK8nWTf76QAkx8UvZ8PkYCm4y2L0zFkY1S7NGuUpw1QrHkGp9gIotD61f
-# 8Rhs+X1uGnBs8Wods2ImvaRUOy209eL26vuWo82KRRnNTQU8oCtt209GsybXS7bc
-# nZEa5eNsPoeQdVMR1Vc/TTWPJP2L84YAnduLXD4DQsZKFc5EDHyqz/mGCgtG7zMf
-# 7VExXQdG3072zNAD2EpXU3E5v1y1msjOWqoOSrL71fwl+lt4ek1jFGoKPCR11xWG
-# S1fG8TLbIxDcGgvVOxxv6m2Jav9ZVdVB90SPx8vnBP5b7W0/VcQNwz5qB8eXaIqu
-# Q13QH+ZTMaPMWMI+sRgVmtb5PX8E3K7kgA7iUBAi2q0PeVBOxTa9N3WlXqC2qpql
-# w2YnADSo7Hl6kqflXFToioeyf5dflY2vuaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFKhj4UftHl5ni/pXnNmycdLKk9kijangJS5
+# PB0dC0ZuMA0GCSqGSIb3DQEBAQUABIIBgLm/WZQQ0DUeHI9qBDV4H2h8e6ieQmia
+# P/CK5QtSiGRujXx25EM8DoEIduUX7FeupFZKuOW4wDKu7UOstNoZi+BiC1RxuFFy
+# BX9riidoKW64xye4xNEy9RGozMg747F8igElKVqiA5h991PGSVj4EqHv8LRhWmzx
+# HI/X1oXxAHG2OT1May50KXnq/NCMIWK3Jadqr/MlnN3lvUQCkCfIQhHwTtR9eU6O
+# rI4HDYhyjNmAdvumyhHYqXxMao3PC02EOifyOHdcee29iqApwg0CafXBRNbF+TIs
+# L9MuOaoUlfWQA+v1vomz7VGUJzgyBQaHO5vlFflPc7Ue+s6q5yrsN/ne3PbzEmDc
+# 8ZwJObkNgfafw7lW3qOlogg7K+0j/GUVyyhFSmaIr8bvcogzNoALrwEjpa1SmPnT
+# GdxcXAaRAZnTyGfpFBRgZMxtPJiXhdBUckvf1Mokd1uso/PODgqfjbMU4OGQMrH0
+# EFWYKTZIGbFPjotQE0RY4f6MycG7k4tzm6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjgwODAwNDdaMC8GCSqGSIb3DQEJBDEiBCDNs8QrFuHXhRN47tVyTMD+
-# lvfivzU/umgBWv0TQSeSpjANBgkqhkiG9w0BAQEFAASCAgAW5YvzvtsALJYZypJh
-# jEZNf4gMD5jQWK1pVN9lxKd9xFXl9OoExFppHjJAwLOvrJ6Hsg2AjJBsCzKTCq0P
-# qxqNXPoB3yG+pXJxjkwIV6Yi2jKcojMVQrIN18M+07ZZ/WnmQms7IoNFep1AcXu7
-# o/MAiLHqE1MFkVrGF2FV5rOnOaCkFzHgPxeAxYFyc0B+Smeoun5SKIvueu+OaMcx
-# AOeJKeNcFI+I8jvyF1hT7diBbHstFQGK1+Ce+8H+kWvDSp6CT2m4ZTnNRR06wruv
-# D91853Nc0oQOw4Q9ISIK7a8mTdM7TadxuDnr+WlLS3UFo2Q8x2Pljp+YW5Vk0dL5
-# lwPTphpNYcvSTKEyt83k8j0Mnvl2oxObgX4OdQngINbtZDBGcjvs2IFUqUgaY/VB
-# WwtPbcVyeTBfJkpE74DvqTJ85lzIUvElaUAhAjA9NHyggRY9UIWm5Bez0rTm12KA
-# NIHULKW3RV9d8TW/ebT29fgNU8oCmhOBfWr+bI9OcOHnP7VlsT3ggIEgQ1IKbQb8
-# a5e0SGTvzAOlJYVpHT7+zqZhw2OqMqtGy1O1t4UXfX2NaVFQI/9r163MdAgX2rq9
-# gza+bi9qZ/wKQqoI54L0DslkuwB8EFCygYtqCio149QJf3IKK7TKZLTO9H3XxOAi
-# /sDWucQ0WB0buFDBFXLwAArQbw==
+# Fw0yNjA5MjkwODQ3MTNaMC8GCSqGSIb3DQEJBDEiBCCDqhAp0A0VXpeNLy2gM2aa
+# h0FY1uy/TV86eMPhoqVQFTANBgkqhkiG9w0BAQEFAASCAgAq/+FCTAfnoV3AiM/v
+# Gr4h7I8kbgSeT0i4CqZkoz669wdAnVigL9myVcW8BF7/VxZjrrS0E3JaGsSMxRTi
+# aiAnCUflp0SMqvUMPiu+XbhJL0/TkaWZbnte7ijAvLwgH2PuN1Ox8kQV9Z/2da8M
+# zKnEu7zy7Wo/M/OYfJ5szoJOH/XbxiTr7CupPqYvn8ME3qbU6hRrVOQ9WV5Pccc1
+# 4w5zgm6OmaxI6NZj1hN63ESeVIp9A2mA5a4Lg7ZBTRLIRhJ4uSfrkrEpfB8G5qTB
+# Pe8R8l85TaBy/AD6odWqHgdxttRlUNwE+d3efKZxE+Fe6fdDdf5l3jKC0pu2PiK+
+# Pdn84J/mik+MDgc/hys+QWlwQr55G/wp2VFLNodbXyuYXZWmiofAD1fyyIWxWrXK
+# EdKNtw3Nq8XG15bt7ycm8QZJIVA2LuXmpDssq1HaFPk85UaS306G7fYzJKLSNjgE
+# 9w4hF/uGt+U6vwhS6qN3feghaHBMKpe+qN3YWDuyoFVQX4QuswZgDrQR7GwuQswr
+# tXFuJFGkW82FM0fB3ScFIn0lUqfxtZ89bmglnoWZ1k68KjjaoOXhaAd9Wbn7fbg1
+# JyhoUt0spSIvzbPdkMlnI4/4AfkfSVmW/KwOs5sy2BYW1jylk58yx6xZzM2cVpfK
+# 5tNNZd8ZITCPJRDa6FfUg7wi9g==
 # SIG # End signature block

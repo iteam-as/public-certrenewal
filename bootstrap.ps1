@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.1'
+$ScriptVersion = '2.11.2'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -967,7 +967,10 @@ function Send-Telemetry {
         elseif ($o.NextExpiry) { try { $days = [int]((([datetime]$o.NextExpiry) - (Get-Date)).TotalDays) } catch { } }
         [ordered]@{
             TimeGenerated        = $stamp
-            ServerName           = $env:COMPUTERNAME
+            # [Environment]::MachineName, not $env:COMPUTERNAME: that variable is set by Windows and by
+            # nothing else, so every Linux run reported an EMPTY ServerName - the column the fleet is
+            # counted by (`distinct ServerName`) and identified by downstream (#125). SHARED VERBATIM.
+            ServerName           = [Environment]::MachineName
             Abr                  = [string]$billing.Abr
             CustomerName         = [string]$billing.CustomerName
             CustomerNr           = [string]$billing.CustomerNr
@@ -1145,10 +1148,26 @@ function Sync-SecretsFromVault {
     # cert-secrets.json IFF the file is absent or a value rotated. Idempotent (no change -> no rewrite).
     # Logs changed FIELD NAMES only, never values. Returns $true if it rewrote the file. Throws if the
     # vault is unreachable - the caller aborts before issuance (must not issue with a stale token).
-    param([Parameter(Mandatory)][string] $VaultName)
+    #
+    # -Config supplies the Linux credential (#132). The vault SP is the telemetry SP, and on Linux its
+    # only form is the PEM that Telemetry.CertPath names - Connect-SecretsVault defaults a THUMBPRINT on
+    # Windows and nothing on Linux, where it expects the caller to pass the path. Until #132 no caller in
+    # the creator or bootstrap did, so the creator's [A]dd (whose sync is fatal by design) could never
+    # issue on Linux, and bootstrap's best-effort sync always warned. The renewal's own copy has always
+    # passed the path. With no Telemetry block yet, fall back to where bootstrap places the PEM.
+    # Windows passes no path, so its thumbprint default is exactly what it was.
+    param(
+        [Parameter(Mandatory)][string] $VaultName,
+        [object] $Config
+    )
 
     Write-Log "Syncing shared secrets from Key Vault '$VaultName'..." -Level INFO
-    $session = Connect-SecretsVault -VaultName $VaultName
+    $vaultCertPath = ''
+    if (-not $IsWindowsHost) {
+        $vaultCertPath = if ($Config -and $Config.Telemetry -and $Config.Telemetry.CertPath) { [string]$Config.Telemetry.CertPath }
+                         else { (Get-PlatformPaths).KeyDir + '/telemetry-sp.pem' }
+    }
+    $session = Connect-SecretsVault -VaultName $VaultName -CertPath $vaultCertPath
 
     $fetched = @{}
     foreach ($field in $SecretNameMap.Keys) {
@@ -1869,11 +1888,13 @@ function Install-FleetScripts {
     }
 
     $thumb = Save-VerifiedDownload -Url $manifest.renewal.url -ExpectedSha256 $manifest.renewal.sha256 -TargetPath $RenewalScript -Label 'Renew-Cert.ps1'
-    Write-Log "Placed Renew-Cert.ps1 $($manifest.renewal.version) (signer $thumb)." -Level SUCCESS
+    # Linux has no Authenticode, so there is no signer thumbprint to show; say what was verified instead.
+    $noSigner = 'sha256 verified against the signed manifest'
+    Write-Log "Placed Renew-Cert.ps1 $($manifest.renewal.version) ($(if ($thumb) { "signer $thumb" } else { $noSigner }))." -Level SUCCESS
 
     try {
         $cthumb = Save-VerifiedDownload -Url $manifest.creator.url -ExpectedSha256 $manifest.creator.sha256 -TargetPath $CreatorScript -Label 'Create-New-Cert.ps1'
-        Write-Log "Placed Create-New-Cert.ps1 $($manifest.creator.version) (signer $cthumb)." -Level SUCCESS
+        Write-Log "Placed Create-New-Cert.ps1 $($manifest.creator.version) ($(if ($cthumb) { "signer $cthumb" } else { $noSigner }))." -Level SUCCESS
     }
     catch { Write-Log "Create-New-Cert.ps1 download failed: $($_.Exception.Message). Renewal is in place; re-run bootstrap to retry the creator." -Level WARNING }
 
@@ -1883,7 +1904,7 @@ function Install-FleetScripts {
     if ($manifest.appProxySetup -and $manifest.appProxySetup.url -and $manifest.appProxySetup.sha256) {
         try {
             $athumb = Save-VerifiedDownload -Url $manifest.appProxySetup.url -ExpectedSha256 $manifest.appProxySetup.sha256 -TargetPath $AppProxyScript -Label 'Setup-AppProxy.ps1'
-            Write-Log "Placed Setup-AppProxy.ps1 $($manifest.appProxySetup.version) (signer $athumb)." -Level SUCCESS
+            Write-Log "Placed Setup-AppProxy.ps1 $($manifest.appProxySetup.version) ($(if ($athumb) { "signer $athumb" } else { $noSigner }))." -Level SUCCESS
         }
         catch { Write-Log "Setup-AppProxy.ps1 download failed: $($_.Exception.Message). It is optional; re-run bootstrap or fetch it later if App Proxy sync is needed." -Level WARNING }
     }
@@ -2041,7 +2062,7 @@ function Sync-BootstrapSecrets {
     param([object] $Config)
     $vaultName = Get-ResolvedVaultName -Config $Config
     try {
-        $null = Sync-SecretsFromVault -VaultName $vaultName
+        $null = Sync-SecretsFromVault -VaultName $vaultName -Config $Config
         Send-Telemetry -Config $Config -Outcome ([pscustomobject]@{ Action = 'bootstrap-secrets'; RunOutcome = 'Synced' })
     }
     catch {
@@ -2058,17 +2079,27 @@ function Write-BootstrapNextSteps {
     param([object] $Config)
     try {
         $domains = @(); if ($Config -and $Config.Domains) { $domains = @($Config.Domains) }
+        # Commands the operator can paste on THIS platform (#132): on Linux the operator is in a shell, not
+        # a PowerShell prompt, and there is no scheduled task - the run is certrenewal.timer.
+        if ($IsWindowsHost) {
+            $creatorCmd = "& '$CreatorScript'"; $renewalCmd = "& '$RenewalScript'"
+            $scheduleCmd = "Get-ScheduledTask -TaskName '$RenewalTaskName'"
+        }
+        else {
+            $creatorCmd = "sudo pwsh -NoProfile -File $CreatorScript"; $renewalCmd = "sudo pwsh -NoProfile -File $RenewalScript"
+            $scheduleCmd = 'systemctl list-timers certrenewal.timer'
+        }
         Write-Log '--- Next steps ---' -Level INFO
         if ($domains.Count -eq 0) {
-            Write-Log "1. Add your certificates (elevated):  & '$CreatorScript'" -Level INFO
+            Write-Log "1. Add your certificates (elevated):  $creatorCmd" -Level INFO
             Write-Log '   Have the _acme-challenge CNAME for each name in place first; the creator prints the exact record if it is missing.' -Level INFO
-            Write-Log "2. Verify:  & '$CreatorScript' -CheckOnly    and    & '$RenewalScript' -DryRun" -Level INFO
+            Write-Log "2. Verify:  $creatorCmd -CheckOnly    and    $renewalCmd -DryRun" -Level INFO
         }
         else {
             Write-Log "This server manages $($domains.Count) certificate(s). Verify they are all listed and the daily run is clean:" -Level INFO
-            Write-Log "   & '$CreatorScript' -CheckOnly" -Level INFO
-            Write-Log "   & '$RenewalScript' -DryRun" -Level INFO
-            Write-Log "   Get-ScheduledTask -TaskName '$RenewalTaskName'" -Level INFO
+            Write-Log "   $creatorCmd -CheckOnly" -Level INFO
+            Write-Log "   $renewalCmd -DryRun" -Level INFO
+            Write-Log "   $scheduleCmd" -Level INFO
         }
         Write-Log "Step-by-step guide (install, upgrade, day-2, troubleshooting): $($script:GuideUrl)" -Level INFO
         if ($DryRun -or -not (Test-HostInteractive)) { return }
@@ -2161,8 +2192,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD2fR0p3EeHUrou
-# Cae5rU0bgeX8kIT18u7mtVX//Lcq9KCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBAwtUkOZYTJGyt
+# miEzFteIqUtFnYZAyobwyYq1LBEJQqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2293,31 +2324,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBS7UjJb9B2k2qYF2P5JC8SWVQHpkJzNHdtm
-# v9LCFKm5MA0GCSqGSIb3DQEBAQUABIIBgA0/pxo4xukEQ494z9FZOrksMtblVn87
-# 7MjAPHqsQvbOXXEBFFYg+2GGvmpK0SC2RzLZ1/sNL54TcH6RsZSJga9w2hKy/FZs
-# nDJbJkgndqgp7FP/2T2zkmzh0ndN4SyN0pj2MRXTRXxUut+QCWrKdUqYJwJoKDpw
-# WNm9Dv+yqgd9WXHx+YLMqCApyc7/oWo2qJhxWcyk7l4Smu5JbsLQlde/LgrTRuBf
-# tzocO5TesOKLPGVw0N0OovQ7lZKCU3+Kp1T4uEJWyVNO1M8FHShX9LzJUOnFzLgF
-# 8mftKd3X0NsOEY5UafooTDUKKdbJSbcVnWHtOlYKlT0X7QeOK7F0O5yPmtORBAm+
-# xLbEAspaORoPjJN0eP8IVN6rZA+/xOEUoJTh8+47xB3bTYeCq/2NCQhfLYHAyi/l
-# 2W2QfiBk0DAMI0G6B2YHuGHfd5lBofCTgLfYGYKNhj8c+y3mQfgzQdDekzGQe6zX
-# GBn3o6USjyrryuXrI/WFNCfjpi+rE51in6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIJWWKPWZqBGME/me33VfcVGrnKV5Bye8XO5C
+# vloJl89IMA0GCSqGSIb3DQEBAQUABIIBgHLUTxAuZq8aGkU+v227di7V2D2OB8Cf
+# Cx0R0n3h/BrlGQFK7PvOnl2lcMz8HFOEAIrvyjT/pmVxuWkH02kNV8qJCCaFmFt+
+# Z1FU+wgmhJnWm9EelUAvCUU8NqIcNkWRNgvbqVQsZZ6KAraVLuldk/gF9zpI7TaI
+# GQpCe04WRbklkcvXvNzSFaqmwRDsdv/5+t0RFyyTmmBIlAvbV7zdnR82SutShiXV
+# GeAPPI01EVtdcLOO5DR9hCvVafWLB2moiSMmR314sEvk2TEDxLXhPH2MfB9mCA4F
+# 6uiJwgrpgff/RORHlXGsTZfrxONyBnac59ainVu33eQN4kKjSmK9c6z5ZFg5KlDy
+# VjNoAoxAqUPEV3zJy+hJ10HTJ4cb/WeWtZNkFDwOuiw5xICU6hm21LI8qbeIEFOL
+# bzhWfxwOcmQcOPH7ViMCESz6MJYbidZdwpiuSd3cJeemlP2sLJ3RZQFrsLtom6dN
+# 68ta+eqcwyLArRq7NLLBNnkmlBjJLi1ku6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjgwODAwNDZaMC8GCSqGSIb3DQEJBDEiBCAHJO5WxeNdtIRPSBLxOgJr
-# 06vu+Z3og51iVJwA53YscjANBgkqhkiG9w0BAQEFAASCAgAiFu9pzY+h3HQpx3Y7
-# iNlkaBExOy5+MhhofjbBqvVfDheuiYPaa3L5R/vs1KPX3kZkxxub4IN/9O4exTdQ
-# OzZ0fiip/LcVUWa4LF7uL3feIxPqmznCa4xzGnTSd4KO+x8GatiE0Fuol5LWUoBn
-# Ia1MJPxAOOP/fhxwYwS0AvZEF7VX79cvsL8f2qPDFtWCxjkQdSnPzjOYxVfkBUl2
-# GL7Mq9kFdfcjIvi7G7d9qc/5RiPLOCdYCZ1RdEx5IJtaGIc8s1Tq1bNU/ovqZdfn
-# SaRQZBycO6qFrinzYXy48FnD5JXpOkygFeO9Sanqx38pfmC9oRzEgD+m+G3OqOY3
-# zdB/SX+HXmU4z12tLXdHnDwsvJI3JPrMjfokfQxE/YLe28fwjWwUJsCs4H+pJjhm
-# TjGZhGUOG1FsR64avDvvYiBoS3b7aj1OhPsv0WxrhaVS0rwHicjtTWslJfc3ov19
-# BN3qWYsWqC4lej00eyBVs3pg4Uw93YRzuu7bDBrtyQ7M5Rxw6uSfyaGsIDMHPodG
-# k8VC7Fwj9CuRvgFvCDtuY4M2lVFs0miLO/QrJ+i7CSICsCMMOjQLijQV7/kWD7kX
-# ObMj25PYXVBzrFv/DNyYbwG8MZrz2jeJIc54T5SdHNyP3s60zjjR/ieQCyLTC8Zf
-# bHf2adzRk/RsqeNwU4FB8wFAbA==
+# Fw0yNjA5MjkwODQ3MTJaMC8GCSqGSIb3DQEJBDEiBCBql9bqaF5QgVlH7bAaUDdM
+# OEhmYCZuCUQ0J03ITZMdHzANBgkqhkiG9w0BAQEFAASCAgAc7YaQi4N4nMlKhFkh
+# XNlbtfThcWboTRRQK9lBNv/W5QtDacMv2c+Q519VcFIjSAh/tTQDwu2YxV3lqTmO
+# 43YqXJVKM9X96b8oVTItZSCMMvyQ68MVst9M2mzyVUUKivgH4jP/+gu4X7qsqm35
+# LjZ0SAhjPMWcTtDNIUFJbdZjefVOgHentm0v2bLzZUK3k26W4MuGjcKPcjM19xd8
+# /vRv6KJvhjE5xuoLCzecZkkKd/hF/krA3+FdZvaw6frzNzkxReCwUCw8Yo/u+NOW
+# FrMnsB7nS9Ro8PcPQ/6nYubeCKPXOD0fi3q2Yu6SLKnVOyYDRpgsq6yCrl7sM3Pp
+# pcoY2ZLAIm9FGMs2PWxxfijczzu2Ei/IjHUtTIfm75sRXB03bNEI3YLH6PrzMCWL
+# +BrdeOpF37DpvfhshHwEaeAE1siHS+C9KtkZJKWWaQ1RnkKy7yrOrXeOsl1OR8zM
+# cDu/PvAgZwDDHONSb9eSkLFMnZtqwGZVcd3S9UzJeGiGnQTZb85TTYLwTuh2JkJa
+# SzcthbN+JGNVFY0mbMurpDzG0NYCqG5n+FdkPXdA383rBZRWHT0Zrn6cNzcCd1xc
+# X7FwxlMCnZi1Qj0tztN2LWFcoM8Z34xFBzzspk7JLAA8iZo37xkIMNhwDw9fkxP6
+# JjOHL+oPbwa4ZIBdMEl5xheiiQ==
 # SIG # End signature block

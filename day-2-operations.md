@@ -136,8 +136,10 @@ sudo pwsh /opt/certrenewal/Setup-AppProxy.ps1        # add -DryRun first to see 
 ```
 
 - **Sign-in uses a device code.** A server has no browser, so the tool prints a code and a URL to
-  complete on your own workstation. Run it from a real terminal — over SSH use `ssh -t` — because a
-  piped or scripted session cannot show you the code, and the tool refuses rather than hanging.
+  complete on your own workstation. **Have the browser ready: the code is valid for two minutes**, and
+  the sign-in gives up after that (run the tool again for a fresh code). Run it from a real terminal —
+  over SSH use `ssh -t` — because a piped or scripted session cannot show you the code, and the tool
+  refuses rather than hanging.
 - **The auth credential is a file, not a certificate store entry**:
   `/etc/certrenewal/keys/appproxy-auth.pem`, `0600 root:root`, holding the certificate and its private
   key. The config then carries `AppProxyAuth.AuthCertPath` instead of `AuthCertThumbprint` — the two are

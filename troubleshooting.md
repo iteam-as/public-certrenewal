@@ -117,6 +117,11 @@ sandbox. Declare its directory in the drop-in above; do not turn the sandbox off
 place. The box still renews certificates; only telemetry and the vault sync are skipped. See
 [linux.md](linux.md).
 
+> **Up to version 2.11.1 this message also appeared from bootstrap, and stopped the creator's `[A]dd`,
+> even with the PEM in place and telemetry working.** That was a bug, not your setup: the creator and
+> bootstrap never told the vault where the PEM is (the daily renewal always did). Update and it goes
+> away — `sudo sh install.sh`, or wait for the nightly self-update.
+
 **The renewal stopped self-updating.** Check the circuit breaker in
 `/var/lib/certrenewal/selfupdate-state.json` and the last few runs in the journal. A refused update is
 fail-closed and deliberate — report it rather than working around it.

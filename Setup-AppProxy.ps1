@@ -56,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # CI replaces 'DEV' with the release tag (e.g. 2.7.0) at publish time.
-$ScriptVersion = '2.11.1'
+$ScriptVersion = '2.11.2'
 
 # The shared Entra app (one per tenant) the fleet authenticates as to update App Proxy certs.
 $AppName = 'AppProxy-Certificate-Updater'
@@ -575,9 +575,19 @@ function ConvertTo-GraphFailureMessage {
     return $msg
 }
 
-function Connect-Graph {
+function Connect-SetupGraph {
     # Interactive Graph sign-in for the admin running setup. Returns the tenant id. The scopes are the ones
     # needed to register the app, upload the cert, and grant the app-role assignments.
+    #
+    # NOT named Connect-Graph (#131): Microsoft.Graph.Authentication exports Connect-Graph as an ALIAS of
+    # Connect-MgGraph, and PowerShell resolves an alias before a function. From the moment
+    # Install-GraphModules imported the SDK, Main's call ran a bare Connect-MgGraph - no scopes, no
+    # device code, the on-disk token cache instead of -ContextScope Process - and not one line of this
+    # function: the tenant-id guard, the scope guard (#117) and the active-role pre-flight (#128) had
+    # never executed in production since v2.7.0. On Linux it waited 120 s for a browser that does not
+    # exist. The Pester harness dot-sources functions without importing the SDK, so every test called
+    # the real function; tests/Setup-AppProxy.Tests.ps1 now checks every name here against the SDK's
+    # exports.
     if ($DryRun) { Write-Log "[DryRun] WOULD Connect-MgGraph ($($RequiredGraphScopes -join ', '))." -Level INFO; return $null }
     # The device-code flow prints a code the operator has to type somewhere else, so a non-interactive
     # Linux session (a pipe, a unit, a CI step) would hang on a prompt nobody can see. Refuse clearly
@@ -597,9 +607,14 @@ function Connect-Graph {
     #
     # D11: a Linux fleet server is administered over SSH and has no browser, so it signs in with the
     # DEVICE CODE flow - the SDK prints a code and a URL for the admin to complete on their own
-    # workstation. That output must reach the operator, so the Information stream is NOT silenced on
-    # that branch; the banner it also carries is cosmetic, and Main reads the tenant id off Get-MgContext
-    # rather than off this function's return value precisely because the banner cannot be trusted.
+    # workstation. That line must reach the operator, and the SDK (2.40, measured) writes it to the
+    # SUCCESS stream - the same stream the Windows branch discards with `| Out-Null`. Doing that here
+    # too is #131: the code went nowhere and the sign-in timed out after the SDK's fixed 120 seconds with
+    # nothing on screen. So on that branch the stream is forwarded to the HOST: the code appears the
+    # moment it is issued (the pipeline streams while Connect-MgGraph is still waiting), and nothing
+    # reaches this function's return value. Any banner is shown too, which is cosmetic; Main reads the
+    # tenant id off Get-MgContext rather than off the return value precisely because it cannot be trusted.
+    # -ClientTimeout does NOT extend the 120 seconds (measured), hence the note saying how long there is.
     # Written as two full calls rather than a splat on purpose: every Graph SDK call in this script has
     # to carry a visible -ErrorAction (#117), and a splatted one hides it from the check that enforces it.
     if ($IsWindowsHost) {
@@ -607,9 +622,9 @@ function Connect-Graph {
             -NoWelcome -ErrorAction Stop -InformationAction SilentlyContinue 6>$null | Out-Null
     }
     else {
-        Write-UiResult 'no browser on this host - signing in with a device code; the code and URL follow' -Kind Note
+        Write-UiResult 'no browser on this host - signing in with a device code. Open the URL below on your workstation and enter the code within 2 minutes.' -Kind Note
         Connect-MgGraph -Scopes $RequiredGraphScopes -ContextScope Process -UseDeviceCode `
-            -NoWelcome -ErrorAction Stop | Out-Null
+            -NoWelcome -ErrorAction Stop | ForEach-Object { Write-Host ('   {0}' -f $_) -ForegroundColor Yellow }
     }
     $ctx = Get-MgContext -ErrorAction Stop
     if (-not $ctx) { throw 'Connect-MgGraph did not establish a context.' }
@@ -1002,11 +1017,11 @@ try {
 
     Write-UiHeader 'Microsoft Graph'
     Install-GraphModules
-    # Connect-Graph does the sign-in + a GUID sanity check, but we deliberately DON'T trust its return
+    # Connect-SetupGraph does the sign-in + a GUID sanity check, but we deliberately DON'T trust its return
     # value: some Graph SDK versions emit the welcome/connection banner to the success stream even with
     # -NoWelcome + redirection, which contaminates any function return. Discard the return and read the
     # tenant id straight off the SDK context object (always a clean GUID) instead.
-    $null = Connect-Graph
+    $null = Connect-SetupGraph
     $tenantId = if ($DryRun) { $null } else { [string](Get-MgContext -ErrorAction Stop).TenantId }
 
     Write-UiHeader 'Authentication certificate'
@@ -1114,8 +1129,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCfsolmVme51GGK
-# QD7iPiR+ndrgSdJA6V2F90JJB1AulqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCCG5Psy2bmijQq
+# sWz768nDCpYhHKEpjU3S6TwbfnxFk6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1246,31 +1261,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIPuVcmIxO/788D76c4JrbyIW9DR6QFi0E7Md
-# BHIHSeXGMA0GCSqGSIb3DQEBAQUABIIBgIQg4whcjXHmkocuRJ0yTyvNBV8jUcXe
-# rxB55XVDl/sAel6wlDiRIdf1HzBZDbftui6KQfCuBCW8DKV/HsoqSDKCwTp9fJ1K
-# ygaMk++fVdMOh3HFGMkoP92Aa8ApgBaQ3qz+SB9ubUmw7Ew6yMkq/Q/KV3+Lv5fs
-# RyjwT/EvYBjbd7KaD6UfmkGInxrW5flXu0dDlW/s/3mDnVSNNU+cfVwvui7M/zu3
-# na7CrVuhBfU1zscK1qpMoFL5Ww+5EsYc24MwImBIMDlPHk5Vbs//UQw1W8r5vMjc
-# APqhBHsrp6C3wYrHFzshWtT0xxCQTV089pZ/fYFXd9sTelxkw+b2MQyhliOtdN2O
-# ogN5SNHsZcfLivNdW1PPJjtBKtPkpOAJh8WqRd2cqjdv7glKz6wEGNUEl8HBnkf7
-# QL2WzBXMPM/1tAWBVYt2duG8benfbqQGC23x84FekikMTYKaz/fVOuZs23AdQFyI
-# q6o4Kbx9SfieQpnsnUcdx16crkaXWro/U6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIMZMwCq3WfTtonNn81UC5wzWEbwkzSsCDgkY
+# UDq9S2UCMA0GCSqGSIb3DQEBAQUABIIBgHUEISSRWARkuGFp5BR+hJF/QnFPV9jR
+# OOLqaXHlr5CHzEMxSLSyG2WOAbVNgiFfBw9aDM903z3trH1Fjqy3nE2dixKK+nmC
+# YGS+9E5eNr3FSllLD5+9eq/K0m1Xr0lzbe85pi0ILMSXlE5r0PsML6Vv9B17mt+x
+# fuVFPNQMJ+Hw6HOVkXQM2yhRH5epCsQU42z+SvjM+VlW3JzvG4W27ZdPwm1gR9Zu
+# s189L41mCh94vIW1RszrC22ky1jN5HrbLQR9ee1LPI04COLCrcJN4rEo8W37kz1m
+# vKhacb7mMJonXhn1fPHJVSXxUnFmbhC4PR/NHt32DEmvcJaSqQ5FC23PWzMkJjAD
+# 0U+o3zdfI4qgqz97YgarvZiiB9cpQAUrNpmnwzv4mKSefLzt/jJlzkzEbU+cd0gS
+# 1vevxV2xsDzkCTQ9gSrAreeaM5/JD64zxJja6gpq+QHgJGOartFgNe+4iRimY3iG
+# aN/ENVHwXCXhfDMF4ufrbdlCDYVcIBs666GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjgwODAwNDlaMC8GCSqGSIb3DQEJBDEiBCCAlNqiwbOMqhiz8vlWZ01N
-# Y0Rvp1xNJnIoEklh7F8C1TANBgkqhkiG9w0BAQEFAASCAgBdNUgAt8He/WoaCV8N
-# kSNG3uIRhzUiqOZ8PlHLc2AoSEYSxgakoWOPmPhnhRQrC9pLlAq7x5RKWzY/ngNv
-# YWb732sV/EVv2YnVkICcCOsCrJB02GOh9vYE8vb8dFzwCfX6bfg6gejEJYYqFyam
-# b0w2OCbpMI9/a41kQ6J3aBaCLx9yYU3k9lAnRAHtr8uKGyH+IqFemrmVpwLbHGof
-# fmnvCP8O+QP7dRB9M9y7ySDPNNXu3o3grCpf8xanSYRPkETy8sm7t7S0Wd79OkcF
-# D1ClbAkm37Qv/PmfVGKIF7hp4LLXQ4Uqg5WUS08gxINpBNEvpncBxxEcF3s6egz2
-# awSZaXoi5V+zx/3+mOiG1V357E+HFv1yaztWv2o/dUkmroO/0jkigOaAR4sbDWEW
-# aaGrEUVcepP2Y8W89uOEntfEfPII4bGOm/cIjwYwId0sAUe+82jCq1hsDhgmNxiv
-# fvJDhaHmWwZ2C/TzQADeBvyumsQ36xKOsP43pD4WCMlyO+1VSBZytWoQ4c0wuhzx
-# dB+eCzHobSpRUlle/pIVdlVADMTZYJon1aLV3iPXTeNHCWBphPs4zXWkzI7IWumf
-# s5yK9fOpZJf/oMEnNNo9hRDWiOTBhq5rb0Ri0yUysElRMwDsGVWpJbCc6CfNCd3f
-# ctNkmwsMvNeSWfagjFVoXROrOA==
+# Fw0yNjA5MjkwODQ3MTVaMC8GCSqGSIb3DQEJBDEiBCC7WWK+wRGijtNEvPKz/yCT
+# oZxkyZP/gvaTQpN8krhBxzANBgkqhkiG9w0BAQEFAASCAgB08rC7lIWASRMXXl+c
+# BDr/BFk+JtIMbZ+uN9dO05aCVlZYRTLlsjU7NTD++FCLug12VvtKtOpDRmfWWvyM
+# xacu+eZXknnPCO16je2sqXAhxTqQiSejRr7JDQbjKIpjPYqARNFl/g3qbWpqeIGG
+# Wma3g1T5sliKPaHTiVS/U8PRBL8u4WMRY74JWUg+JajnETTNw8DDQNu3xqEv5jSf
+# OB6iw0cTgkD7EqZO7ZIlvB2JxTt/+UyfeVHzhr0zd9XvRglpf2CMhWvlEgwgtFVM
+# +88qcvGd+lrCLGJegNt9zWvcNqk2c9gJD1py66wBRYNnxwLkqWgqsUhAdFjU2puS
+# BnuWhvGDSeOwaufIjH03mF4YkPkL1pMaL0HfFB4lH6Z1tso1yfnJ0nCIyWYg5L9t
+# 9I/YlHI+vX1BwVVzcOKba86BYAk9YYJcW2s60POuEReWEeBygmOFy99x2sokG6Yz
+# A2UsQkcMjCKpeaU75n0T6y3TgfJcg+ZVUl34fvkkVKCIm8MlR/rCzExyBtfsE6vw
+# q28reXdEvf0M/2NNcmVPP1tAmNCpAZmZEYCzz2OfmDcIBmlMrc2kT4ZjvBXBJwMo
+# sL+uRbwvMWiOHX1CUwwPVgekYLVYpYCDUzqv3P2dTwboLuc/ibB9kLg7+s/AxGrw
+# h0gCvI5P+eKv2r0eIIBYoyw7yg==
 # SIG # End signature block

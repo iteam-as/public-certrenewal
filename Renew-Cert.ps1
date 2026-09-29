@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.1'
+$ScriptVersion = '2.11.2'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -913,7 +913,10 @@ function Send-Telemetry {
         elseif ($o.NextExpiry) { try { $days = [int]((([datetime]$o.NextExpiry) - (Get-Date)).TotalDays) } catch { } }
         [ordered]@{
             TimeGenerated        = $stamp
-            ServerName           = $env:COMPUTERNAME
+            # [Environment]::MachineName, not $env:COMPUTERNAME: that variable is set by Windows and by
+            # nothing else, so every Linux run reported an EMPTY ServerName - the column the fleet is
+            # counted by (`distinct ServerName`) and identified by downstream (#125). SHARED VERBATIM.
+            ServerName           = [Environment]::MachineName
             Abr                  = [string]$billing.Abr
             CustomerName         = [string]$billing.CustomerName
             CustomerNr           = [string]$billing.CustomerNr
@@ -2139,7 +2142,7 @@ function Get-TeamsFacts {
     # Standard fact set for Teams cards, incl. Billing identifiers (spec section9).
     param([object] $Config)
     $facts = @{
-        'Server'    = $env:COMPUTERNAME
+        'Server'    = [Environment]::MachineName
         'Version'   = $ScriptVersion
         'Timestamp' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
@@ -2477,7 +2480,7 @@ function Update-AppProxyAuthCertificate {
     $facts['New Thumbprint'] = $newCert.Thumbprint
     if (-not $IsWindowsHost) { $facts['New Credential'] = $newRef }
     Send-TeamsNotification -WebhookUrl $Webhook -Title 'App Proxy Auth Certificate Renewed' `
-        -Message "The App Proxy auth credential on $env:COMPUTERNAME was automatically renewed (zero-touch). Future runs use the new one; the previous credential stays valid for another $days days." `
+        -Message "The App Proxy auth credential on $([Environment]::MachineName) was automatically renewed (zero-touch). Future runs use the new one; the previous credential stays valid for another $days days." `
         -Severity good -Facts $facts
 }
 
@@ -3286,8 +3289,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCNC4byrPiYxQOv
-# clw6j/dU+68V6FnNuXQdgUHhxKY9EqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB5s1don93qQwV5
+# w5PH50EUElrT2Vy7E8m09xpqZByBnKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3418,31 +3421,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIEiIkkJ8nDV+5aScVelmkFFglSrYVpXTSUC0
-# 3Rdcnc33MA0GCSqGSIb3DQEBAQUABIIBgA1Ux3JHZFmEx6rhkSxAe4n49POx/aho
-# 51lfZbezxSPlYBTxTSvhieCx7v/CMLb4Y6wOar0DzM2eQug4570R1nHzG4MDFoe7
-# LuLZm2CcuwD3q4rNDJSGrekBvNznr4TubxH1d0cVqr6xUHuXz53PUa/1wjV5pH5i
-# 2BNABy+sXIeDmaxPPMz4ygZllNOmY4IDbQ+05n25MXz/AkR+6KTULWTPcmMpeRIP
-# 8jaU1wB8BKLVyfNgLLLn/qW+gVnndLZ7E2OOFe1SGz6wHqcjJKqNbyJh7ijT+W0z
-# p3JP183T+rJmnh9m2JClK/OJpCdOWPQ1gMyLrz42VLu3Swg/CoJ7TIJ657r+VpQC
-# eMwX98uk+rzOaKViUcHpvryrLMQbp2MejqkUcVrNmHAqfmuNQX9DB1yORAUC5Oez
-# rKzvWWzfncXYAkE60K6hiJIg1LKUwssP7yV0V4/0EXHcWSrKYVefn0tytCoOy/dO
-# YCGuC6oZWy96ntb4CpDq08NdlLF73cBHmKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIJ7M3HwzkhvQUwm6EO8t29fZnzWFuD8HBlbR
+# hsy35HtJMA0GCSqGSIb3DQEBAQUABIIBgEnC+KL0D0vkSTkf0SudzalG5pW+r3nC
+# 09hkyWGem96CAmpEhNuiIWtmLQJ5JU+9hatguq9dlYuIGh3SBJsASzX27lTpof2U
+# KxrkgshYj2rKcmEsaRZ3lGIb0c65CLVLI0mxxCUH6h5v20FsupBwM90tiq1f4/nx
+# 0pf3qkQXWmW3DrvMg/j7H2ceS4iK+KCVsiXzE4k8qu5GPSFv65SHP1OwR4/g6efB
+# g/PHvIsRXvcDDEcMkLhtOFlwqQ/iSb+9X/AgkUhvb9PhNbkiVYN6ckJKcd4hSWX7
+# wpMsNDt/R1JoeD7dfjf6jlEjktSoDTkU0DK1O54MMKMkVmLwLHrBkmvqMo6Ck5De
+# Yd1J6Sjd5bk6LisOMdCDOpPy8fFNx2jJirEJppAp6mITBhe3NMjId67637W6O6Sr
+# 8zAgkaN6wmrAjMNnuMayvyD9FiBQ8Lr13FQ4NHnQ4cDq6iSxsSWK8NJHVHAorUfM
+# 5k4URdcluI9zjjRSJIdazpDMRLI1lFhLq6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjgwODAwNDhaMC8GCSqGSIb3DQEJBDEiBCCXIybXvhyBmvEReTY5f7Ux
-# 7134RWDZky40vxbJjOV9/DANBgkqhkiG9w0BAQEFAASCAgCtMR4ESjG6+fucePSC
-# OyDQgyFepNW7CyQPPnlVCngl48hhIYQ/HmVBA2TdkvxV2dFnv0dvZav/zdoRNst7
-# sqHaxCj9iJSb/fc7/rZQ3sY3V1/O8ebaZMFBnNNt+hW5mEWXRpi1iPxzfwjmZWPr
-# BgR69iqfC+BOoQzYiq0aVhehCjRp5VvsXwGwdlVNmZGuHvO1yS3o4Vr57ox8ZqaX
-# VflHsU3aNMc284M0V+LhoClnAdchaolynFUCo0HGnIGyjPuUSg/4uDzGEXN1ooit
-# /r/Z04Hr0CBG/gKRKX+EFO/JHwl7Xei8jnuI/GMGlwY7bINa6NFNFBPH5I8BCmxJ
-# Jk/yMzuI4TbMxkjqFU+Bp4mpcEeOHSzRH4T6n3hvFs1WqEM22DI1jTbc/s5W0p06
-# 6XYg7CzupcCZ3H2rojD6/3oAvJoOf0gfClY5ckakqy7TbQLusbcRrHD8aTkjDwdF
-# niU5haCpaSXJV/uUVb9UoM/+Yfo+9DbLAcg6hmqsuqMFFSNiTg/xu0eVcfbwTCRO
-# h1GH18kzC/dZ2z27727K2zQD6zIq6wYEBQRn0xu9jGivpk48yjgjfA3GZ5tsw68R
-# VWM3Knk2ZHV1FbKlS86LQbc2QUbVsM8bGGCmqpK+k1YywC3m3PbG5xjYkIhA8Odz
-# NbQaCSMFYtiT1SK4Xv+oPr1TrQ==
+# Fw0yNjA5MjkwODQ3MTRaMC8GCSqGSIb3DQEJBDEiBCCQV6l1jxz+Nu2NE3dNX3Ep
+# kDaWC/eOHeCkTUxFRnO1fDANBgkqhkiG9w0BAQEFAASCAgCN3NrUTB5tA9pWk1Aw
+# LDvywsvguf2tDUxccyYw3YPRVICj1Vfc+n1PzbkKIuNwDQSTahtCdB8Zz0XC9gxE
+# gCVum/HXv7zf5mhh6y4hZmWBqAFeET0zMOUZWkOmLWm6Lz2I/y6XGPKUDMBN35B4
+# Fyxh80FHDIuK658qbvNRWNx53fUHgPNbt/iUHFmepPuXUEDmbb0mQKV/BhKgxPV8
+# 4LYCSjItEbr61HiUkgscV+u8s9blml5eunQe6tZgv3zhzkpYaAy5o4Ov4YdiTgUS
+# cKWMMN93W3UjWMod9IZ8FtGdg1+ZzSols3oLSv+4kBfTA2Rs/+ljEuTRhYwSgqJc
+# 8J5z/gs3MRVv5UQRWuIylFCE7hEXDmbPce+JbQelxIDvvxI8WMQNweupgsy7ryiv
+# KWqzPFdD4fPjJldKNqjdIHDki1aT1ukbU9m1CO2HqfSnL3lODIpqLd5HTg6xaqIp
+# myfoq4Pptc/2XKrM1IBiMnVhX8l0OLEXn+EiLcUTXUDgFTOZqIXhGlSTE3J0Hag9
+# VNHW1mn5T0hQ5FUhfySgACRYkiPLQIuhP1c6OpunTvsWD+RecBxfnLkPUza/CggV
+# tBlfKyX1KhJroGCYZq2fZsrNsmG4bPzFVJeN8VwIYxS6ffdLr83LV9wYSdUK5fsz
+# loKOiazBgjJ9Od+ba1XIMmU4Og==
 # SIG # End signature block
