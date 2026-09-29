@@ -14,7 +14,7 @@
 # through to bootstrap.ps1 verbatim, so -DryRun and -ManifestUrl mean the same here as there.
 set -eu
 
-SCRIPT_VERSION='2.11.2'    # stamped by the release workflow, like the .ps1 scripts
+SCRIPT_VERSION='2.11.3'    # stamped by the release workflow, like the .ps1 scripts
 MIRROR='https://raw.githubusercontent.com/iteam-as/public-certrenewal/main'
 DOCS='https://github.com/iteam-as/public-certrenewal#readme'
 MS_DOCS='https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux'

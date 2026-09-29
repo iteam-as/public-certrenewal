@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.2'
+$ScriptVersion = '2.11.3'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -2451,18 +2451,50 @@ function Update-AppProxyAuthCertificate {
     }
 
     # Authenticated with the OLD credential, whichever form it takes - see the header.
-    $token   = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId `
-        -CertThumbprint $(if ($IsWindowsHost) { $oldRef } else { '' }) -CertPath $(if ($IsWindowsHost) { '' } else { $oldRef })
-    $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
-    $appResp = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 30 `
-        -Uri ("https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '{0}'" -f $auth.ClientId)
-    if (-not $appResp.value -or $appResp.value.Count -eq 0) { throw "Entra app $($auth.ClientId) not found while self-renewing the auth cert" }
-    $appObjId = $appResp.value[0].id
-    $existing = @($appResp.value[0].keyCredentials)
-    $certB64  = [Convert]::ToBase64String($newCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-    $newKey   = @{ type = 'AsymmetricX509Cert'; usage = 'Verify'; key = [Convert]::FromBase64String($certB64); displayName = ("Auth-Cert-" + $newCert.Thumbprint.Substring(0, 8)) }
-    $patchBody = @{ keyCredentials = @($existing + $newKey) } | ConvertTo-Json -Depth 10
-    Invoke-RestMethod -Method Patch -Uri "https://graph.microsoft.com/v1.0/applications/$appObjId" -Headers $headers -Body $patchBody -TimeoutSec 30 | Out-Null
+    #
+    # #136: before this fix the PATCH was a 400 on EVERY platform, so the rotation had never once worked -
+    # found by the first real run (#126), since every test mocked Graph with an empty key list. The body
+    # had two faults, either of them fatal:
+    #  - the existing credentials came from the LIST query (?$filter=appId eq ...), where Graph returns
+    #    every keyCredential with key = null (the key is returned only on a single-object $select).
+    #    Sending those back is a 400 - and would drop every other box's key if Graph ever accepted it.
+    #  - the new key was a byte[], which ConvertTo-Json writes as an array of numbers on BOTH 5.1 and 7,
+    #    where Graph's Edm.Binary wants a base64 string.
+    # And a failed attempt left its freshly minted credential behind - a PEM on Linux, a certificate in
+    # LocalMachine\My on Windows - once a day for the whole 30-day window. Nothing was registered and
+    # nothing points at it, so it is removed; the current credential stays in use.
+    try {
+        $token   = Get-GraphAccessToken -TenantId $auth.TenantId -AppClientId $auth.ClientId `
+            -CertThumbprint $(if ($IsWindowsHost) { $oldRef } else { '' }) -CertPath $(if ($IsWindowsHost) { '' } else { $oldRef })
+        $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+        $appResp = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 30 `
+            -Uri ("https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '{0}'&`$select=id" -f $auth.ClientId)
+        if (-not $appResp.value -or @($appResp.value).Count -eq 0) { throw "Entra app $($auth.ClientId) not found while self-renewing the auth cert" }
+        $appObjId = [string]$appResp.value[0].id
+        $full     = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 30 `
+            -Uri ("https://graph.microsoft.com/v1.0/applications/{0}?`$select=keyCredentials" -f $appObjId)
+        $existing = @($full.keyCredentials)
+        # Refuse rather than PATCH a collection with a hole in it: a key credential sent without its key is
+        # at best a 400 and at worst the removal of another server's credential.
+        $keyless = @($existing | Where-Object { [string]::IsNullOrEmpty([string]$_.key) })
+        if ($keyless.Count -gt 0) { throw "Graph returned $($keyless.Count) key credential(s) without their key data; refusing to rewrite the app's credentials" }
+        $certB64  = [Convert]::ToBase64String($newCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+        $newKey   = @{ type = 'AsymmetricX509Cert'; usage = 'Verify'; key = $certB64; displayName = ("Auth-Cert-" + $newCert.Thumbprint.Substring(0, 8)) }
+        $patchBody = @{ keyCredentials = @($existing + $newKey) } | ConvertTo-Json -Depth 10
+        Invoke-RestMethod -Method Patch -Uri "https://graph.microsoft.com/v1.0/applications/$appObjId" -Headers $headers -Body $patchBody -TimeoutSec 30 | Out-Null
+    }
+    catch {
+        # Graph's own explanation lives in ErrorDetails, not in the exception text ("400 (Bad Request)"
+        # is all that reached the log before). It names a field, never a secret.
+        $why = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $why = "$why $($_.ErrorDetails.Message)" }
+        try {
+            if ($IsWindowsHost) { Remove-Item -LiteralPath "Cert:\LocalMachine\My\$($newCert.Thumbprint)" -DeleteKey -ErrorAction Stop }
+            else { Remove-Item -LiteralPath $newRef -Force -ErrorAction Stop }
+        }
+        catch { Write-Log "Could not remove the unregistered new auth credential ${newRef}: $($_.Exception.Message)" -Level WARNING }
+        throw "uploading the new credential to Entra failed ($why); it was never registered, so it was removed and the current one stays in use"
+    }
 
     # Repoint the field this platform reads. The OTHER field is never touched: a config carrying both is
     # refused by Get-MachineCredential, and Setup-AppProxy.ps1 is what removes a stale one.
@@ -3289,8 +3321,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB5s1don93qQwV5
-# w5PH50EUElrT2Vy7E8m09xpqZByBnKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC8X/r/leOPBTVV
+# WJgiYClAjBS5yBo+Xl0dSdn27GS+TKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3421,31 +3453,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIJ7M3HwzkhvQUwm6EO8t29fZnzWFuD8HBlbR
-# hsy35HtJMA0GCSqGSIb3DQEBAQUABIIBgEnC+KL0D0vkSTkf0SudzalG5pW+r3nC
-# 09hkyWGem96CAmpEhNuiIWtmLQJ5JU+9hatguq9dlYuIGh3SBJsASzX27lTpof2U
-# KxrkgshYj2rKcmEsaRZ3lGIb0c65CLVLI0mxxCUH6h5v20FsupBwM90tiq1f4/nx
-# 0pf3qkQXWmW3DrvMg/j7H2ceS4iK+KCVsiXzE4k8qu5GPSFv65SHP1OwR4/g6efB
-# g/PHvIsRXvcDDEcMkLhtOFlwqQ/iSb+9X/AgkUhvb9PhNbkiVYN6ckJKcd4hSWX7
-# wpMsNDt/R1JoeD7dfjf6jlEjktSoDTkU0DK1O54MMKMkVmLwLHrBkmvqMo6Ck5De
-# Yd1J6Sjd5bk6LisOMdCDOpPy8fFNx2jJirEJppAp6mITBhe3NMjId67637W6O6Sr
-# 8zAgkaN6wmrAjMNnuMayvyD9FiBQ8Lr13FQ4NHnQ4cDq6iSxsSWK8NJHVHAorUfM
-# 5k4URdcluI9zjjRSJIdazpDMRLI1lFhLq6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIDn67kRXi4ibGXdmwz/RMi31yFHYMdW194tt
+# Fzj/SpkjMA0GCSqGSIb3DQEBAQUABIIBgFY2sl/9aus4cFviUgPL9hmQEFDI5sFo
+# yHW92zYtYZISxxKLcX7z/iRraYn802t0uUQF5x+W5NOwz3Q1f/doPj4VmeTEBnd7
+# Ap3yjT/HiEz97amjUsK19JWBqvZ3vsNtAw+k+Nl2BVpuKEi6R7zqCRDAT4EKKth+
+# xW5bGzsd2cptjNEzWechk+vPm5k7qywkvTThloclZ5JBXSy8P7LSQB2aSPplw0tO
+# 9IuxDnOCjs8rPnVN9VG+kHSJuUXJbxrJ/hc2NFIlI6cYrV8c1t29J1R5X7fEIGq2
+# 6d2bVX5JGI45gg2vRvJTHmWMXE7hQL3tsfNGgY0Ync2kCSrtkMOjHGd1Sv4/NOJ3
+# glgIx0Fiq0SmztXK69QkH0gM/cLvl788RYQQwGmDcXH4zexFef561md4wKblPJUu
+# MXpJuwd20QuzlYesYj+rrUIs6vE2Pf72c9kz/JLpRlnkGFhQm9cJ5SC/RJvlXjSk
+# YWKicKro68RqHtIwQLnAxQWGMCPC0OFyYqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjkwODQ3MTRaMC8GCSqGSIb3DQEJBDEiBCCQV6l1jxz+Nu2NE3dNX3Ep
-# kDaWC/eOHeCkTUxFRnO1fDANBgkqhkiG9w0BAQEFAASCAgCN3NrUTB5tA9pWk1Aw
-# LDvywsvguf2tDUxccyYw3YPRVICj1Vfc+n1PzbkKIuNwDQSTahtCdB8Zz0XC9gxE
-# gCVum/HXv7zf5mhh6y4hZmWBqAFeET0zMOUZWkOmLWm6Lz2I/y6XGPKUDMBN35B4
-# Fyxh80FHDIuK658qbvNRWNx53fUHgPNbt/iUHFmepPuXUEDmbb0mQKV/BhKgxPV8
-# 4LYCSjItEbr61HiUkgscV+u8s9blml5eunQe6tZgv3zhzkpYaAy5o4Ov4YdiTgUS
-# cKWMMN93W3UjWMod9IZ8FtGdg1+ZzSols3oLSv+4kBfTA2Rs/+ljEuTRhYwSgqJc
-# 8J5z/gs3MRVv5UQRWuIylFCE7hEXDmbPce+JbQelxIDvvxI8WMQNweupgsy7ryiv
-# KWqzPFdD4fPjJldKNqjdIHDki1aT1ukbU9m1CO2HqfSnL3lODIpqLd5HTg6xaqIp
-# myfoq4Pptc/2XKrM1IBiMnVhX8l0OLEXn+EiLcUTXUDgFTOZqIXhGlSTE3J0Hag9
-# VNHW1mn5T0hQ5FUhfySgACRYkiPLQIuhP1c6OpunTvsWD+RecBxfnLkPUza/CggV
-# tBlfKyX1KhJroGCYZq2fZsrNsmG4bPzFVJeN8VwIYxS6ffdLr83LV9wYSdUK5fsz
-# loKOiazBgjJ9Od+ba1XIMmU4Og==
+# Fw0yNjA5MjkxMDQ2MjRaMC8GCSqGSIb3DQEJBDEiBCAfw8ynbj65nt8mLU3M/yms
+# s6aa+uz4MKKe8Ka9NPnFzzANBgkqhkiG9w0BAQEFAASCAgBVM70xJZ8+xg3TKZ9b
+# 7VngaKifz5bAad6E3WVPv1OerYbWtnvvFbLTssdp6X5/ZjktXjklSJRCPSNEydp/
+# x/hbNxakaQ3W7eIP6yUQ19lZJg6eL513wpRh3vyvfhwAERy293ryFq6GTWlId3Bp
+# 7q+uPe++wjJR8+bRjQvL5UVEgR0uiGet+ywwnQBMkPfmdEvzLtEp4aN0XBYyaZSY
+# RCkU0P27NKwLsAbJLBtDrfX3Gl+9K2j/R632WlhN3k9P1GE9dYOKgYV6iqNvQSIE
+# 9B8VEj5gcNJGh8hkpDioY3viwFg0n2LDtGrKMn0KeOL2c0NMFdZomMGOtElWANIP
+# Gd3e+6dqSeOP+hiyJlDdbvdAH2HViChcWfWH9ALpOvQkuW1izBvR/Y8U7FMyUZez
+# ynE8co5QXxS4GgVzrADGDb4vx5OPsx5ZD82yg3/ZEoa5GmKUjmobLq8/nm/fK2hj
+# 0xsc4OXI0F7lZY9lrfa+BYZgH966sUa6PvTsEhyQyJNYnGTxavOg12rrhk+MYnNq
+# vgTp/dV7hqWYf2Z28w7uMnAOQhCObULi3PPbC6KtM0+N/4CpMV63AIktcXl9WTOk
+# dL1AKCvcWE4/DR73VrEK3B6btJDB5ajHjMZFvAmd7cZpsAbPKFOPNWJnZTkdVLp7
+# NRzdgFF46r/T5JwL23Q0Ppp0bA==
 # SIG # End signature block
