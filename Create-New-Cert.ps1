@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.3'
+$ScriptVersion = '2.11.4'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -2324,7 +2324,31 @@ function Register-RenewalTask {
 }
 
 function Unregister-RenewalTask {
-    # Remove the renewal scheduled task (used by the Delete flow when the last domain is removed). DryRun-gated.
+    # Remove the daily run (used by the Delete flow when the last domain is removed). DryRun-gated.
+    #
+    # Linux (#138): stop and disable certrenewal.timer, remove the two units bootstrap/the creator wrote,
+    # daemon-reload. Until #138 this only knew the scheduled-task cmdlets, which do not exist on Linux: the
+    # error was caught as a WARNING and the timer stayed enabled, so a box with every certificate deleted
+    # went on running - and reporting - every night, or failed every night if the operator had also
+    # removed Renew-Cert.ps1. An operator drop-in (certrenewal.service.d/) is theirs and is left alone.
+    param([string] $UnitDir = '/etc/systemd/system')
+    if (-not $IsWindowsHost) {
+        $timerPath = "$UnitDir/certrenewal.timer"; $servicePath = "$UnitDir/certrenewal.service"
+        if ($DryRun) { Write-Log "[DryRun] WOULD stop and disable certrenewal.timer and remove $timerPath + $servicePath." -Level INFO; return $true }
+        try {
+            if (-not (Test-Path -LiteralPath $timerPath) -and -not (Test-Path -LiteralPath $servicePath)) {
+                Write-Log 'systemd units not present; nothing to remove.' -Level INFO; return $true
+            }
+            & systemctl disable --now certrenewal.timer 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "systemctl disable --now certrenewal.timer failed (exit $LASTEXITCODE)" }
+            foreach ($p in $timerPath, $servicePath) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } }
+            & systemctl daemon-reload
+            if ($LASTEXITCODE -ne 0) { throw "systemctl daemon-reload failed (exit $LASTEXITCODE)" }
+            Write-Log 'systemd timer certrenewal.timer stopped and disabled; its units were removed.' -Level SUCCESS
+            return $true
+        }
+        catch { Write-Log "Failed to remove the systemd timer: $($_.Exception.Message)" -Level WARNING; return $false }
+    }
     if ($DryRun) { Write-Log "[DryRun] WOULD unregister scheduled task '$RenewalTaskName'." -Level INFO; return $true }
     try {
         if (Get-ScheduledTask -TaskName $RenewalTaskName -ErrorAction SilentlyContinue) {
@@ -2614,7 +2638,10 @@ function Initialize-PoshAcme {
         else { New-Item -ItemType Directory -Path $sharedPath -Force | Out-Null; Write-Log "Created shared Posh-ACME directory $sharedPath." -Level INFO }
     }
     # SYSTEM needs FullControl so the daily renewal task (runs as SYSTEM) can read the account + order state.
-    if (-not $DryRun -and (Test-Path $sharedPath)) {
+    # Windows only (#138): on Linux the renewal runs as root, the directory is 0700 root:root, and bootstrap
+    # re-asserts that mode on every run. The ACL cmdlets do not exist there, so this used to print a
+    # 'Get-Acl is not recognized' WARNING on every Linux [A]dd.
+    if ($IsWindowsHost -and -not $DryRun -and (Test-Path $sharedPath)) {
         try {
             $acl = Get-Acl $sharedPath
             $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')   # NT AUTHORITY\SYSTEM
@@ -2661,7 +2688,10 @@ function Set-AcmeAccount {
         if ($existing) {
             Set-PAAccount -ID $configuredId
             if ([string]::IsNullOrEmpty($existing.sskey)) {
-                Write-Log 'Configured account does not use alternate plugin encryption - SYSTEM renewals may fail to decrypt plugin credentials.' -Level WARNING
+                # A Windows concern: the plugin args are DPAPI-protected for the admin who issued, and the
+                # renewal runs as SYSTEM. On Linux the creator and the renewal are both root (#138).
+                if ($IsWindowsHost) { Write-Log 'Configured account does not use alternate plugin encryption - SYSTEM renewals may fail to decrypt plugin credentials.' -Level WARNING }
+                else { Write-Log 'Alternate plugin encryption: not enabled (not needed on Linux - the creator and the renewal both run as root).' -Level DEBUG }
             }
             else { Write-Log 'Alternate plugin encryption: enabled.' -Level SUCCESS }
             Write-Log "Using existing ACME account: $configuredId" -Level INFO
@@ -2678,6 +2708,11 @@ function Set-AcmeAccount {
 
     Set-PAAccount -ID $any.id
     $details = Get-PAAccount -ID $any.id
+    if ([string]::IsNullOrEmpty($details.sskey) -and -not $IsWindowsHost) {
+        # Same reason as above: there is no SYSTEM-versus-admin split on Linux to encrypt across (#138).
+        Write-Log "Using existing ACME account: $($any.id) (alternate plugin encryption not needed on Linux)." -Level SUCCESS
+        return $any.id
+    }
     if ([string]::IsNullOrEmpty($details.sskey)) {
         Write-Log 'Existing account does not use alternate plugin encryption (required for SYSTEM renewals).' -Level WARNING
         $choice = $null
@@ -3047,7 +3082,12 @@ function Read-RestartService {
         }
         elseif ((Read-UiInput $(if ($IsWindowsHost) { 'Configure a service to restart after renewal? (y/N)' } else { 'Configure a systemd unit to reload after renewal? (y/N)' })).Trim().ToUpper() -ne 'Y') { return $null }
         $svcName = (Read-UiInput $(if ($IsWindowsHost) { 'Windows service name to restart' } else { 'systemd unit to reload (e.g. nginx.service)' })).Trim()
-        if ([string]::IsNullOrWhiteSpace($svcName)) { return $null }
+        # #138: after [C]hange, an empty name used to REMOVE the current value - the one outcome [R]emove
+        # exists for. Enter keeps it, as it does everywhere else in this menu.
+        if ([string]::IsNullOrWhiteSpace($svcName)) {
+            if (-not [string]::IsNullOrWhiteSpace($Current)) { Write-UiResult "unchanged ($Current)"; return $Current }
+            return $null
+        }
         $info = Get-ServiceUnitInfo -Name $svcName
         if ($info.Exists) { Write-UiResult "$(Get-ServiceNoun) '$svcName' found" -Kind Ok; return $svcName }
         if ((Read-UiInput "$(Get-ServiceNoun) '$svcName' not found here. Configure it anyway? (y/N)").Trim().ToUpper() -eq 'Y') { return $svcName }
@@ -3060,7 +3100,17 @@ function Read-RestartService {
     $ask = if ($IsWindowsHost) { 'Restart a Windows service after successful renewal? (Y/N)' }
            else                { 'Reload a systemd unit after successful renewal? (Y/N)' }
     if ((Read-Host $ask).Trim().ToUpper() -eq 'Y') {
-        $svcName = (Read-Host $(if ($IsWindowsHost) { 'Windows service name to restart' } else { 'systemd unit to reload (e.g. nginx.service)' })).Trim()
+        # #138: "yes" followed by Enter used to save the certificate with NO restart, silently - on an
+        # [A]dd that reconfigures an existing domain that drops the one it had. Ask again instead; N (or
+        # three empty answers, so a scripted run cannot loop forever) means none.
+        $svcName = ''
+        for ($try = 1; $try -le 3; $try++) {
+            $svcName = (Read-Host $(if ($IsWindowsHost) { 'Windows service name to restart' } else { 'systemd unit to reload (e.g. nginx.service)' })).Trim()
+            if ($svcName.ToUpper() -eq 'N') { $svcName = ''; break }
+            if (-not [string]::IsNullOrWhiteSpace($svcName)) { break }
+            Write-Log "Enter the $(Get-ServiceNoun) name, or N for none." -Level WARNING
+        }
+        if ([string]::IsNullOrWhiteSpace($svcName)) { Write-Log "No $(Get-ServiceNoun) configured." -Level INFO }
         if (-not [string]::IsNullOrWhiteSpace($svcName)) {
             $info = Get-ServiceUnitInfo -Name $svcName
             if ($info.Exists) { Write-Log "$(Get-ServiceNoun) found: $($info.Detail)." -Level SUCCESS; $restartService = $svcName }
@@ -3327,7 +3377,7 @@ function Read-DomainsToAdd {
 
         # Optional pre/post-renewal hook scripts (issue #13; shared with the Update flow)
         if (-not $hookTipShown) {
-            Write-Log 'Tip: pre/post-renewal scripts run as SYSTEM and can be added or changed later via the [U]pdate menu or by editing cert-config.json.' -Level INFO
+            Write-Log "Tip: pre/post-renewal scripts run as $(if ($IsWindowsHost) { 'SYSTEM' } else { 'root' }) and can be added or changed later via the [U]pdate menu or by editing cert-config.json." -Level INFO
             $hookTipShown = $true
         }
         $preRenewalScript  = Read-RenewalHook -Phase Pre
@@ -3526,7 +3576,7 @@ function Invoke-DeleteFlow {
     if ($DryRun) {
         Write-Log "[DryRun] WOULD remove $($toDelete.Count) domain(s) from cert-config.json (remaining: $($remaining.Count))." -Level INFO
         foreach ($d in $removeDirs) { Write-Log "[DryRun] WOULD delete the deployed certificate files in $d." -Level INFO }
-        if ($remaining.Count -eq 0) { Write-Log '[DryRun] WOULD unregister the renewal task and offer to remove Renew-Cert.ps1 + cert-config.json.' -Level INFO }
+        if ($remaining.Count -eq 0) { Write-Log "[DryRun] WOULD remove the daily run ($(if ($IsWindowsHost) { 'scheduled task' } else { 'certrenewal.timer' })) and offer to remove Renew-Cert.ps1 + cert-config.json." -Level INFO }
         return
     }
 
@@ -3921,8 +3971,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDroVbtP4Hpy2Ie
-# 7Uy572B7c7cVnM37JefSOf5QDHSxIKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAYXvQ6uyDxhSf2
+# XOLkma7H/hOfXCUquP3pje+HT+yvraCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -4053,31 +4103,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFrls2ca2aosY+JDzUWpq4EBKKZ0/aLxk9zy
-# YjEUSKuhMA0GCSqGSIb3DQEBAQUABIIBgCcjd0PvQVAm5vGnBhsjxmZf4WVEDMcl
-# 4yO4QbuhBSTjcf0EaNfmWHxO46MOkxHN5PSV0qAO4WLd31BjKq9/2RqOjoRyyCIM
-# kOCji5HQqfLZdzbly87T3odKkMZZKPJnowwMNH3jhezkFs4q2niA80Gww3lAkdTc
-# nbb5ezJadmGbrdwhMd7fSK35r6Fqpl5juDuIbVoCk+T1yB21+09wyDO1no0sWxeR
-# KSeU7l8x9P1fkvqdn3mSxF3PNJTfMfLvgAfE9AvjSxG41kK30eE9WKoe1zwCvxz6
-# Bqe8Ek9tD+U+IkuoL69Kko0IVifVX/sa1EShbwWA0rl5pu38RsN5aOXId4HJ/CN8
-# FO9vG3+4o8sukiXxarpSTfbpF2gRY02+hGFin+caljpBwjPCMEKEkFfrXGrBSnoU
-# dNZtyk6/8kvqMFk9IAVg/VmkeQd5j6CPiGcQArXf+EEaw2ZNpG86iMye+CNqAl4v
-# gm3dvnOR3j5QGo1LAYUb5ICV4ZtZkoFwG6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBWxhN2l+8AF4Gs9Wil320IzfTrx28sLGbO9
+# 7ROUBZIfMA0GCSqGSIb3DQEBAQUABIIBgEsYD/ibTnonl3/j1AQC3R+kMfweKR68
+# qPe4Cp5oe6LwXwXr1TZy0raPEQBi03MbqU6zpqGm8VVQg4BzKpRNmdbInTuuWI6c
+# KGYJais2jF45acr8NkBI1aepea7DPw5ntCGp7a2ATASF940kFa5D7XQvVOx9hCyh
+# V0KDk+QEicd+K26e8muTkhcsDqZrQK48nCSUSsViuMVsxra87oxMw3g2B9BEkBL8
+# ZPg8vgBpo3XXY/8NsZfsM5/1etBNG8MKonA0wwm0p25oOWlXOWvRtdcmN5PmMacT
+# Rc/8uJXr4utjPQ/y7kWxNdQrGKxDa+EdX4GfCJqeNu5hNta5hhImBXiggdZjuPZ4
+# TeCl3iDmRW979pIuW0QLJxjOqNsjsGm2eFqed6ra5wrezQ5YgSQUdgwek8bbDSnH
+# DhOmi+qn/xuH8DN/4jAdw59/2Y4CcFIPoHRUgLQO6S/9KJW6KVd0VSgGZBnn6wZ+
+# +AOEdDjFkYu/2aaa5aK5C9GMdvyYdJcb76GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjkxMDQ2MjJaMC8GCSqGSIb3DQEJBDEiBCC+/+4u/wUR6paFgLBqogoY
-# T+ZSN2Wur9mlJBmzclTbNTANBgkqhkiG9w0BAQEFAASCAgAZX4Ka3a3MfFwLuMXK
-# m2xd1uBteIPWh7y9GzXgzS/esna1i/FVt+9l+ZrrBRltavBjK4J/P7izcruhnlrp
-# msvNPxgs0u0Y716cTAe4Maem0aiYugW/729GhKV1vIBDBwgqeRQbr++eKX16tlUj
-# wHGR5rbF7jMexRHcCfzR3/+ggy8GqgWeYrtwlm83jkprp+Op3MXkIOQinrgLHJ4c
-# NJbZ8/y05GKjjnDVfa6herpXQj0EmVk8jYr3vfgJym2MQIcRHBuZOY8amxa+in2R
-# LdPqtywgqXYWR6o1Zao/03i6MtHTwik1r1H4lp6kP/X+KvhByb9LfJWBbSgaGNuJ
-# /HXMrrzdxjXvCQ4J0sOQOedl+CdRxum8r0BTlHyksJf7tywJrvczYy362eg45iyW
-# 4unuBhHRzCo/knDkcsdWMnH01cPsvEsdZtu3aTldNbV50wVsGwIJvHCgsqXxqPmZ
-# 092YHY3D/9U1TocFu/QR7UAnrZ0i2q0n+LTyJXKZ4i3UW7dzTaJOizfrz8cfm+vm
-# zvt1zcQZ85YMhm6ZGYa0tUn0mcnKapdvxq7YYniGnmBS+9rnnnbv+QINVcjly8Oy
-# sVhrHg6h2v8Gekq7P1fEiyPbxpp0MnEq4OiIL76VaSTySb/jO7HtBppXACZg/q1x
-# amxdxB7BCOyEukazaFkJ0a8hMA==
+# Fw0yNjA5MzAwNjMzMTRaMC8GCSqGSIb3DQEJBDEiBCAB5vaXe+nLKsTVqVW1w9gN
+# Mgp9KfHSOlzk0QbdVtKVmzANBgkqhkiG9w0BAQEFAASCAgB2lScRgfGMvUY6nJYM
+# KFh1JC1jZhNIA2pk3XEqLvG/U6swfnJypFQMhqpzjBiVKoJScNcrHYzkI9p4nM4X
+# 7X/uHkaq2tJl65rDeOhLBYdOoRD+ua6H76zVnrjDfaPqj/Hb070doW+BHIKdRBoe
+# u/Sq4icq8wWxy/xnb/zydWrKy9g/AqQgDp7ntH4alzG6rwXXy9608u3bTW890PXJ
+# 0aMyuGTWr+qYNINVc0dTZK2nJlAxIXaH9hTKjPyKkZRcW+G4RCSyeCMf2YZM3WPu
+# EPSjMz4o1brl3QQ0KeD5n5kwVWPP0VAA/vxEH84/GAApQJu1xMIvscRrnxQSiTrW
+# LDU7eSfNRyvIZD3cWVzIds/riMMfAcl9kdUL7x5sfbnnivvWlFV2U2O11fDqoMol
+# ITmoyfMr1AnjB6BhITIx2/SaL4OY3Wo47PyCsYy3bLAFVUmicoHgtxVee3uoRWI+
+# ZWox4/kqoiXqxlLUnKaR8x9GIW6rvqmj3sO0PdWV2ZjmjazsFLZb+uDXLKLFPDJl
+# 39ssqQ0TX9/6Fe3PjmPCshl+W1eFztO2NkqtX0dtl4LT8Lafr8yrvXSqiBF2g9ku
+# XP5sSm3KX/y4TISTPFofCiItrT+WjHlIPClO7ABffl5/tUavDbF8dyqsS/psOm7d
+# n9jqdTlXY5UJmYp6U5advsKVlA==
 # SIG # End signature block

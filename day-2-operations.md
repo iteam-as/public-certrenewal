@@ -176,6 +176,24 @@ Before every change the creator and the daily renewal write a snapshot of the pr
 to `C:\Cert\Renewal\config-backups\cert-config.<timestamp>.<reason>.json`. The newest 20 are kept. Use
 them to see exactly what a save changed, or restore one by copying it back over `cert-config.json`.
 
+## Decommissioning a server or offboarding a customer
+
+**You do not need to do anything on the server.** A server that is switched off or deleted simply stops
+reporting, and the cert team's fleet view ages it out on its own: flagged **stale** after two days
+without a report, **retired** (hidden) after 14. If a customer's servers all go quiet together, that is
+flagged once for the customer as a whole. A server that comes back is shown again automatically.
+
+Only if you are removing cert-renewal from a server that **keeps running**:
+
+1. Run the creator and **[D]elete** every certificate. Deleting the last one also removes the daily run
+   (the scheduled task on Windows, `certrenewal.timer` on Linux) and offers to remove the renewal script
+   and its config.
+2. Decide separately what happens to the deployed certificate files; a service may still be using them.
+
+A replacement server is set up like any new one, and its first certificate `[A]dd` re-issues the names
+the old one held. Nothing renews a terminated server's certificates, and nothing revokes them: they
+expire on their own date.
+
 ## Things that happen without you
 
 - **Secret rotation.** If the cert team rotates the Domeneshop token or Teams webhook in Key Vault, the

@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.3'
+$ScriptVersion = '2.11.4'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -2427,6 +2427,8 @@ function Update-AppProxyAuthCertificate {
     }
     $oldThumb = [string]$cert.Thumbprint
     $days = ($cert.NotAfter - (Get-Date)).Days
+    # For the caller's failure card (#141): how long this box has before its pushes stop.
+    $script:AppProxyAuthDaysLeft = $days
     if ($days -gt 30) { Write-Log "App Proxy auth credential valid for $days more days; no self-renewal needed." -Level DEBUG; return }
 
     if ($DryRun) { Write-Log "[DryRun] WOULD self-renew the App Proxy auth credential ($days days left): mint a new 2-year credential + upload its public key to Entra app $($auth.ClientId)." -Level INFO; return }
@@ -2547,8 +2549,28 @@ function Invoke-AppProxySyncPass {
     $passPath  = [string]$auth.AuthCertPath
 
     # Auth-cert self-renewal (best-effort; this run keeps using the old cert, persists the new for next run)
+    $script:AppProxyAuthDaysLeft = $null
     try { Update-AppProxyAuthCertificate -Config $Config -Webhook $Webhook -RenewalEvents $RenewalEvents }
-    catch { Write-Log "App Proxy auth-cert self-renewal failed (continuing on the existing cert): $($_.Exception.Message)" -Level WARNING }
+    catch {
+        # #141: this used to be a WARNING line and nothing else. #136 showed the cost: the rotation failed on
+        # every box for the life of the feature and nobody could have known until pushes stopped when the
+        # credential expired. The run still succeeds (the current credential works), but the failure is
+        # now as loud as the success: an event, a telemetry row and a warning card, on every run until it
+        # is fixed. The telemetry row reuses the success Action with RunOutcome 'Failed', so the ingestor
+        # needs no new Action value.
+        $why  = $_.Exception.Message
+        $left = $script:AppProxyAuthDaysLeft
+        $when = if ($null -ne $left) { "in $left day(s)" } else { 'at its expiry' }
+        Write-Log "App Proxy auth-cert self-renewal failed (continuing on the existing cert, which expires $when): $why" -Level WARNING
+        Write-EventLogEntry $EID.AppProxyFailed Warning "App Proxy auth credential self-renewal failed; the current credential expires $when, and App Proxy pushes stop then: $why"
+        if ($null -ne $RenewalEvents) { $RenewalEvents.Add((New-TelemetryEvent -Action 'appproxy-authcert-renewed' -RunOutcome 'Failed' -Message $why)) }
+        $facts = Get-TeamsFacts -Config $Config
+        if ($null -ne $left) { $facts['Days Left'] = $left }
+        $facts['Error'] = $why
+        Send-TeamsNotification -WebhookUrl $Webhook -Title 'App Proxy Auth Credential Renewal Failed' `
+            -Message "The App Proxy auth credential on $([Environment]::MachineName) could not renew itself. The current one keeps working and expires $when; after that this server stops pushing certificates to Entra Application Proxy. Re-running Setup-AppProxy.ps1 on the server mints and registers a new one." `
+            -Severity warning -Facts $facts
+    }
 
     # One Graph token for the whole pass (best-effort), on the pinned credential.
     $token = $null
@@ -3321,8 +3343,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC8X/r/leOPBTVV
-# WJgiYClAjBS5yBo+Xl0dSdn27GS+TKCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCdsWFMtwpoh7co
+# ifGpI3Oc1HShrOq6X3b0VufWECenN6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3453,31 +3475,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIDn67kRXi4ibGXdmwz/RMi31yFHYMdW194tt
-# Fzj/SpkjMA0GCSqGSIb3DQEBAQUABIIBgFY2sl/9aus4cFviUgPL9hmQEFDI5sFo
-# yHW92zYtYZISxxKLcX7z/iRraYn802t0uUQF5x+W5NOwz3Q1f/doPj4VmeTEBnd7
-# Ap3yjT/HiEz97amjUsK19JWBqvZ3vsNtAw+k+Nl2BVpuKEi6R7zqCRDAT4EKKth+
-# xW5bGzsd2cptjNEzWechk+vPm5k7qywkvTThloclZ5JBXSy8P7LSQB2aSPplw0tO
-# 9IuxDnOCjs8rPnVN9VG+kHSJuUXJbxrJ/hc2NFIlI6cYrV8c1t29J1R5X7fEIGq2
-# 6d2bVX5JGI45gg2vRvJTHmWMXE7hQL3tsfNGgY0Ync2kCSrtkMOjHGd1Sv4/NOJ3
-# glgIx0Fiq0SmztXK69QkH0gM/cLvl788RYQQwGmDcXH4zexFef561md4wKblPJUu
-# MXpJuwd20QuzlYesYj+rrUIs6vE2Pf72c9kz/JLpRlnkGFhQm9cJ5SC/RJvlXjSk
-# YWKicKro68RqHtIwQLnAxQWGMCPC0OFyYqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFHIKR6AFM7+MGizmy/P9T/zNMJYo7gfDjAF
+# todUnZ2oMA0GCSqGSIb3DQEBAQUABIIBgBmEpSHRKcMa6/Jf9WwXno9ULQWzdlqy
+# vlGkc2NDfkL1mUZ4ft7fa3mXfUWSuX301Es1+kq1OQMWo802edCOlpe5T0qZZiPn
+# Ajj9r9tG1mloxKF4BVVRskqdMh7I15a2daMUg9ITIaImt5tptXSV2dKw9VGKZMVd
+# nZP5fSZupHf1vcQyc3v97e+YACYHRuDmiBc6dT8xR3e5lBvj6C+10EyC5r+DSO2R
+# dlgKW/EIKN5Wav+ugHj3zsjx0Nvj7OlBMPW9WmAlYiAzfnTu1D1StawteQHROSQc
+# 77oOP9ZgNvEK1nzRT/mYeJFJBi/E/Mk1VEND2lFC7IKVkrrhrb3iF+hHG59ksDID
+# KzbUlHDHhMC+G4v1wXipMKcoQo9m+VtIArKpLijfq5B8Nx24esUrZGZkrrUkAfp/
+# +gJv1pxnEQO9cs+njg8W2Ckl2/qOP5DYTJ+wmgB/QvtsRn0Q734aMA2RFbXKmKfT
+# iJCrLtWEDWfVzoiya0hljA28PMUwcGRk1aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MjkxMDQ2MjRaMC8GCSqGSIb3DQEJBDEiBCAfw8ynbj65nt8mLU3M/yms
-# s6aa+uz4MKKe8Ka9NPnFzzANBgkqhkiG9w0BAQEFAASCAgBVM70xJZ8+xg3TKZ9b
-# 7VngaKifz5bAad6E3WVPv1OerYbWtnvvFbLTssdp6X5/ZjktXjklSJRCPSNEydp/
-# x/hbNxakaQ3W7eIP6yUQ19lZJg6eL513wpRh3vyvfhwAERy293ryFq6GTWlId3Bp
-# 7q+uPe++wjJR8+bRjQvL5UVEgR0uiGet+ywwnQBMkPfmdEvzLtEp4aN0XBYyaZSY
-# RCkU0P27NKwLsAbJLBtDrfX3Gl+9K2j/R632WlhN3k9P1GE9dYOKgYV6iqNvQSIE
-# 9B8VEj5gcNJGh8hkpDioY3viwFg0n2LDtGrKMn0KeOL2c0NMFdZomMGOtElWANIP
-# Gd3e+6dqSeOP+hiyJlDdbvdAH2HViChcWfWH9ALpOvQkuW1izBvR/Y8U7FMyUZez
-# ynE8co5QXxS4GgVzrADGDb4vx5OPsx5ZD82yg3/ZEoa5GmKUjmobLq8/nm/fK2hj
-# 0xsc4OXI0F7lZY9lrfa+BYZgH966sUa6PvTsEhyQyJNYnGTxavOg12rrhk+MYnNq
-# vgTp/dV7hqWYf2Z28w7uMnAOQhCObULi3PPbC6KtM0+N/4CpMV63AIktcXl9WTOk
-# dL1AKCvcWE4/DR73VrEK3B6btJDB5ajHjMZFvAmd7cZpsAbPKFOPNWJnZTkdVLp7
-# NRzdgFF46r/T5JwL23Q0Ppp0bA==
+# Fw0yNjA5MzAwNjMzMTZaMC8GCSqGSIb3DQEJBDEiBCCyoxhCIJegGAXr7Ul7gBLe
+# CrcbCurxXfE36zfSV8JxQzANBgkqhkiG9w0BAQEFAASCAgAT5NvMtpL2Z+ItgUUy
+# yN1ccGu/HZiBHd6twoOj5wEYYnqdSEzCH7sBPN6pVDnmuom6PdOaFPUZ6/GXk2Uk
+# mmFLUOEfKSkq325zGr//QGmJr3R23slicpEmu8bsTHNajyXdLMTB6denvrMb+xXM
+# QhjYf5smQzjnt5difE4ou16puVMVizOQ7n95y4eKiZ/yfo9+PN/E2ryn73XwEje3
+# Se1VZWz/2Z/Sb9/1ce2Ws4YTZyJ3f+Rh1iUala4ozU0YkNEjT8od6SvnYY6faWBw
+# /qEoXYQX9SiivmuI5QRrv+XjKt1pt/UHXtBffBWkoe8Y4zzlmoyDMpMsVV0hupcT
+# t4iO0TGMayKdZphZeUlfOnC5LCr4UqRnqKXjf5IUHuPVNFGm5BFOWuYXPluPRrYW
+# t2mAIjokwyUABo+GS5GJp6P90cEgWK1KsAT52GLSRqfFzzUzAsybMdwp2Tvabkh/
+# AQrIaXDcFsYpDZKpRGH+IpiVgUgJHPwaGjoqr0RFWgzmlCeb9k4ZaTHNWvgq7Xdt
+# Qm/Uyap6tRfWXpYaWxPxUtM5rWAnJ9E3EURjXJgg1ms9QcHFMRTm6ItcT0/bIVhW
+# Xer+VdtKMV/f0rroLz8bUkht/04IqYWw1KqFravIE/sUBGEhTKvpLrwHrw70eZvo
+# Bzc/iEUaDTYh1SqBE2vgLpMznA==
 # SIG # End signature block

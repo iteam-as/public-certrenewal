@@ -131,6 +131,7 @@ There is no scheduled task. A **systemd timer** does the same job:
 systemctl list-timers certrenewal.timer     # when it next runs, when it last ran
 systemctl start certrenewal.service         # run it now, don't wait for 03:00
 journalctl -u certrenewal.service -n 50     # what the last run did
+journalctl -u certrenewal.service -t pwsh -n 50   # the same, but only the scripts' own lines
 journalctl CERTRENEWAL_EID=1020 --since -7d # every successful renewal this week, by event id
 ```
 
@@ -316,6 +317,8 @@ Pressing Enter at any prompt keeps the current value. Setting a value back to it
 from the config rather than storing it.
 
 **`[D]elete`** removes the config entry, and then asks separately whether to delete the deployed files.
+Deleting the **last** certificate also stops and removes `certrenewal.timer` and its service unit (a
+`certrenewal.service.d` drop-in of your own is left alone).
 It defaults to **No**, because a service may still be reading them and a deleted private key is not
 recoverable. The old files are left where they are unless you say otherwise.
 
@@ -349,6 +352,11 @@ sudo sh install.sh -Abr ACME -CustomerName 'Acme AS' -CustomerNr AC001 -InvoiceC
 
 **A `System error` line in `journalctl` after a successful run** — that is PowerShell's health channel
 logging exceptions the scripts *caught and handled*. If the run ended `SUCCESS`, nothing is wrong.
+
+**Hundreds of `ScriptBlock_Compile_Detail` warnings from `powershell`** — PowerShell logs the definitions
+of functions it considers worth auditing (Posh-ACME's crypto code among them) at *Warning* level. That is
+a built-in security feature, not a fault, and it is not ours to switch off. To read what the renewal
+itself said, filter on its identifier: `journalctl -u certrenewal.service -t pwsh`.
 
 ---
 
