@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.4'
+$ScriptVersion = '2.11.5'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -156,7 +156,7 @@ $EventLogSource = 'CertRenewal'
 # as the manifest canary's -Component, and per-script BY DESIGN - the one constant here that must
 # differ between the three copies.
 $ScriptComponent = 'renewal'
-$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; AppProxyUpdated = 1032; AppProxyFailed = 1033; AppProxyAuthCertRenewed = 1034; SigRefused = 1040; ManifestSigMissing = 1041; SecretsRefreshed = 1045; SandboxBlocked = 1046; Breaker = 1050 }
+$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; AppProxyUpdated = 1032; AppProxyFailed = 1033; AppProxyAuthCertRenewed = 1034; SigRefused = 1040; ManifestSigMissing = 1041; SecretsRefreshed = 1045; SandboxBlocked = 1046; PluginArgsReset = 1047; Breaker = 1050 }
 
 # Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
 # Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
@@ -1638,14 +1638,127 @@ function Update-IISFTPBinding {
     }
 }
 
+function New-DomeneshopPluginArgs {
+    # The Domeneshop plugin's arguments as Posh-ACME wants them, built from the shared secrets
+    # (cert-secrets.json). The ONE place the renewal turns those secrets into plugin args: the self-heal
+    # issuance and Repair-OrderPluginArgs (#148) both go through here, so an order re-stamped by the
+    # repair carries exactly what a fresh issuance would.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'Domeneshop secret is DPAPI-LM encrypted at rest (cert-secrets.json); the Posh-ACME plugin requires a SecureString at runtime.')]
+    param([Parameter(Mandatory)][object] $Secrets)
+    return @{
+        DomeneshopToken  = [string]$Secrets.DomeneshopToken
+        DomeneshopSecret = (ConvertTo-SecureString -String ([string]$Secrets.DomeneshopSecret) -AsPlainText -Force)
+    }
+}
+
+function Repair-OrderPluginArgs {
+    # Posh-ACME keeps each order's DNS plugin credentials in pluginargs.json, SecureString values encrypted
+    # either with the account's alternate key (sskey) or - when the account has none - with DPAPI in the
+    # scope of WHOEVER WROTE THEM. A cert issued interactively by an administrator therefore carries args
+    # the nightly SYSTEM run cannot read, and nothing notices until the first renewal that needs a fresh
+    # DNS-01 challenge (ARI "renew now", pruned authorizations): every earlier renewal reused cached
+    # authorizations and never opened the file (issue #148, TNFMGV001 2026-10-14). The failure shape
+    # depends on the module version - a terminating error out of Get-PAPluginArgs, or a 'Failed to
+    # deserialize' warning that drops the field and lets the plugin fail binding - so this does NOT match
+    # error text. It reads the args back the way the plugin will, and re-stamps the order from
+    # cert-secrets.json (DPAPI-LocalMachine, readable by the renewal identity; the vault sync keeps it
+    # current) whenever they are unreadable, incomplete, or DIFFER from the shared secrets - which is also
+    # how a rotated Domeneshop credential reaches an existing order. Posh-ACME encrypts the new values with
+    # the account key when it has one, else in the running identity's DPAPI scope: readable by every later
+    # run either way. Best-effort (never throws), DryRun-gated, logs field NAMES only, never values.
+    # Returns 'Current' | 'Reset' | 'DryRun' | 'Failed' | 'Skipped'.
+    param(
+        [Parameter(Mandatory)][string] $Domain,
+        [Parameter(Mandatory)][object] $Secrets
+    )
+
+    function ConvertFrom-SecureStringLocal([securestring] $Value) {
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+        try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    }
+    function Compare-StoredPluginArgs {
+        # The fields of the stored args that are unreadable, missing or differ from the shared secrets,
+        # read exactly as the plugin reads them (the active account's encryption parameters). A throw
+        # (older modules) marks every field; a newer module drops the field it could not decrypt, which
+        # reads as missing. Returns @{ Drift = [string[]]; Reason = [string] }.
+        $stored = $null
+        try { $stored = Get-PAPluginArgs -MainDomain $Domain -ErrorAction Stop }
+        catch { return @{ Drift = @('DomeneshopToken', 'DomeneshopSecret'); Reason = "unreadable: $($_.Exception.Message)" } }
+        if ($null -eq $stored) { $stored = @{} }
+        $drift = @()
+        if ([string]$stored['DomeneshopToken'] -cne [string]$Secrets.DomeneshopToken) { $drift += 'DomeneshopToken' }
+        $storedSecret = $stored['DomeneshopSecret']
+        if ($storedSecret -isnot [securestring] -or
+            (ConvertFrom-SecureStringLocal $storedSecret) -cne [string]$Secrets.DomeneshopSecret) { $drift += 'DomeneshopSecret' }
+        $reason = if ($drift.Count -gt 0) { 'missing or differs from cert-secrets.json' } else { '' }
+        return @{ Drift = @($drift); Reason = $reason }
+    }
+
+    try {
+        $setOrder = Get-Command Set-PAOrder -ErrorAction SilentlyContinue
+        if (-not $setOrder -or -not $setOrder.Parameters.ContainsKey('PluginArgs')) {
+            Write-Log "This Posh-ACME cannot reset plugin args on an order (Set-PAOrder -PluginArgs); skipping the check for $Domain." -Level DEBUG
+            return 'Skipped'
+        }
+        if ([string]::IsNullOrEmpty([string]$Secrets.DomeneshopToken) -or [string]::IsNullOrEmpty([string]$Secrets.DomeneshopSecret)) {
+            Write-Log "cert-secrets.json carries no Domeneshop credentials; cannot verify the plugin args for $Domain." -Level WARNING
+            return 'Skipped'
+        }
+
+        $before = Compare-StoredPluginArgs
+        if ($before.Drift.Count -eq 0) {
+            Write-Log "Plugin args on the order for $Domain are readable and current." -Level DEBUG
+            return 'Current'
+        }
+        $fields = $before.Drift -join ', '
+        if ($DryRun) {
+            Write-Log "[DryRun] Plugin args on the order for $Domain need a reset ($fields; $($before.Reason)). WOULD re-stamp them from cert-secrets.json." -Level INFO
+            return 'DryRun'
+        }
+        Write-Log "Plugin args on the order for $Domain need a reset ($fields; $($before.Reason)). Re-stamping from cert-secrets.json..." -Level WARNING
+        $acct = Get-PAAccount
+        if ($acct -and [string]::IsNullOrEmpty([string]$acct.sskey)) {
+            Write-Log "ACME account $($acct.id) has no alternate plugin encryption, so the reset args are readable by this identity only. To make them portable, run once as the administrator who issued the certificates: Set-PAAccount -ID $($acct.id) -UseAltPluginEncryption" -Level WARNING
+        }
+
+        $pluginArgs = New-DomeneshopPluginArgs -Secrets $Secrets
+        try { Set-PAOrder -MainDomain $Domain -Plugin 'Domeneshop' -PluginArgs $pluginArgs -ErrorAction Stop }
+        catch {
+            # Set-PAOrder merges over the existing file first, and an older module dies there on the same
+            # unreadable value. The file is unreadable by this identity and about to be rewritten in full:
+            # move it aside (kept as .bak for forensics) and write afresh.
+            $order = Get-PAOrder -MainDomain $Domain -ErrorAction SilentlyContinue
+            $argsFile = if ($order -and $order.Folder) { Join-Path $order.Folder 'pluginargs.json' } else { $null }
+            if (-not ($argsFile -and (Test-Path -LiteralPath $argsFile))) { throw }
+            Write-Log "  Set-PAOrder could not merge over the existing plugin args ($($_.Exception.Message)); moving pluginargs.json aside as pluginargs.json.bak and writing afresh." -Level WARNING
+            Move-Item -LiteralPath $argsFile -Destination "$argsFile.bak" -Force
+            Set-PAOrder -MainDomain $Domain -Plugin 'Domeneshop' -PluginArgs $pluginArgs -ErrorAction Stop
+        }
+
+        # Verify, do not assume: read back the way the plugin will.
+        $after = Compare-StoredPluginArgs
+        if ($after.Drift.Count -gt 0) {
+            Write-Log "Plugin args for $Domain were re-stamped but still do not read back correctly ($($after.Drift -join ', '); $($after.Reason)). Renewal proceeds and may fail at the DNS challenge." -Level WARNING
+            return 'Failed'
+        }
+        Write-Log "Plugin args on the order for $Domain re-stamped from cert-secrets.json ($fields)." -Level SUCCESS
+        Write-EventLogEntry -EventId $EID.PluginArgsReset -EntryType Warning -Message "Plugin args on the Posh-ACME order for $Domain were re-stamped from cert-secrets.json ($fields; $($before.Reason)). The previous values were not readable by, or did not match, this renewal's identity and secrets."
+        return 'Reset'
+    }
+    catch {
+        Write-Log "Could not repair the plugin args for ${Domain}: $($_.Exception.Message). Renewal proceeds and may fail at the DNS challenge." -Level WARNING
+        return 'Failed'
+    }
+}
+
 function Invoke-SelfHealCertificate {
     # Posh-ACME has lost track of a cert (e.g. order stuck in 'pending' after a failed
     # Submit-Renewal -Force): rebuild the order from scratch with New-PACertificate -Force.
     # Captures bindings against the OLD thumbprint (from cert-config) BEFORE issuing - after the
     # new cert is installed, domain-based lookups would resolve to the new cert instead.
     # Returns the new PACertificate object on success; throws on failure.
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
-        Justification = 'Domeneshop secret is DPAPI-LM encrypted at rest (cert-secrets.json); the Posh-ACME plugin requires a SecureString at runtime.')]
     param(
         [Parameter(Mandatory)][string] $Domain,
         [string[]] $SANs,
@@ -1688,10 +1801,7 @@ function Invoke-SelfHealCertificate {
     # Domeneshop creds come from cert-secrets.json - the self-heal path is their only consumer
     # (normal renewals use Posh-ACME's per-order encrypted plugin args, spec section4).
     Write-Log '  Requesting fresh certificate from the ACME server...' -Level INFO
-    $pluginArgs = @{
-        DomeneshopToken  = $Secrets.DomeneshopToken
-        DomeneshopSecret = (ConvertTo-SecureString -String $Secrets.DomeneshopSecret -AsPlainText -Force)
-    }
+    $pluginArgs = New-DomeneshopPluginArgs -Secrets $Secrets
     $poshParams = @{
         Domain     = $allDomains
         Plugin     = 'Domeneshop'
@@ -2981,6 +3091,11 @@ function Invoke-RenewalCore {
                 }
             }
             catch { Write-Log "Could not heal DnsVariant for ${domain}: $($_.Exception.Message)" -Level WARNING }
+            # The order's plugin credentials must be readable by THIS identity and match cert-secrets.json
+            # before Submit-Renewal needs them for a fresh DNS-01 challenge; an interactively issued cert
+            # carries args only its issuer can decrypt (issue #148). Best-effort, DryRun-gated inside.
+            try { $null = Repair-OrderPluginArgs -Domain $domain -Secrets $Secrets }
+            catch { Write-Log "Could not check the plugin args for ${domain}: $($_.Exception.Message)" -Level WARNING }
             try {
                 # Submit renewal with retry. The script -Force forwards to Submit-Renewal -Force so the
                 # cert is re-issued even when ARI says it is not in the renewal window yet (genuine forced
@@ -3343,8 +3458,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCdsWFMtwpoh7co
-# ifGpI3Oc1HShrOq6X3b0VufWECenN6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCn9cd3fxRl4iVH
+# jDVbO1jxEj87kkCzYMflajcNbqMSVqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3475,31 +3590,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFHIKR6AFM7+MGizmy/P9T/zNMJYo7gfDjAF
-# todUnZ2oMA0GCSqGSIb3DQEBAQUABIIBgBmEpSHRKcMa6/Jf9WwXno9ULQWzdlqy
-# vlGkc2NDfkL1mUZ4ft7fa3mXfUWSuX301Es1+kq1OQMWo802edCOlpe5T0qZZiPn
-# Ajj9r9tG1mloxKF4BVVRskqdMh7I15a2daMUg9ITIaImt5tptXSV2dKw9VGKZMVd
-# nZP5fSZupHf1vcQyc3v97e+YACYHRuDmiBc6dT8xR3e5lBvj6C+10EyC5r+DSO2R
-# dlgKW/EIKN5Wav+ugHj3zsjx0Nvj7OlBMPW9WmAlYiAzfnTu1D1StawteQHROSQc
-# 77oOP9ZgNvEK1nzRT/mYeJFJBi/E/Mk1VEND2lFC7IKVkrrhrb3iF+hHG59ksDID
-# KzbUlHDHhMC+G4v1wXipMKcoQo9m+VtIArKpLijfq5B8Nx24esUrZGZkrrUkAfp/
-# +gJv1pxnEQO9cs+njg8W2Ckl2/qOP5DYTJ+wmgB/QvtsRn0Q734aMA2RFbXKmKfT
-# iJCrLtWEDWfVzoiya0hljA28PMUwcGRk1aGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFs0zX7s3ohBkYVlY3a+FlS0U9W59Ym/Bf1c
+# seLjF7mcMA0GCSqGSIb3DQEBAQUABIIBgLqdiRv+Mj3yQ3nBxamLN75POMkQYs5X
+# zGo90kxX1xJ+9o48TXBY6vpTGtak758yogeyz0doy3YRw8+zIt6aQx2dE6raHhhA
+# ilCiyeWkpevYElgqAiIlLghNxvZfEupG3ZYc5KylZuwY7cuETV+A/DEbEN0mEo9S
+# ig60UKGjvIlQCnSEzgGObKsByEDCiQ95utFcRsX+E0vECwyVxMfSFWUEZTZ8YKo8
+# gSG229YYNPbDJKUjmfruKv9Qwb0l0irJkO3af5FCiAiJJkkRpyhtc5Qd2Er6UhoM
+# fqxK9Q0vXPfmsZRomcsN7j8dhRINfW78/lKV2UG3TUVEcNqlailOkv3vy+UeEKzL
+# 52cCEqT/T4kmoDY4HTEWfL3O7kEyoSwf/Pm1ryYQmqnVz/pgkTVYmno0rcQJnitC
+# 4d1ixSoyqvvKo2Ap7JUt5JvAI/9xvwGU/lUKGVXSHhjmPt7qlJMkwwblpfqHfcQr
+# 5A+1L5cAFXXFypVILHpDQm8yxE7bBEoapaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjA5MzAwNjMzMTZaMC8GCSqGSIb3DQEJBDEiBCCyoxhCIJegGAXr7Ul7gBLe
-# CrcbCurxXfE36zfSV8JxQzANBgkqhkiG9w0BAQEFAASCAgAT5NvMtpL2Z+ItgUUy
-# yN1ccGu/HZiBHd6twoOj5wEYYnqdSEzCH7sBPN6pVDnmuom6PdOaFPUZ6/GXk2Uk
-# mmFLUOEfKSkq325zGr//QGmJr3R23slicpEmu8bsTHNajyXdLMTB6denvrMb+xXM
-# QhjYf5smQzjnt5difE4ou16puVMVizOQ7n95y4eKiZ/yfo9+PN/E2ryn73XwEje3
-# Se1VZWz/2Z/Sb9/1ce2Ws4YTZyJ3f+Rh1iUala4ozU0YkNEjT8od6SvnYY6faWBw
-# /qEoXYQX9SiivmuI5QRrv+XjKt1pt/UHXtBffBWkoe8Y4zzlmoyDMpMsVV0hupcT
-# t4iO0TGMayKdZphZeUlfOnC5LCr4UqRnqKXjf5IUHuPVNFGm5BFOWuYXPluPRrYW
-# t2mAIjokwyUABo+GS5GJp6P90cEgWK1KsAT52GLSRqfFzzUzAsybMdwp2Tvabkh/
-# AQrIaXDcFsYpDZKpRGH+IpiVgUgJHPwaGjoqr0RFWgzmlCeb9k4ZaTHNWvgq7Xdt
-# Qm/Uyap6tRfWXpYaWxPxUtM5rWAnJ9E3EURjXJgg1ms9QcHFMRTm6ItcT0/bIVhW
-# Xer+VdtKMV/f0rroLz8bUkht/04IqYWw1KqFravIE/sUBGEhTKvpLrwHrw70eZvo
-# Bzc/iEUaDTYh1SqBE2vgLpMznA==
+# Fw0yNjEwMTQxMDE4MTBaMC8GCSqGSIb3DQEJBDEiBCAMWQWY01jbpfsACqGauWqU
+# QsVTJ6+mthYw0KQBRCeMzDANBgkqhkiG9w0BAQEFAASCAgAj0O+eMHGDzb6cjc0r
+# tl6uCeNvLYpbco9XJN9nDr0MoKr0TKnamVCI1Cj8Qhsrr6AIgmbHcZLQSyr6jOGh
+# 6dxCZ3nMR8ZVfR6/jGG77KswUEH9mltJxjQAouU1AEIC8Togi/deZqZCuBVpndPG
+# 5kAYYbv8IvkR/arywu4EfXS50+ykm19QcnXI3spxZ8F3rxSD4QMGHJLEJRwG//Y2
+# fMjAEHGCGjf5zB/YAYSuCQAgedEF8RU33oEVMdA3t2y3cOCNhAGcJ+lr1fvFR5TH
+# p/qAF3Vd2eUUp9j+yM+ojXRM8/svKi3DVnkbrhIQW04bHVIraIzg9KHgwuPgYL1Z
+# V3M9r78kGn5oR3+LFIOF/UYDGbX0TXTIs/rcCKXniffSW1/HJRqfDrDrK0C67+Mr
+# U4bAiNnEwQAjOxSEAyM4wSglAuyvXjun4H7Amp4G4pH16XOPJjbAigU2LMd5eqwm
+# 01mpNoXIXiLyaeUknmqRxucJ+ctcyni/ObxVYwmjm+CZVgevnj3XvZoy8Ekr1ILx
+# VfbwS8nEVmcEqqwFuyJiA7/3TUs9UxApYObxIbWWPRWoUcjc5u8QW52gq03g1LIj
+# yHQSMK1pRgg5093tCzQBWwlhRAlQwuE/ZpD1qbziRpiO3AxmnXZFN8O4q/k4SGcN
+# VYKJq9Md555fsTRsaF1D3friXg==
 # SIG # End signature block
