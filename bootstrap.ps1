@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.5'
+$ScriptVersion = '2.12.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1814,8 +1814,8 @@ function Install-SpCert {
 function Install-RequiredModules {
     # Duty 3 ("Fix A", unattended). Ensure NuGet provider + PSGallery trust + TLS 1.2, then install the
     # modules the SYSTEM renewal + creator need, machine-wide (-Scope AllUsers) so the SYSTEM task can load
-    # them. DnsClient-PS is creator-only (CAA walk in Test-CaaRecordForLetsEncrypt) but the creator hard-fails
-    # without it, so it belongs in the baseline set. Born here; the creator's pending interactive "Fix A" copies this (sharing, not duplicating) and
+    # them. DnsClient-PS serves the creator's CNAME/CAA pre-checks and, since #151, the Linux renewal's
+    # _acme-challenge CNAME lookup (Resolve-DnsRecord); the creator hard-fails without it, so it belongs in the baseline set. Born here; the creator's pending interactive "Fix A" copies this (sharing, not duplicating) and
     # wraps it with prompts. Best-effort per module: a failure warns + continues (Connect-SecretsVault /
     # Posh-ACME re-check at use; the box may still be partly usable).
     # Az is Windows-only for us now: the Linux Key Vault path is REST with a client-certificate assertion
@@ -2192,8 +2192,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDLbd7Yxiq1LJrS
-# cBA1+zBjNWR+Y/qXDXz28m/7RAwT1KCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB0CIjc61zNfovj
+# ouWcR7NvFP4rVURdijNbTCDg5NStr6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2324,31 +2324,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIE7FPxcbBN3I4zC/3lGSi7tT5pDTDMO3dRce
-# bqMLUeYdMA0GCSqGSIb3DQEBAQUABIIBgEjN6lxaJ+jXnnME8kd+nPViOyg1k+WN
-# P283xCFOF8CDeRQXfarXURx50Up+lMQ0LkxTucN8tNDqVxG6uCJaJyTDz+NA1eub
-# YppTVE19uJjdXoHEsyfFrM9lBWoas1ULoJRhGXShYRWBp514fkk/u+zEfTsBmk2y
-# TmRJdq8CT7TxvFrAt15KstUjl3Wqwl6irfrSMdxGb3xgccMsVDilFS/jKnlaew0t
-# lg/MqLQwNwoxz44fksp4jpjA4tnogbKAaQSHQv5c9MndUuySbxgF4+8I2bu49W1/
-# xo0GwWNVXXCMnu4GIuDglR4MqvmQK0yINNX4LLfVMluFnN+gU9YaDvkw/cz6S2ub
-# wcqI+21hYb+VMq7ZRthWHasoy2kd2uLxSc5Hj1Xj3Q+25evgKzm8yYnlC3v9rffK
-# QxcqJCTBL703Ti6s1lZkmvsZCjI3+FLOAxGZVEsfv/xCnzvcswcJ3p1q4USACM+M
-# X9Wsdm1AQNKzikUAwUc42L3oulcPiO2eFqGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIDecwKCHQt2mZP8RMcKtqG+qdlGpH14sfkzp
+# d+oWUplmMA0GCSqGSIb3DQEBAQUABIIBgBW/U4dZ3v712VwXtN7XdqhjYACH1EMB
+# b35HfHEFuNgo8xjGZFrMVK4NJZ8XnFYpA6uatO9EeJmfCFLVQzlA5BFVrSM10hH0
+# Vq6F1YAR2qRlcWJZTtYq3Fs8k2QpNtJpqWvJMF4rLUTX6nww5iVAhS8Omzmkom/b
+# agrFF6212gYpA/I4+CZxvq31aykXNNgY71iFvFTkE4CmWLKqfMi5rliwg883ar3G
+# xBIkLpIa1W/lBc5/zOUdb3+b+cPweLKW/U/89UkKGpinhXKVbyzqnPgBUBSy+g+D
+# C1beEZ2XohKNd2DIAId6f6OD8KIvqImZWiecf94juRcwG1XH/PFoFoW6xVM8Llcx
+# CJOuLixG+adQuU3qmG7zBRNByunVs7xaB5caD8uXE3yDUouYW4vv/B+RZ/EE28a7
+# R9vYvqy1odCkifVPhgdRH1gT2C9iVqesTqOd2iX/Xgl7QlmGiw6c9SDX1yzLpi2u
+# Zu7muhYBUOSwWqCSuYicybveMDSaIPRqL6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjEwMTQxMDE4MDhaMC8GCSqGSIb3DQEJBDEiBCARqsU5whSE+T5NIfZHsloN
-# qUGytkBEemGiWLgf4T+pqTANBgkqhkiG9w0BAQEFAASCAgAnJyuE0cxY0UIZ3teO
-# 1bgxNTLiPDElVoJAJNnWo/DHBv7fbmStPEA1l7FBz3K43Mp8Eq+NKhnZXcQhBd1F
-# sr3hD84XoiI2a5SATlPZq7gShSi3z2MYg3ZgdnHTq2P64xzMaghOBibM3/vKoOr+
-# EL9a1bBaZF4s0Z8tA3r+6OLa6iOAhcY/EIbYFF7g7+isYM/nDTFQKhNS9YXlTJV6
-# 4dz6Pa5yLvalTPzXyAubJ0+Bg871CN0rphC8dL83CVEm0DcypJ8ge3f5GqAyj5ZW
-# b5EvNhb/fDzyuLr+6DZ2zVRt7qkZv0IhvTnhD4rViFe8Yr8AyEv/XLGNecweqZyU
-# zoN6gSWMHGLzpy6bBvxHxp792EKD3EXnffA5+WvQctsLnYJq/sJdNzO42RmDQXIV
-# u/QSqYyC5gpQ0bZ8LTZkBydREgbxq5/ZLUtH03+NYjVY7U12N6+ez72QuwyAwzLi
-# 0HKt/OuXTXdQHfwK+zrODXAaoporA2VSVmtCJrP0FPFGvrG+OtmPtr8Br1AE6/9J
-# FkquXAAYJR0QozbrmUBAJxK3EnAdbbJ8zLPd3pNRfQxtxcyJKDv12CTpc4IG6CvA
-# uVuJZI+4RoelQrX9R3dTamGukQx5tvfg5JAMzQ4brQmg8S6JicYZZz9SnwGJsKtc
-# w21/GEYKHvAsNY61RhszWct1Kw==
+# Fw0yNjEwMjYxMTUyMjJaMC8GCSqGSIb3DQEJBDEiBCDRq/AVrISOmHRXhutK3GU8
+# m/hAO0+Tp2zDJ2fAXh3dXTANBgkqhkiG9w0BAQEFAASCAgCEgDlfoGFdnwjr4eRG
+# R7mUW03wFc/pHnUZrAHrDjX/rcdovH2CaH2+TC3VZGW4S/MHYiUXRE0cVAxIw/YQ
+# ESetpSiRSuQR6xPrwkBkV1pk0x9/onDSCKuCjgrAXpda/X2D+nXGjRG0cBuEibi3
+# x0FkAiNf1E+LMA+l9YAeZrxBy1zvaQ15fLM2TEfthSXCQouFWB+003FCuUuMMxgk
+# 4Nos3K19eFoO3sZ9Zfh/FYCnOkMm7uuXGqIuxkchC6YBLPi34lizZiV22/dP0TWh
+# jtkPyyZnYpHdrdIRbshs/a8WXMTEPOfeeq85G30InFt4IwCbyawE0SNhFhoGOehk
+# ASwxlcjlihEvLm0zDmlc+PijLuNZepIRYLVK7u5qbxGcQ/EN79r7JCepFFg55IMH
+# KyUbK/WShB/yF6h63rt36awiqbgQAwDepPzzLTgFvu/e6lrGBdCAndwe67vydFko
+# UNN7u9N3FUFnEPkmjkD2EWgyzAsLMfbKHF0vcD8DLTuYZFAjCw7Hjd+18wL/pu0E
+# cIujGCXFCZucjBB3yUB0qFMQmoSidmNepeOIe9skcqIJjcDKisVdGjx+FamblTFk
+# Igt5tTUmosuN8dHVV3Y9mUzGztPRGaJ0n0LO64Y/BrsBuTC5o28KVJcs8RJEXWoo
+# /r19IIfKn42Rhwy6xooQxx6m6Q==
 # SIG # End signature block

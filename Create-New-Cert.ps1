@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.5'
+$ScriptVersion = '2.12.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -1087,6 +1087,68 @@ function Get-AcmeChallengeDomain {
     param([string] $Domain)
     if ($Domain -match '^\*\.(.+)$') { return "_acme-challenge.$($Matches[1])" }
     return "_acme-challenge.$Domain"
+}
+
+function Get-ChallengeCnameTarget {
+    # The CNAME the customer actually has on _acme-challenge.<domain>, lower-cased and without a trailing
+    # dot, or $null when there is none or DNS does not answer. Never throws: callers fall back to what they
+    # already know (issue #151). SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Domain)
+    $challengeName = Get-AcmeChallengeDomain -Domain $Domain
+    try {
+        $answers = @(Resolve-DnsRecord -Name $challengeName -Type CNAME)
+        if ($answers.Count -gt 0 -and $answers[0]) { return ([string]$answers[0]).Trim().TrimEnd('.').ToLowerInvariant() }
+    }
+    catch { Write-Log "  No CNAME answer for ${challengeName}: $($_.Exception.Message)" -Level DEBUG }
+    return $null
+}
+
+function Test-AcmeAliasAllowed {
+    # Only a record INSIDE the certval.no delegation may receive a challenge TXT. The alias is handed to the
+    # Domeneshop plugin, which writes wherever it is told, so a customer CNAME that points anywhere else must
+    # never steer a write into another zone on that account. The zone is hard-coded on purpose (never
+    # configurable). At least one label before certval.no; labels may carry the _acme-challenge underscore.
+    # SHARED VERBATIM.
+    param([string] $Alias)
+    if ([string]::IsNullOrWhiteSpace($Alias)) { return $false }
+    return [bool]($Alias -match '^(?:[a-z0-9_](?:[a-z0-9_\-]{0,61}[a-z0-9_])?\.)+certval\.no$')
+}
+
+function Get-DnsAliasArray {
+    # One DnsAlias per name, in order, for Posh-ACME: the record the Domeneshop plugin writes each
+    # challenge TXT to. Per name the source is, in priority: (1) the CNAME the customer actually has on
+    # _acme-challenge.<name>, when it points inside certval.no - that is the record Let's Encrypt follows,
+    # whatever we would have computed; (2) the alias already stored on the order, when the caller has one;
+    # (3) the computed default _acme-challenge.<zone>.certval.no, the record the creator prints for the
+    # customer to create. Before #151 only (3) existed, and its one-dot zone rule sends the apex of a
+    # three-label domain (meloy.kommune.no) to kommune.no.certval.no while its www goes to
+    # meloy.kommune.no.certval.no: the apex TXT landed where Let's Encrypt never looked, and the failure
+    # read as "record N+1 overwrote record N". Live DNS wins; the stored alias is the fallback when DNS
+    # does not answer, so a lookup failure can never make things worse; the computed default only applies
+    # to a name nothing is known about. Never throws. Callers @()-wrap the result (PS 5.1 unwraps a
+    # single element; a leading-comma return would nest under that same @()). SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string[]] $Domains,
+        [string[]] $StoredAliases
+    )
+    $stored  = @($StoredAliases | Where-Object { $_ })
+    $aliases = @()
+    for ($i = 0; $i -lt $Domains.Count; $i++) {
+        $d = $Domains[$i]
+        $computed = Get-AcmeChallengeDomain -Domain "$(Get-DomainSuffix -FQDN $d).certval.no"
+        # Posh-ACME stores either ONE alias for every name or one per name; map both shapes.
+        $storedForName = if ($stored.Count -eq 1) { $stored[0] } elseif ($stored.Count -eq $Domains.Count) { $stored[$i] } else { $null }
+        $live = Get-ChallengeCnameTarget -Domain $d
+        if ($live -and (Test-AcmeAliasAllowed -Alias $live)) { $alias = $live; $source = 'live CNAME' }
+        else {
+            if ($live) { Write-Log "  CNAME for $(Get-AcmeChallengeDomain -Domain $d) points at '$live', outside the certval.no delegation; ignoring it." -Level WARNING }
+            if ($storedForName) { $alias = $storedForName; $source = 'stored alias' }
+            else                { $alias = $computed;      $source = 'computed default' }
+        }
+        Write-Log "  DnsAlias for ${d}: $alias ($source)" -Level DEBUG
+        $aliases += $alias
+    }
+    return $aliases
 }
 
 function Get-StoreCertificateForDomain {
@@ -2369,7 +2431,8 @@ function Test-ValidFQDN {
 }
 
 function Resolve-DnsRecord {
-    # Creator-only (not in Renew-Cert.ps1). One DNS lookup, on either platform.
+    # One DNS lookup, on either platform. SHARED VERBATIM with Renew-Cert.ps1 since #151, which needs it
+    # to follow the customer's live _acme-challenge CNAME at renewal time.
     #
     # Resolve-DnsName is a WINDOWS-ONLY cmdlet. It does not exist on Linux, and DnsClient-PS - the module
     # bootstrap installs on both platforms - exports Resolve-Dns, NOT Resolve-DnsName. Every DNS lookup in
@@ -2446,7 +2509,7 @@ function Get-ReachableExternalDnsResolvers {
 
 function Test-DnsCnameRecords {
     # Creator-only (not in Renew-Cert.ps1). Verify each domain has its DNS-01 _acme-challenge CNAME
-    # pointing at the certval.no delegation, querying internal DNS first then the public resolvers that
+    # pointing INTO the certval.no delegation (existence AND target, #151), querying internal DNS first then the public resolvers that
     # Get-ReachableExternalDnsResolvers says this server can reach (probed lazily, once per call). When
     # none are reachable the external check is skipped - with a message that says so - rather than
     # timing out twice and then claiming the record does not exist.
@@ -2496,6 +2559,20 @@ function Test-DnsCnameRecords {
                 }
             }
 
+            if ($cnameFound) {
+                # The TARGET decides where Let's Encrypt looks, so it has to be inside the certval.no
+                # delegation (issue #151). Any record in there is accepted - issuance follows the CNAME as it
+                # is (Get-DnsAliasArray) - so a target that differs from the computed default is only noted.
+                $cnameTarget = ([string]@($cname)[0]).Trim().TrimEnd('.')
+                if (-not (Test-AcmeAliasAllowed -Alias $cnameTarget)) {
+                    Write-Log "  CNAME for $challengeDomain points at '$cnameTarget', which is OUTSIDE the certval.no delegation: Let's Encrypt would look there and find nothing we write." -Level ERROR
+                    Write-Log "  Please change the CNAME record:  Name: $challengeDomain  Type: CNAME  Value: $challengeTarget" -Level WARNING
+                    $validationFailed = $true
+                }
+                elseif ($cnameTarget -ne $challengeTarget) {
+                    Write-Log "  CNAME target '$cnameTarget' differs from the default $challengeTarget; issuance follows the record as it is." -Level INFO
+                }
+            }
             if (-not $cnameFound) {
                 $notFoundText = if ($IsRetry) { 'still not found' } else { 'not found' }
                 if ($externalSkipped) {
@@ -2771,7 +2848,7 @@ function New-Certificate {
     # Issue + install + deploy ONE certificate (ported from v1 issuance ~1482-1605). Domain validation
     # is done by the caller. Returns the installed certificate object, or $null under DryRun. Throws on
     # a hard issuance/install failure (the caller records it as failed and continues). Domeneshop creds
-    # come from the synced cert-secrets.json (Decision D); DnsAlias points every domain at certval.no.
+    # come from the synced cert-secrets.json (Decision D); DnsAlias points every domain into certval.no.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
         Justification = 'Domeneshop secret is DPAPI-LM encrypted at rest (cert-secrets.json); the Posh-ACME plugin requires a SecureString at runtime.')]
     param(
@@ -2781,11 +2858,9 @@ function New-Certificate {
     )
 
     $mainDomain = $DomainConfig.MainDomain
-    $dnsAliasArray = @()
-    foreach ($d in $AllDomains) {
-        $suffix = Get-DomainSuffix -FQDN $d
-        $dnsAliasArray += Get-AcmeChallengeDomain -Domain "$suffix.certval.no"
-    }
+    # One DnsAlias per name: the customer's live CNAME inside certval.no when it exists (Test-DnsCnameRecords
+    # has just confirmed it), else the computed default (issue #151).
+    $dnsAliasArray = @(Get-DnsAliasArray -Domains $AllDomains)
     Write-Log "Requesting certificate for $mainDomain (domains: $($AllDomains -join ', '))" -Level INFO
     Write-Log "  DnsAlias: $($dnsAliasArray -join ', ')" -Level DEBUG
 
@@ -3971,8 +4046,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCqEKFvoERarQ7T
-# xuhe/LIYrjTiaPvQZIV1M8IhFC+7Y6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBYrSNugrVhtLPl
+# PkvkXJSkEhmPrlaujptg2QW5PYgYEqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -4103,31 +4178,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBYCD282W62vXV5qUqr3iFatJBFx3tAh49Oy
-# DwwHzXdqMA0GCSqGSIb3DQEBAQUABIIBgL5stbMJFFMG9WNE7Jkur8yCT80Ww7xj
-# W1j4deE/PrbGqpT3A5tXAZPiO1E5kiJZLO9N3ptoTUCF/VVl7H5gRuAYINaiQ3/f
-# zkui8XGAfKaFW0xeQtIW2U5rIJTXu4WqI5hLv7l21lEBD6+QTIXEs9mAoUiKv5/D
-# peXQkHRlyZ1p1iJDsGTLcB3t/RjBhXQgMgpUVrIDwL6UJ4TXSHlGRVJusyuZMypL
-# Buq0OGx0qS2nygv9gs93KhGYX4u3ApR9dnTZ2cFn6bvh1E5/Nw5dxjahIABFDvps
-# UbdyS8O8oPMiXDcEghUGt3MQoRDs1x7aDSd8J8LmcPMaaMB7fRjF9VATOcpv6AxA
-# UW5nttC+Evqm+WOO53H7kWQMHoO/Kvv5jfQ28V4lD+DoHJMndNEU6l0BYtstgTTK
-# nI+owREIvbxe/cNufzZFlJ5Ikb9J1naSs77+J9Fuowf7mGoExC5uHD8xASbMyoaA
-# 8833OKPSf2gV8DKjHWVKtx3DglCh1QE2nKGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEINE4laTtQ/THf+wyjhm16eB10uDtRR2LQ5nd
+# DR4FryxcMA0GCSqGSIb3DQEBAQUABIIBgEk/c/N5dRCGZhLPyCUAa+8/eNbgWDbe
+# 29dvDMbCpEMz4C+ZAdRZP8r9HgohXWA8TeXVK/10N+NK3WQZAv6SGQmdns7T0ABh
+# qh0LBwf7chGX5lCMiNjaBVtj5mts7HXu48j4BJ68NGlAmD5Q2PwWDm7oXeqsFZf3
+# qnna0BanJgHiHSZ8h2Vxtjxhti49+VYzBwHII/eRXAj1HE8sMfxD3/Zj6eHh4tAO
+# 5Mcr2m+eNaDuGjkpy/uM33I3KxOZGSNmVadRzt0Wde4JPcqYf00hwegcH5ZvmmYn
+# xmbc/DjvAnZN+WwoxvLwGC7P+MlbJ8qfA/OWfsfKYAJcOcQb5QWt2Bzzypn3NGaR
+# u6sV/mfgALWMLjyd3LU9AsVfWwqlMoChqYtwW6O1NWO7shRZRi5qGLMv48MHYJzs
+# K3L5DVW8cEu4v1Q88lmza0q9rmRFNGeqcNCJQzlKBV6fc+IB3nL1AHqq+aNEsr1i
+# MB3KayQKK50HMCcxhYZLwGeVVBYlTYvtq6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjEwMTQxMDE4MDlaMC8GCSqGSIb3DQEJBDEiBCCEQr4dnCKhcGgB9b7B5m9G
-# 2+XsfNHYJ0YSgTwGOGaegjANBgkqhkiG9w0BAQEFAASCAgCtzVoBXxohXpLAvSVl
-# t5sI6WGCaoe3h+wLWgh/w4A0CO3eDtMZ38EdL4jgCZ7MgBiLEz1+54oWQ2uAzPPA
-# 3uZG4M8pgav1R+MtNl0IGqx3LpVkzVwM84WdkGp7vKCPdCENJcnt9ijiinHh1Bok
-# dy9RYoSc6Q1pE5HzXFchGR21wCbuV6ekZN4e94kC0578semUVUV6eR1UBoGCUjc9
-# PLcYXxbUUwgUMwtt1JUjCPcFOL39pja/mryvh10QjurSOcrbWw9lL2eYYitRpu90
-# 3vQzgUNe+/cSNMG8O90VnsgfSf0vTWcXYv4ZGyfrwYoThI5v6CmjKfq1Ikl67odi
-# VgJtH0T7RyDfW5qEUotgJniHY1hpgaqCmt+j0HI9VAG74pLMKybNM2oSfmMeCrmz
-# 3jQOUAb7IFOke0nwjs3SuSDjlGOBS9JF11t+j35JiV5U+MWpOjyzpxUiW8KghwiT
-# 0SauwO6Jxi6TXqiAuEGdGKPk6J5+lvX7iQFVSpqwAd769cZRDf8OnPMvnbKxRh2z
-# aVz/+gG/Ot2TEZI5IvVa6FriU8U/k5GIgabeHDG1zqtyN3luEHTRN3ydvafLiNQw
-# TXDT0+HuRcNW8QguFgPNJ9DIz7GT6RsNmJRtz6u+TZFEEo3ot697RgALmauKNNsz
-# K/ONIBVzhFgvWZREyDUm9auGoQ==
+# Fw0yNjEwMjYxMTUyMjNaMC8GCSqGSIb3DQEJBDEiBCD1ov/DIO+4FxMn+fSBFQI/
+# cn6OLCiS4mMRNRWIx/Iu3DANBgkqhkiG9w0BAQEFAASCAgBho0Y7LA7/r8LS1U11
+# 1kGJ+mXBmyKeXsvuNmM1OZVzvfCwYOkrDfB8xwft/VQ4xO/aSX09fLjeUXqkOYZF
+# 6R8C3uDsDiAc7Oq5x8Lc3FaFGTGOIgOczLlODcTu7WL+ohMxgxQAQeVVqA9ahhxj
+# ZHVEk51FITRhlLgwEUh3+0QBbW6ne0frf/FU04m4a8xiksNHEQatiCIjCeoaL7t4
+# 6Uh/19S/CpKNuPycQHZ8g7rwVFVivk4cMAtUInOlHPNnN5x0qiEuBnUm0qaDlgMy
+# YXPt28Pjk5Fvykv2lv2ZuAoptrZ0yBGlderLOpZwapelmlED56fnh+jerP/CO0de
+# ZcbuEKmNyfdGs3dJO8YKITQf9/+lxglYQG2Qk+AiN23OiJm4+1dzJ2ePykRaq++h
+# E64Y+VSMjGHJrQ5+35hdMmYZndMczhyy65A6mXZ9Hm3HWVXWus4t76aALTpknkkn
+# RcvyAVMFNyd9KUyPZhsAAGro5zIl9FmS0M7tfpWFvAg9eCjOP+BEjcH0F3WB2Pr1
+# oPXKEyJZqd9nyUIUa/ng1K+3RPuiCaG7SDwOyGT8l02RGu8aUqhNlZUhipnFVVjZ
+# Q05f0xLVhhV+dD+G/Uj0t/9W0IrEwhLQj8l9LY4KpVNUCc4kmwozsqAoh+6r1R7a
+# uLoYVx5q8QE7PIPHSl9BHLhIDQ==
 # SIG # End signature block

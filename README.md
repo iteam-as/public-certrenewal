@@ -65,7 +65,9 @@ missing.
 - [ ] **A DNS record per certificate name.** Validation uses DNS-01 with a CNAME delegation:
   `_acme-challenge.<your-fqdn>` must be a CNAME pointing into the `certval.no` zone. Get this in place with
   whoever manages the domain's DNS before you add the certificate. If it is missing, the creator pauses and
-  prints the exact record to create.
+  prints the exact record to create. Any record inside `certval.no` works: the scripts follow the CNAME you
+  have. For a certificate with several names in one zone (`www` plus the bare domain), point them all at
+  the same record.
 
 > You never type a secret. The Domeneshop token, Teams webhook and contact email all come from Azure Key
 > Vault automatically.

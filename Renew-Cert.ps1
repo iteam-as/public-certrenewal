@@ -46,7 +46,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.11.5'
+$ScriptVersion = '2.12.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -156,7 +156,7 @@ $EventLogSource = 'CertRenewal'
 # as the manifest canary's -Component, and per-script BY DESIGN - the one constant here that must
 # differ between the three copies.
 $ScriptComponent = 'renewal'
-$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; AppProxyUpdated = 1032; AppProxyFailed = 1033; AppProxyAuthCertRenewed = 1034; SigRefused = 1040; ManifestSigMissing = 1041; SecretsRefreshed = 1045; SandboxBlocked = 1046; PluginArgsReset = 1047; Breaker = 1050 }
+$EID = @{ Start = 1000; UpToDate = 1001; Upgraded = 1010; RenewSuccess = 1020; RenewFailure = 1030; HookFailed = 1031; AppProxyUpdated = 1032; AppProxyFailed = 1033; AppProxyAuthCertRenewed = 1034; SigRefused = 1040; ManifestSigMissing = 1041; SecretsRefreshed = 1045; SandboxBlocked = 1046; PluginArgsReset = 1047; DnsAliasUpdated = 1048; Breaker = 1050 }
 
 # Self-update outcome stamped onto the telemetry event (UpToDate | Upgraded | Refused | Skipped).
 # Set by Invoke-SelfUpdate / main; defaults to Skipped so it is always defined for Send-Telemetry.
@@ -1364,6 +1364,123 @@ function Get-AcmeChallengeDomain {
     return "_acme-challenge.$Domain"
 }
 
+function Resolve-DnsRecord {
+    # One DNS lookup, on either platform. SHARED VERBATIM with Renew-Cert.ps1 since #151, which needs it
+    # to follow the customer's live _acme-challenge CNAME at renewal time.
+    #
+    # Resolve-DnsName is a WINDOWS-ONLY cmdlet. It does not exist on Linux, and DnsClient-PS - the module
+    # bootstrap installs on both platforms - exports Resolve-Dns, NOT Resolve-DnsName. Every DNS lookup in
+    # this file used to call Resolve-DnsName directly, so the creator's CNAME pre-check was dead on Linux:
+    # it could never succeed, it blamed 'outbound DNS is probably blocked by a firewall' while DNS was
+    # working perfectly, and it told the operator to create a CNAME that already existed and was correct -
+    # leaving [S]kip or [A]bort as the only ways out, which means no certificate. The unit tests could not
+    # see it, because the Linux test harness STUBS Resolve-DnsName so the suite has something to mock;
+    # that stub is what made a Windows-only dependency look portable. Found by the first live creator run
+    # on Linux (issue #23 L2c), not by review and not by the suite.
+    #
+    # Returns the answers as plain strings - CNAME targets (trailing dot trimmed, to match the Windows
+    # shape) or A addresses - and THROWS when the lookup fails or answers nothing, so every caller keeps
+    # the try/catch it already had.
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][ValidateSet('A', 'CNAME')][string] $Type,
+        [string] $Server,
+        [switch] $QuickTimeout
+    )
+    if ($IsWindowsHost) {
+        $p = @{ Name = $Name; Type = $Type; ErrorAction = 'Stop' }
+        # -DnsOnly only makes sense against an explicit server (skip NetBIOS/LLMNR), which is how the
+        # probe and the external fallback have always called it.
+        if ($Server)       { $p['Server'] = $Server; $p['DnsOnly'] = $true }
+        if ($QuickTimeout) { $p['QuickTimeout'] = $true }
+        $vals = @(Resolve-DnsName @p | ForEach-Object {
+            if ($_.NameHost)      { [string]$_.NameHost }
+            elseif ($_.IPAddress) { [string]$_.IPAddress }
+        } | Where-Object { $_ })
+    }
+    else {
+        # DnsClient-PS. Its two failure modes differ and BOTH have to end up as a throw here: a missing
+        # record comes back as a result with HasError set and no answers, while an unreachable name
+        # server throws out of the underlying QueryServer call.
+        $p = @{ Query = $Name; QueryType = $Type; ErrorAction = 'Stop' }
+        if ($Server) { $p['NameServer'] = $Server }
+        $r = Resolve-Dns @p
+        if (-not $r -or $r.HasError) {
+            $why = if ($r -and $r.ErrorMessage) { [string]$r.ErrorMessage } else { 'no response' }
+            throw "DNS query for $Name ($Type) failed: $why"
+        }
+        $vals = @($r.Answers | ForEach-Object {
+            if ($_.CanonicalName) { ([string]$_.CanonicalName).TrimEnd('.') }
+            elseif ($_.Address)   { [string]$_.Address }
+        } | Where-Object { $_ })
+    }
+    # @()-wrapped above, so .Count is safe for a single answer (PS 5.1 single-element unwrap).
+    if ($vals.Count -eq 0) { throw "DNS query for $Name ($Type) returned no $Type answer." }
+    return $vals
+}
+
+function Get-ChallengeCnameTarget {
+    # The CNAME the customer actually has on _acme-challenge.<domain>, lower-cased and without a trailing
+    # dot, or $null when there is none or DNS does not answer. Never throws: callers fall back to what they
+    # already know (issue #151). SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Domain)
+    $challengeName = Get-AcmeChallengeDomain -Domain $Domain
+    try {
+        $answers = @(Resolve-DnsRecord -Name $challengeName -Type CNAME)
+        if ($answers.Count -gt 0 -and $answers[0]) { return ([string]$answers[0]).Trim().TrimEnd('.').ToLowerInvariant() }
+    }
+    catch { Write-Log "  No CNAME answer for ${challengeName}: $($_.Exception.Message)" -Level DEBUG }
+    return $null
+}
+
+function Test-AcmeAliasAllowed {
+    # Only a record INSIDE the certval.no delegation may receive a challenge TXT. The alias is handed to the
+    # Domeneshop plugin, which writes wherever it is told, so a customer CNAME that points anywhere else must
+    # never steer a write into another zone on that account. The zone is hard-coded on purpose (never
+    # configurable). At least one label before certval.no; labels may carry the _acme-challenge underscore.
+    # SHARED VERBATIM.
+    param([string] $Alias)
+    if ([string]::IsNullOrWhiteSpace($Alias)) { return $false }
+    return [bool]($Alias -match '^(?:[a-z0-9_](?:[a-z0-9_\-]{0,61}[a-z0-9_])?\.)+certval\.no$')
+}
+
+function Get-DnsAliasArray {
+    # One DnsAlias per name, in order, for Posh-ACME: the record the Domeneshop plugin writes each
+    # challenge TXT to. Per name the source is, in priority: (1) the CNAME the customer actually has on
+    # _acme-challenge.<name>, when it points inside certval.no - that is the record Let's Encrypt follows,
+    # whatever we would have computed; (2) the alias already stored on the order, when the caller has one;
+    # (3) the computed default _acme-challenge.<zone>.certval.no, the record the creator prints for the
+    # customer to create. Before #151 only (3) existed, and its one-dot zone rule sends the apex of a
+    # three-label domain (meloy.kommune.no) to kommune.no.certval.no while its www goes to
+    # meloy.kommune.no.certval.no: the apex TXT landed where Let's Encrypt never looked, and the failure
+    # read as "record N+1 overwrote record N". Live DNS wins; the stored alias is the fallback when DNS
+    # does not answer, so a lookup failure can never make things worse; the computed default only applies
+    # to a name nothing is known about. Never throws. Callers @()-wrap the result (PS 5.1 unwraps a
+    # single element; a leading-comma return would nest under that same @()). SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string[]] $Domains,
+        [string[]] $StoredAliases
+    )
+    $stored  = @($StoredAliases | Where-Object { $_ })
+    $aliases = @()
+    for ($i = 0; $i -lt $Domains.Count; $i++) {
+        $d = $Domains[$i]
+        $computed = Get-AcmeChallengeDomain -Domain "$(Get-DomainSuffix -FQDN $d).certval.no"
+        # Posh-ACME stores either ONE alias for every name or one per name; map both shapes.
+        $storedForName = if ($stored.Count -eq 1) { $stored[0] } elseif ($stored.Count -eq $Domains.Count) { $stored[$i] } else { $null }
+        $live = Get-ChallengeCnameTarget -Domain $d
+        if ($live -and (Test-AcmeAliasAllowed -Alias $live)) { $alias = $live; $source = 'live CNAME' }
+        else {
+            if ($live) { Write-Log "  CNAME for $(Get-AcmeChallengeDomain -Domain $d) points at '$live', outside the certval.no delegation; ignoring it." -Level WARNING }
+            if ($storedForName) { $alias = $storedForName; $source = 'stored alias' }
+            else                { $alias = $computed;      $source = 'computed default' }
+        }
+        Write-Log "  DnsAlias for ${d}: $alias ($source)" -Level DEBUG
+        $aliases += $alias
+    }
+    return $aliases
+}
+
 function Backup-CertConfig {
     # Snapshot the current cert-config.json before it is overwritten, so an admin can diff a save and see
     # what changed (and recover a prior version). Best-effort: writes to <CertRenewalPath>\config-backups\
@@ -1638,6 +1755,56 @@ function Update-IISFTPBinding {
     }
 }
 
+function Repair-OrderDnsAlias {
+    # Bring the saved order's DnsAlias list in line with the CNAMEs the customer actually has
+    # (Get-DnsAliasArray) before Submit-Renewal needs them for a fresh DNS-01 challenge (issue #151: the
+    # apex of a three-label domain was aliased to the wrong certval.no record, so its TXT was written where
+    # Let's Encrypt never looked). Only a LIVE answer inside certval.no can change a stored alias: when DNS
+    # does not answer, the stored value stands, so a lookup failure can never make a renewal worse.
+    # Best-effort (never throws), DryRun-gated, version-guarded (Set-PAOrder -DnsAlias).
+    # Returns 'Current' | 'Updated' | 'DryRun' | 'Failed' | 'Skipped'.
+    param([Parameter(Mandatory)][string] $Domain)
+    try {
+        $setOrder = Get-Command Set-PAOrder -ErrorAction SilentlyContinue
+        if (-not $setOrder -or -not $setOrder.Parameters.ContainsKey('DnsAlias')) {
+            Write-Log "This Posh-ACME cannot set DnsAlias on a saved order; skipping the alias check for $Domain." -Level DEBUG
+            return 'Skipped'
+        }
+        $order = Get-PAOrder -MainDomain $Domain -ErrorAction SilentlyContinue
+        if (-not $order) {
+            Write-Log "No saved order for $Domain; nothing to reconcile." -Level DEBUG
+            return 'Skipped'
+        }
+        $names  = @([string]$order.MainDomain) + @($order.SANs | Where-Object { $_ })
+        $stored = @($order.DnsAlias | Where-Object { $_ })
+        $want   = @(Get-DnsAliasArray -Domains $names -StoredAliases $stored)
+        # One stored alias means "the same for every name": expand it so the comparison is shape-independent.
+        $storedPerName = if ($stored.Count -eq 1) { @($names | ForEach-Object { $stored[0] }) } else { $stored }
+        $changes = @()
+        for ($i = 0; $i -lt $want.Count; $i++) {
+            $was = if ($i -lt $storedPerName.Count) { [string]$storedPerName[$i] } else { '' }
+            if ($was -ne [string]$want[$i]) { $changes += "$($names[$i]): $(if ($was) { $was } else { '(none)' }) -> $($want[$i])" }
+        }
+        if ($changes.Count -eq 0) {
+            Write-Log "DnsAlias on the saved order for $Domain matches the live CNAMEs." -Level DEBUG
+            return 'Current'
+        }
+        $changeText = $changes -join '; '
+        if ($DryRun) {
+            Write-Log "[DryRun] WOULD update DnsAlias on the saved order for $Domain ($changeText)." -Level INFO
+            return 'DryRun'
+        }
+        Set-PAOrder -MainDomain $Domain -DnsAlias $want -ErrorAction Stop
+        Write-Log "Updated DnsAlias on the saved order for $Domain to follow the live CNAMEs ($changeText)." -Level SUCCESS
+        Write-EventLogEntry -EventId $EID.DnsAliasUpdated -EntryType Information -Message "DnsAlias on the Posh-ACME order for $Domain was updated to follow the customer's live _acme-challenge CNAMEs ($changeText)."
+        return 'Updated'
+    }
+    catch {
+        Write-Log "Could not reconcile DnsAlias for ${Domain}: $($_.Exception.Message). Renewal proceeds with the saved aliases." -Level WARNING
+        return 'Failed'
+    }
+}
+
 function New-DomeneshopPluginArgs {
     # The Domeneshop plugin's arguments as Posh-ACME wants them, built from the shared secrets
     # (cert-secrets.json). The ONE place the renewal turns those secrets into plugin args: the self-heal
@@ -1772,12 +1939,16 @@ function Invoke-SelfHealCertificate {
     $allDomains = @($Domain)
     if ($SANs) { $allDomains += @($SANs | Where-Object { $_ }) }
 
-    # One DnsAlias per domain, using the certval.no CNAME pattern
-    $dnsAliasArray = @()
-    foreach ($d in $allDomains) {
-        $suffix = Get-DomainSuffix -FQDN $d
-        $dnsAliasArray += Get-AcmeChallengeDomain -Domain "$suffix.certval.no"
+    # One DnsAlias per domain: the customer's live CNAME inside certval.no, else what the saved order (if
+    # any survives) already used, else the computed default (issue #151). Rebuilding from the computed
+    # default alone is what used to break a three-label apex here.
+    $storedAliases = @()
+    try {
+        $savedOrder = Get-PAOrder -MainDomain $Domain -ErrorAction SilentlyContinue
+        if ($savedOrder) { $storedAliases = @($savedOrder.DnsAlias | Where-Object { $_ }) }
     }
+    catch { Write-Log "  Could not read the saved order for ${Domain}: $($_.Exception.Message)" -Level DEBUG }
+    $dnsAliasArray = @(Get-DnsAliasArray -Domains $allDomains -StoredAliases $storedAliases)
     Write-Log "  Domains: $($allDomains -join ', ')" -Level INFO
     Write-Log "  DnsAlias: $($dnsAliasArray -join ', ')" -Level INFO
 
@@ -3091,6 +3262,10 @@ function Invoke-RenewalCore {
                 }
             }
             catch { Write-Log "Could not heal DnsVariant for ${domain}: $($_.Exception.Message)" -Level WARNING }
+            # The order's DnsAlias list must point where the customer's live _acme-challenge CNAMEs point,
+            # or a fresh DNS-01 challenge lands where Let's Encrypt never looks (issue #151). Best-effort.
+            try { $null = Repair-OrderDnsAlias -Domain $domain }
+            catch { Write-Log "Could not check the DnsAlias list for ${domain}: $($_.Exception.Message)" -Level WARNING }
             # The order's plugin credentials must be readable by THIS identity and match cert-secrets.json
             # before Submit-Renewal needs them for a fresh DNS-01 challenge; an interactively issued cert
             # carries args only its issuer can decrypt (issue #148). Best-effort, DryRun-gated inside.
@@ -3458,8 +3633,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCn9cd3fxRl4iVH
-# jDVbO1jxEj87kkCzYMflajcNbqMSVqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDxt8v2EgmiRu+G
+# osAPuxHX9rlmd4PaZ7uJvXtx9ZBpr6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -3590,31 +3765,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIFs0zX7s3ohBkYVlY3a+FlS0U9W59Ym/Bf1c
-# seLjF7mcMA0GCSqGSIb3DQEBAQUABIIBgLqdiRv+Mj3yQ3nBxamLN75POMkQYs5X
-# zGo90kxX1xJ+9o48TXBY6vpTGtak758yogeyz0doy3YRw8+zIt6aQx2dE6raHhhA
-# ilCiyeWkpevYElgqAiIlLghNxvZfEupG3ZYc5KylZuwY7cuETV+A/DEbEN0mEo9S
-# ig60UKGjvIlQCnSEzgGObKsByEDCiQ95utFcRsX+E0vECwyVxMfSFWUEZTZ8YKo8
-# gSG229YYNPbDJKUjmfruKv9Qwb0l0irJkO3af5FCiAiJJkkRpyhtc5Qd2Er6UhoM
-# fqxK9Q0vXPfmsZRomcsN7j8dhRINfW78/lKV2UG3TUVEcNqlailOkv3vy+UeEKzL
-# 52cCEqT/T4kmoDY4HTEWfL3O7kEyoSwf/Pm1ryYQmqnVz/pgkTVYmno0rcQJnitC
-# 4d1ixSoyqvvKo2Ap7JUt5JvAI/9xvwGU/lUKGVXSHhjmPt7qlJMkwwblpfqHfcQr
-# 5A+1L5cAFXXFypVILHpDQm8yxE7bBEoapaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEICBzbsuy+NhnWePtpNoK4/8kovesv76mj3y1
+# UuWNRm1rMA0GCSqGSIb3DQEBAQUABIIBgEXbxseU76KniY5LHpbUgokcAry+mwrn
+# WBuZed9RddkcocNFxLZ1f+p2opfJ9tlmdMXg6KwIOqbpiT1cfeB6qGHML83p1Ih4
+# pPQ1RQZRse1Yj67olsaJxbFf7q4uXBeeGQxDrjd5pZAbIDcsTjRjqKh21hyyfp70
+# bCBiaIOyh/fs0bhmijN0unBtyp4gl3lR8Um+/TwSkEQr20ZwgE/MtJxIoltE+tjc
+# l2SKxv2ACa/Eul0OkJkl6iEelB4EfNfyS76iGtUEjcSR8DJKU8tdNj8XeNBmoZbS
+# tfb4gwVgDmtOstlvrtqEK7DFRH47SQnnxDfhfu+d1uwSZZJY6fPYInly5cxgCdra
+# c1sz/PzD0b9cckN4lhZNUETW/mn6ZHj+QAyR9XsYhE/XzhusSaKB659NoTdvHeeQ
+# NdPdh7Mg8MeOIKrAg58IaqCQB1uwN5hujoDXQaZJ1TtCLkLEsYPsuAZ8ZZyCXdyG
+# 9fPXUDknoiis9ZvjKxthDcNG053ogqXrIaGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjEwMTQxMDE4MTBaMC8GCSqGSIb3DQEJBDEiBCAMWQWY01jbpfsACqGauWqU
-# QsVTJ6+mthYw0KQBRCeMzDANBgkqhkiG9w0BAQEFAASCAgAj0O+eMHGDzb6cjc0r
-# tl6uCeNvLYpbco9XJN9nDr0MoKr0TKnamVCI1Cj8Qhsrr6AIgmbHcZLQSyr6jOGh
-# 6dxCZ3nMR8ZVfR6/jGG77KswUEH9mltJxjQAouU1AEIC8Togi/deZqZCuBVpndPG
-# 5kAYYbv8IvkR/arywu4EfXS50+ykm19QcnXI3spxZ8F3rxSD4QMGHJLEJRwG//Y2
-# fMjAEHGCGjf5zB/YAYSuCQAgedEF8RU33oEVMdA3t2y3cOCNhAGcJ+lr1fvFR5TH
-# p/qAF3Vd2eUUp9j+yM+ojXRM8/svKi3DVnkbrhIQW04bHVIraIzg9KHgwuPgYL1Z
-# V3M9r78kGn5oR3+LFIOF/UYDGbX0TXTIs/rcCKXniffSW1/HJRqfDrDrK0C67+Mr
-# U4bAiNnEwQAjOxSEAyM4wSglAuyvXjun4H7Amp4G4pH16XOPJjbAigU2LMd5eqwm
-# 01mpNoXIXiLyaeUknmqRxucJ+ctcyni/ObxVYwmjm+CZVgevnj3XvZoy8Ekr1ILx
-# VfbwS8nEVmcEqqwFuyJiA7/3TUs9UxApYObxIbWWPRWoUcjc5u8QW52gq03g1LIj
-# yHQSMK1pRgg5093tCzQBWwlhRAlQwuE/ZpD1qbziRpiO3AxmnXZFN8O4q/k4SGcN
-# VYKJq9Md555fsTRsaF1D3friXg==
+# Fw0yNjEwMjYxMTUyMjRaMC8GCSqGSIb3DQEJBDEiBCAT3GUWtswZo+QbMsEad7sK
+# 0lUp2Gndh9PPYoxFrW7ObDANBgkqhkiG9w0BAQEFAASCAgBdM0/+Q6LwFfcaItgw
+# vGElXVTzAMKfA/DlfEz4vxhKzxTqs7k/l/wkkp0rS0pHDP1Yjee9DPX/shGWCa9Y
+# yksuxQcYtL4Xf2cqI1AeyrxIZ6s5izc5Vt7MsN60c2JIQZf6cbagvzJt2tN0HgGK
+# TiGZFSprxE6pGgcvAqdLq+fzhbPBdAz7AnZsJfxM5ZRMspHAsXKgFPqIW+7/U0yh
+# tmW7ipqA6vRvzjYssA3EW2DF2e4J08I7pMud1LBaMGrnIMLTTmI8ClYc6MQSbU6E
+# 30FLsRzZSiOnUpOnpQpc8vfnhk+haor1FYZywPJWCvCBOQzmEImLBNs2ATMeWwlo
+# YJG7FR50y8OFCTkGBDsR8sPhxDTTF1MlUAhOmteGH6OkichPT2WyOycGWa4XWhgk
+# PhHqc3rWVH6Q6lnn6EEsEMY9AiCocyYnJzwp2xLDdO/vn6tBI7as1JENCB6rTU+/
+# iXDClmui6jAh90YSA8f5zHyhGWUCNyM/OxtkAJv2wDH7LS4ckNypqAtfSudwWM9G
+# 5ewtk8vsHR6SsTSU2GNLietr0pyEBBmpea2evde2do3hP/h8Cc5dr35Jv7b8lBKV
+# 2w2LgaTJrRgsAz0VPQC47ISOY7NoNZqR5cKPawS6gBhpPZ2H+6F+7qjGIsiDRWpn
+# LpUAkwBavfBDFICdyNGGuXfzfw==
 # SIG # End signature block
