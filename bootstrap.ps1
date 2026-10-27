@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.12.0'
+$ScriptVersion = '2.13.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -134,7 +134,7 @@ function Get-PlatformPaths {
             ConfigBackups   = "$root\config-backups"
             PoshAcmeHome    = 'C:\ProgramData\Posh-ACME'
             KeyDir          = $null    # Windows keeps machine credentials in LocalMachine\My, not as files
-            LiveDir         = $null    # 'Files' deployment is Linux-only for now (D9)
+            LiveDir         = "$root\live"   # default export root, <LiveDir>\<MainDomain> per domain (issue #152)
         }
     }
     return [pscustomobject]@{
@@ -2192,8 +2192,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB0CIjc61zNfovj
-# ouWcR7NvFP4rVURdijNbTCDg5NStr6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAQgJeFssybyeju
+# zEOq34awKvp18jV2ESDN009vRmWYlqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -2324,31 +2324,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIDecwKCHQt2mZP8RMcKtqG+qdlGpH14sfkzp
-# d+oWUplmMA0GCSqGSIb3DQEBAQUABIIBgBW/U4dZ3v712VwXtN7XdqhjYACH1EMB
-# b35HfHEFuNgo8xjGZFrMVK4NJZ8XnFYpA6uatO9EeJmfCFLVQzlA5BFVrSM10hH0
-# Vq6F1YAR2qRlcWJZTtYq3Fs8k2QpNtJpqWvJMF4rLUTX6nww5iVAhS8Omzmkom/b
-# agrFF6212gYpA/I4+CZxvq31aykXNNgY71iFvFTkE4CmWLKqfMi5rliwg883ar3G
-# xBIkLpIa1W/lBc5/zOUdb3+b+cPweLKW/U/89UkKGpinhXKVbyzqnPgBUBSy+g+D
-# C1beEZ2XohKNd2DIAId6f6OD8KIvqImZWiecf94juRcwG1XH/PFoFoW6xVM8Llcx
-# CJOuLixG+adQuU3qmG7zBRNByunVs7xaB5caD8uXE3yDUouYW4vv/B+RZ/EE28a7
-# R9vYvqy1odCkifVPhgdRH1gT2C9iVqesTqOd2iX/Xgl7QlmGiw6c9SDX1yzLpi2u
-# Zu7muhYBUOSwWqCSuYicybveMDSaIPRqL6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEIILn/aQJibi6eDKIcCVAT8DBfMbnw2YxO1dl
+# j6tyreTZMA0GCSqGSIb3DQEBAQUABIIBgIFnHCUXr0MNF1OOq7gVaK19qwbYciXU
+# I1J+tN4gRAuEMh4glgUTJzABZE1G5Q6CyIHBVsRYpFutQ2v19g8ufACKEU0t/rkG
+# RrJFsll3RWbnatzLSeOllxPKKM6aiuu8U+6u7mOntnYtuYq7zDHUWTElqcmKkRVx
+# EkMECS6yvmmwciKRyBCLu+lsg+TTFlFKjyJNrgLRL+T0556hRBinFEZKC9VKeRWu
+# 4Itfmh8wPqpzG8/lHuCxdrag7kkfVqmHmzFOtG89DJK82jjfXr8oNKbYtQyLA0d5
+# FAZ5lzCWnY2LJrgw40yZMOQqTxOf6wX9gwynoCtnV/t2mrv25GRgz62ydHB1i4ym
+# AX531PKFteJ27IhlFqTEyt8J0CSgbbCbBGvTLS2wrNd50Y4/QcNcg+HQyDkqTgz3
+# sHGMnrpYI3iNmeauZ63IafUcDTvtsvDGnprIiuapR1s79I3PftCt/tEJkVBrl1kB
+# cGJciVa05fCJQJpMkLDiBBNcn9BUrwJAF6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjEwMjYxMTUyMjJaMC8GCSqGSIb3DQEJBDEiBCDRq/AVrISOmHRXhutK3GU8
-# m/hAO0+Tp2zDJ2fAXh3dXTANBgkqhkiG9w0BAQEFAASCAgCEgDlfoGFdnwjr4eRG
-# R7mUW03wFc/pHnUZrAHrDjX/rcdovH2CaH2+TC3VZGW4S/MHYiUXRE0cVAxIw/YQ
-# ESetpSiRSuQR6xPrwkBkV1pk0x9/onDSCKuCjgrAXpda/X2D+nXGjRG0cBuEibi3
-# x0FkAiNf1E+LMA+l9YAeZrxBy1zvaQ15fLM2TEfthSXCQouFWB+003FCuUuMMxgk
-# 4Nos3K19eFoO3sZ9Zfh/FYCnOkMm7uuXGqIuxkchC6YBLPi34lizZiV22/dP0TWh
-# jtkPyyZnYpHdrdIRbshs/a8WXMTEPOfeeq85G30InFt4IwCbyawE0SNhFhoGOehk
-# ASwxlcjlihEvLm0zDmlc+PijLuNZepIRYLVK7u5qbxGcQ/EN79r7JCepFFg55IMH
-# KyUbK/WShB/yF6h63rt36awiqbgQAwDepPzzLTgFvu/e6lrGBdCAndwe67vydFko
-# UNN7u9N3FUFnEPkmjkD2EWgyzAsLMfbKHF0vcD8DLTuYZFAjCw7Hjd+18wL/pu0E
-# cIujGCXFCZucjBB3yUB0qFMQmoSidmNepeOIe9skcqIJjcDKisVdGjx+FamblTFk
-# Igt5tTUmosuN8dHVV3Y9mUzGztPRGaJ0n0LO64Y/BrsBuTC5o28KVJcs8RJEXWoo
-# /r19IIfKn42Rhwy6xooQxx6m6Q==
+# Fw0yNjEwMjcxNTA0MjlaMC8GCSqGSIb3DQEJBDEiBCAsq1ApP5qvUhJeZhOpPj/a
+# +judSp8B8JXf3HjbeN6U1TANBgkqhkiG9w0BAQEFAASCAgCumP3Z0YWUYhKMcq6k
+# L9ulABcHy5mxOLBIzZuV17G7aqbMk8L80VwuUazd92FNs+zvcfSG3dsLQhOB+l2U
+# a2FPv5M2Yyd0AwXzF7XM9gxBOhdulnZal3QnTZdqpvThiuccWAPez3sLQG3AEJvh
+# 4JMzs1E4Zmagy7LF4U+rsuSZb3wp8kHVn4FM7ZNPYIziXSsTsw3ByTPMCTRcFLfv
+# Zju+5Zcsp9KUC4d2+q4r0hsHnNLPWj47OM76k/VVmBuMzXUx4Orfzw2G+b7CYr1w
+# OcEInwTXeOtQJ2ahoZiPS3y7GP1koOpICF8Rm7cvf/ELDltr4m0lMAWCg68AI1yT
+# wClBRMiZeeKq0Xaw7QeWy63XqKce1jeaazzwRrM4CYh2WICApAVhePa+NDetJ5Fk
+# HBOkmf99oi4Es6hjy5WHn5tt5BzDfhuBjWvFmQBA7bXkrcwuPaxzITA2VeySbDZH
+# nR4rsHcXEAHyVEZOixpxINd4gemKPSIk5XtPNQ+kD9ExlkGlTrz+HlNQ3MB7KMri
+# IVO0p8Vz4So9f1elMTCm+Kw24Kz4NAPmveAFzJVYIiJ4xObKy4Y13N28l1XqdrbB
+# d1m/2kqXYp1KknZUKMNulmkV48g3L/10goDc8iw9Lss8YVbFcKQBYfnlG7JiYTik
+# aT+rL8XDlMFXwkyVW+M6ho9fcg==
 # SIG # End signature block

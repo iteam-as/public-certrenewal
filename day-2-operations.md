@@ -102,6 +102,57 @@ The daily renewal runs the hook, so:
   `CERTRENEWAL_HOOK_NOTAFTER`. An existing script needs no special parameters.
 - On `-DryRun` the renewal logs `WOULD run …` and does not execute it.
 
+## Export the certificate as files for a service (Windows)
+
+nginx, HAProxy, Tomcat, MongoDB and similar want `cert.pem` / `chain.pem` / `fullchain.pem` /
+`privkey.pem` (or one `cert.pfx`) on disk instead of the certificate store. The creator does this for
+any deployment type: at **[A]dd**, after the deployment type, answer **y** to *Also export certificate
+files for a service?*, pick the format (PEM, PFX or both), the directory (default
+`C:\Cert\Renewal\live\<domain>`) and the accounts that may read the files — the service's own account,
+such as `NT SERVICE\nginx` or `CORP\svc-tomcat`; press Enter for administrators only. **[U]pdate** adds,
+changes or removes the export on an existing certificate and writes the files at once; **[D]elete**
+offers to remove them.
+
+What the renewal then does, every night the certificate renews: writes the files, locks the directory
+to Administrators + SYSTEM plus the accounts you named (nothing inherited, reapplied on every run, so a
+directory somebody loosened by hand is tightened again), and tells your hook where they are in
+`CERTRENEWAL_HOOK_CERTDIR`. Use `RestartService` or a post-renewal hook to make the service reload. If
+the export fails you get a warning Teams card (*Certificate Renewed - Post-Renewal Action Failed*) and
+event `1049`; the certificate itself is still renewed and bound.
+
+The private key is written as Posh-ACME produces it (`BEGIN RSA PRIVATE KEY` / `BEGIN EC PRIVATE KEY`),
+the PFX with Posh-ACME's password (`poshacme` unless you changed it). A consumer that insists on PKCS#8
+needs `openssl pkcs8 -topk8 -nocrypt` in a post-renewal hook.
+
+### Manual alternative: a post-renewal hook that exports PEM files
+
+The built-in export above is the normal way. The recipe below is for a box that cannot take the current
+release yet, or for a layout the export does not produce. A post-renewal hook copies Posh-ACME's files
+where the service reads them and locks the directory down. The hook runs inside the renewal, so
+Posh-ACME is loaded and the account is selected. Save this as `C:\Cert\Renewal\hooks\Export-Pem.ps1`
+(administrators-only path) and set it as the certificate's `PostRenewalScript`:
+
+```powershell
+$dir = 'C:\certs\' + $env:CERTRENEWAL_HOOK_DOMAIN          # where the service reads from
+$pa  = Get-PACertificate -MainDomain $env:CERTRENEWAL_HOOK_DOMAIN
+if (-not $pa) { throw "Posh-ACME has no certificate for $env:CERTRENEWAL_HOOK_DOMAIN" }
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+# Administrators + SYSTEM full control, the service account read-only, nothing inherited.
+icacls $dir /inheritance:r /grant:r 'BUILTIN\Administrators:(OI)(CI)F' 'NT AUTHORITY\SYSTEM:(OI)(CI)F' 'NT SERVICE\nginx:(OI)(CI)RX' | Out-Null
+foreach ($pair in @{ 'cert.pem' = $pa.CertFile; 'chain.pem' = $pa.ChainFile; 'fullchain.pem' = $pa.FullChainFile; 'privkey.pem' = $pa.KeyFile }.GetEnumerator()) {
+    Copy-Item -LiteralPath $pair.Value -Destination (Join-Path $dir $pair.Key) -Force
+}
+Restart-Service nginx   # or whatever reloads the consumer
+```
+
+Replace `NT SERVICE\nginx` with the account the service runs as (`CORP\svc-tomcat`, a local user, or
+drop that entry when the service runs as SYSTEM or an administrator). The key is a plaintext private key:
+the `icacls` line is not optional. Two limits of this recipe: hooks fire only on a **scheduled renewal**,
+so the files first appear at the first renewal rather than at issuance (run `Renew-Cert.ps1 -Force` once
+if you need them today), and the key is in the format Posh-ACME writes (`BEGIN RSA PRIVATE KEY` or
+`BEGIN EC PRIVATE KEY`); a consumer that insists on PKCS#8 needs one more `openssl pkcs8 -topk8 -nocrypt`
+step in the hook.
+
 ## Entra Application Proxy certificate sync
 
 If a certificate is published through an **Entra Application Proxy** app, the renewal can push each

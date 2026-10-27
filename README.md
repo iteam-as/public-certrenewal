@@ -62,6 +62,9 @@ missing.
   the **first time only**: bootstrap imports it into the machine certificate store and then deletes the file.
 - [ ] **The customer's billing identifiers**: abbreviation and invoice code are required; customer name,
   number and services are optional. Bootstrap asks for them; they are stamped on alerts and reporting.
+- [ ] **Where the certificate must end up.** An IIS site, an FTP site, a `netsh` binding, just the store —
+  or, for a service that reads PEM/PFX files from disk (nginx, HAProxy, Tomcat, …), a directory and the
+  account that service runs as. The creator asks for all of this.
 - [ ] **A DNS record per certificate name.** Validation uses DNS-01 with a CNAME delegation:
   `_acme-challenge.<your-fqdn>` must be a CNAME pointing into the `certval.no` zone. Get this in place with
   whoever manages the domain's DNS before you add the certificate. If it is missing, the creator pauses and

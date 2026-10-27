@@ -42,7 +42,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue   # for DPAPI ProtectedData
 
 # CI replaces 'DEV' with the release tag (e.g. 2.0.0) at publish time.
-$ScriptVersion = '2.12.0'
+$ScriptVersion = '2.13.0'
 
 # Self-signed code-signing thumbprints trusted for self-updates (array = rotation overlap).
 # Enforced by THIS running script before any atomic replace; never relax via config/manifest.
@@ -106,7 +106,7 @@ function Get-PlatformPaths {
             ConfigBackups   = "$root\config-backups"
             PoshAcmeHome    = 'C:\ProgramData\Posh-ACME'
             KeyDir          = $null    # Windows keeps machine credentials in LocalMachine\My, not as files
-            LiveDir         = $null    # 'Files' deployment is Linux-only for now (D9)
+            LiveDir         = "$root\live"   # default export root, <LiveDir>\<MainDomain> per domain (issue #152)
         }
     }
     return [pscustomobject]@{
@@ -1293,6 +1293,81 @@ function Update-IISFTPBinding {
     }
 }
 
+function Test-FilesExportConfigured {
+    # Does this domain want certificate files on disk? Either the Files deployment TYPE (Linux, or a
+    # hand-made Windows entry) or - since issue #152 - a Files block with a Directory on a bound Windows
+    # Type, meaning "deploy as usual, and ALSO export". The one predicate every gate uses (the renewal's
+    # export step, the self-heal re-deploy, the hook CERTDIR, the creator's re-deploy and delete), so the
+    # gates cannot disagree about what "has files" means. SHARED VERBATIM.
+    param([Parameter(Mandatory)][object] $DomainConfig)
+    if ([string]$DomainConfig.Type -eq 'Files') { return $true }
+    $f = $DomainConfig.Files
+    return [bool]($f -and -not [string]::IsNullOrWhiteSpace([string]$f.Directory))
+}
+
+function Resolve-WindowsPrincipalSid {
+    # Translate an account name (local or domain user or group, an 'NT SERVICE\x' virtual account) to its
+    # SID, or $null when Windows cannot resolve it. Isolated so the creator validates a Files.ReadAccess
+    # answer with the SAME lookup the renewal's ACL uses (a typo is caught at the prompt, not skipped at
+    # 03:00), and so tests can mock the lookup. Windows-only: on Linux there is nothing to resolve against
+    # and it returns $null. SHARED VERBATIM.
+    param([Parameter(Mandatory)][string] $Name)
+    if (-not $IsWindowsHost) { return $null }
+    try {
+        $acct = New-Object System.Security.Principal.NTAccount($Name)
+        return $acct.Translate([System.Security.Principal.SecurityIdentifier])
+    }
+    catch { return $null }
+}
+
+function Set-ExportDirectoryAccess {
+    # The Windows sibling of the 0750 + Owner/Group step on an export directory (issue #152): a PROTECTED
+    # ACL, reapplied every run - inheritance off, Administrators owner, Administrators + SYSTEM full
+    # control by SID, each Files.ReadAccess principal read + execute, inherited by the files (which are
+    # written as .new and MOVED inside the same directory, so they take the inherited rules). Reapplying
+    # on every run is what makes a changed ReadAccess take effect and tightens a directory an admin
+    # loosened by hand - the same reason the Linux 0750 is unconditional. A principal that does not
+    # resolve is skipped with a WARNING; a broad one (Everyone, Users, Authenticated Users, Interactive)
+    # is applied with a WARNING: admin config, the PrivateMode-0644 policy. Never fatal - the files are
+    # already correctly on disk. No-op on Linux, where chmod/chown do this job. SHARED VERBATIM.
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [string[]] $ReadAccess = @()
+    )
+    if (-not $IsWindowsHost) { return }
+    try {
+        $adminSid  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')   # BUILTIN\Administrators
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')        # NT AUTHORITY\SYSTEM
+        $broad     = @('S-1-1-0', 'S-1-5-32-545', 'S-1-5-11', 'S-1-5-4')   # Everyone, Users, Authenticated Users, Interactive
+        $inherit   = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited rules
+        foreach ($sid in $adminSid, $systemSid) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', $inherit, 'None', 'Allow')))
+        }
+        $granted = @()
+        foreach ($name in @($ReadAccess | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+            $sid = Resolve-WindowsPrincipalSid -Name $name
+            if (-not $sid) {
+                Write-Log "  Files.ReadAccess '$name' does not resolve to an account on this box; skipped (the files stay administrators-only for it)." -Level WARNING
+                continue
+            }
+            if ($broad -contains $sid.Value) {
+                Write-Log "  Files.ReadAccess '$name' lets EVERY member of that group read the private key under $Path." -Level WARNING
+            }
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'ReadAndExecute, Synchronize', $inherit, 'None', 'Allow')))
+            $granted += $name
+        }
+        $acl.SetOwner($adminSid)
+        Set-Acl -Path $Path -AclObject $acl
+        $who = if ($granted.Count) { '; read: ' + ($granted -join ', ') } else { '' }
+        Write-Log "  Restricted ACL on $Path (Administrators + SYSTEM$who)." -Level DEBUG
+    }
+    catch { Write-Log "Could not set the ACL on ${Path}: $($_.Exception.Message)" -Level WARNING }
+}
+
 function Get-FilesDeploymentTarget {
     # Resolve the 'Files' deployment settings for a domain (spec section 4). Defaults come from the platform
     # layout - /var/lib/certrenewal/live/<MainDomain>, root:root, 0640 for the public parts and 0600 for the
@@ -1304,26 +1379,43 @@ function Get-FilesDeploymentTarget {
     # be a gratuitous exposure. PrivateMode exists for the service that reads its key AS its own unprivileged
     # user - set Group plus PrivateMode 0640 for that, deliberately, one domain at a time. (Found by the L1c
     # live run: Group alone silently achieved nothing, because 0600 grants the group no access at all.)
-    # Returns $null when the platform has no default live directory and the config names none, which is the
-    # Windows case: 'Files' is allowed there but the creator does not offer it yet, so it must be explicit.
+    # On Windows (issue #152) the default is <LiveDir>\<MainDomain> under the install root, access is the
+    # directory ACL (Administrators + SYSTEM, plus Files.ReadAccess), and Owner/Group/Mode/PrivateMode are
+    # Linux concepts that are warned about and ignored. Returns $null only for a directory this will not
+    # write to: a drive root or the Windows directory (the ACL step strips inheritance there).
     param([Parameter(Mandatory)][object] $DomainConfig)
     $f       = $DomainConfig.Files
     $liveDir = (Get-PlatformPaths).LiveDir
-    # A literal '/' rather than Join-Path, for the same reason Get-PlatformPaths concatenates: Join-Path
-    # uses the RUNNING host's separator, so on Windows it would render the Linux default as
-    # '/var/lib/certrenewal/live\domain'. LiveDir is only ever non-null on Linux, so '/' is always right -
-    # and keeping the function pure lets the Linux layout be verified from either CI leg.
-    $dir     = if ($f -and $f.Directory) { [string]$f.Directory }
-               elseif ($liveDir)         { "$liveDir/" + [string]$DomainConfig.MainDomain }
-               else                      { $null }
+    # Literal separators rather than Join-Path, for the same reason Get-PlatformPaths concatenates:
+    # Join-Path uses the RUNNING host's separator, which is wrong whenever a test (or the Linux CI leg)
+    # resolves the OTHER platform's layout. The separator follows $IsWindowsHost, as LiveDir itself does,
+    # so the function stays pure and both layouts are verifiable from either leg.
+    $dir     = if ($f -and $f.Directory)       { [string]$f.Directory }
+               elseif ($liveDir -and $IsWindowsHost) { "$liveDir\" + [string]$DomainConfig.MainDomain }
+               elseif ($liveDir)                { "$liveDir/" + [string]$DomainConfig.MainDomain }
+               else                             { $null }
     if (-not $dir) { return $null }
-    $formats = if ($f -and $f.Formats) { @($f.Formats | ForEach-Object { ([string]$_).ToLower() }) } else { @('pem', 'pfx') }
+    # @(if ...): an if-expression hands a one-element array back UNWRAPPED (the 5.1 trap, on both runtimes).
+    $formats = @(if ($f -and $f.Formats) { @($f.Formats | ForEach-Object { ([string]$_).ToLower() }) } else { @('pem', 'pfx') })
 
+    if ($IsWindowsHost) {
+        # Set-ExportDirectoryAccess strips inheritance from the directory, so one the OS owns is refused.
+        $norm    = $dir.TrimEnd('\')
+        $sysRoot = if ($env:SystemRoot) { ([string]$env:SystemRoot).TrimEnd('\') } else { $null }
+        if ($norm -match '^[A-Za-z]:$' -or ($sysRoot -and ($norm -eq $sysRoot -or $norm.StartsWith($sysRoot + '\', [StringComparison]::OrdinalIgnoreCase)))) {
+            Write-Log "Files.Directory '$dir' for $($DomainConfig.MainDomain) is a drive root or inside the Windows directory; refusing to export there." -Level WARNING
+            return $null
+        }
+        $linuxOnly = @(foreach ($k in 'Owner', 'Group', 'Mode', 'PrivateMode') { if ($f -and $f.$k) { $k } })
+        if ($linuxOnly.Count) {
+            Write-Log ("Files.{0} for {1} only apply on Linux; on Windows access is the directory ACL (Administrators + SYSTEM, plus Files.ReadAccess)." -f ($linuxOnly -join ' / Files.'), $DomainConfig.MainDomain) -Level WARNING
+        }
+    }
     $privateMode = if ($f -and $f.PrivateMode) { [string]$f.PrivateMode } else { '0600' }
     # A typo in THIS field exposes the private key, so do not let it pass in silence. It is admin config,
     # not one of the hard security gates, so this warns and proceeds rather than refusing - but 0644 or
     # 0666 is almost always a mistake for a key, and 0640 plus Files.Group is what the admin meant.
-    if ($privateMode -match '^[0-7]{3,4}$' -and [int]($privateMode.Substring($privateMode.Length - 1)) -ne 0) {
+    if (-not $IsWindowsHost -and $privateMode -match '^[0-7]{3,4}$' -and [int]($privateMode.Substring($privateMode.Length - 1)) -ne 0) {
         Write-Log ("Files.PrivateMode '{0}' for {1} makes the private key and PFX readable by OTHER (every local user). Use Files.Group with PrivateMode 0640 to grant one service account instead." -f $privateMode, $DomainConfig.MainDomain) -Level WARNING
     }
     [pscustomobject]@{
@@ -1334,12 +1426,15 @@ function Get-FilesDeploymentTarget {
         # Owner-only unless the admin explicitly widens it; 'Mode' must never do so by accident.
         PrivateMode = $privateMode
         Formats     = $formats
+        # Windows: who may read, on top of Administrators + SYSTEM (issue #152). Names, resolved at write time.
+        ReadAccess  = @(if ($f -and $f.ReadAccess) { @($f.ReadAccess | ForEach-Object { [string]$_ } | Where-Object { $_ }) } else { @() })
     }
 }
 
 function Install-CertificateToFiles {
-    # 'Files' deployment (D9, Linux-first): put the renewed certificate on disk where an ordinary service -
-    # nginx, apache, haproxy - can read it, then let RestartService / PostRenewalScript reload that service.
+    # 'Files' deployment (D9, Linux-first; on Windows since issue #152 as an export beside any Type): put
+    # the renewed certificate on disk where an ordinary service - nginx, apache, haproxy, Tomcat - can read
+    # it, then let RestartService / PostRenewalScript reload that service.
     # The files are COPIED from Posh-ACME's own output (CertFile / KeyFile / ChainFile / FullChainFile /
     # PfxFile), so there is no re-derivation and no openssl dependency. Each file is written to a temporary
     # name in the target directory and moved into place, so a consumer reloading mid-run never reads a
@@ -1378,8 +1473,9 @@ function Install-CertificateToFiles {
     }
 
     if ($DryRun) {
-        Write-Log ("[DryRun] WOULD write {0} to {1} ({2}:{3}, {4}/{5}) for {6}." -f `
-            ($wanted.Keys -join ', '), $target.Directory, $target.Owner, $target.Group, $target.Mode, $target.PrivateMode, $domain) -Level INFO
+        $who = if ($IsWindowsHost) { 'Administrators + SYSTEM' + $(if ($target.ReadAccess.Count) { ', read: ' + ($target.ReadAccess -join ', ') } else { '' }) }
+               else { "{0}:{1}, {2}/{3}" -f $target.Owner, $target.Group, $target.Mode, $target.PrivateMode }
+        Write-Log ("[DryRun] WOULD write {0} to {1} ({2}) for {3}." -f ($wanted.Keys -join ', '), $target.Directory, $who, $domain) -Level INFO
         return $true
     }
 
@@ -1394,7 +1490,10 @@ function Install-CertificateToFiles {
         # file itself is chmodded - which is exactly how the L1c live run found this: privkey.pem was
         # 0640 root:www-data and www-data still got "Permission denied" from the 0750 root:root parent.
         # Applying it unconditionally also means changing Files.Group later actually takes effect.
-        Set-FileOwnerAndMode -Path $target.Directory -Owner $target.Owner -Group $target.Group -Mode '0750'
+        # Windows (issue #152): the same idea as a protected ACL - Administrators + SYSTEM, plus the
+        # Files.ReadAccess principals - that the files inherit when they are moved into place below.
+        if ($IsWindowsHost) { Set-ExportDirectoryAccess -Path $target.Directory -ReadAccess $target.ReadAccess }
+        else { Set-FileOwnerAndMode -Path $target.Directory -Owner $target.Owner -Group $target.Group -Mode '0750' }
         foreach ($name in $wanted.Keys) {
             $src  = [string]$wanted[$name].Source
             $dest = Join-Path $target.Directory $name
@@ -2910,6 +3009,13 @@ function New-Certificate {
         Files        = $DomainConfig.Files
     }
     $null = Deploy-Certificate -DomainConfig $deployConfig -NewCert $cert
+    # ALSO export (issue #152): a bound Type with a Files block writes the files now, while the operator is
+    # watching, not at the first scheduled renewal. Type = Files was written by the deploy above.
+    if ($deployConfig.Type -ne 'Files' -and (Test-FilesExportConfigured -DomainConfig $deployConfig)) {
+        if (-not (Install-CertificateToFiles -DomainConfig $deployConfig -NewCert $cert)) {
+            Write-Log '  The certificate is deployed, but the file export failed (see above); the daily renewal retries it.' -Level WARNING
+        }
+    }
     Write-Log "Deployment completed for $mainDomain." -Level SUCCESS
     return $cert
 }
@@ -3048,6 +3154,85 @@ function Read-FilesDeployment {
 
     Write-UiResult ("{0}  owner {1}:{2}  key {3}" -f $dir, $owner, $group, $privateMode) -Kind Ok
     return @{ Type = 'Files'; Guid = $null; NetshIpPorts = $null; Files = [pscustomobject]$files }
+}
+
+function Get-FilesExportSummary {
+    # Creator-only. One line for the Update screen and the export prompt: directory, formats, who may read.
+    param([Parameter(Mandatory)][object] $Files)
+    $fmt = if ($Files.Formats) { (@($Files.Formats | ForEach-Object { ([string]$_).ToLower() }) -join '+') } else { 'pem+pfx' }
+    $who = if ($Files.ReadAccess) { @($Files.ReadAccess) -join ', ' } else { 'administrators only' }
+    return ("{0}  {1}  read: {2}" -f [string]$Files.Directory, $fmt, $who)
+}
+
+function Read-FilesExport {
+    # Creator-only. The Windows half of the Files story (issue #152, D8): "also export the certificate as
+    # files for a service that does not read the store". An ADDITION to whatever deployment type was just
+    # chosen, so it is asked after Read-DeploymentType, never instead of it. Returns $null for "no export",
+    # else the Files block for cert-config.json: Directory always, Formats only when not both, ReadAccess
+    # only when given - the Read-FilesDeployment convention (an absent field means the script default).
+    # -CurrentFiles (Update flow) pre-fills every answer so Enter keeps the export as it is; N removes it.
+    param(
+        [Parameter(Mandatory)][string] $FQDN,
+        [object] $CurrentFiles
+    )
+    $cur = $CurrentFiles
+    $has = [bool]($cur -and $cur.Directory)
+    Write-UiSetting 'Export files' -Current $(if ($has) { Get-FilesExportSummary -Files $cur } else { '(none)' })
+    Write-UiOption 'For a service that reads PEM or PFX files from disk (nginx, HAProxy, Tomcat, ...) instead of the certificate store.'
+    # Read-UiInput only DISPLAYS the default; Enter comes back empty and means "take it".
+    $ans = ([string](Read-UiInput 'Also export certificate files for a service? (y/N)' -Default $(if ($has) { 'Y' } else { 'N' }))).Trim().ToUpper()
+    if (-not $ans) { $ans = if ($has) { 'Y' } else { 'N' } }
+    if ($ans -ne 'Y') {
+        if ($has) { Write-UiResult 'export removed (the files already on disk are left in place)' -Kind Warn }
+        return $null
+    }
+
+    # Format (D7/D8): PEM for OpenSSL-style consumers, PFX for one password-protected bundle, or both.
+    # @(if ...): an if-expression hands a one-element array back UNWRAPPED, and 'pfx'[0] is 'p'.
+    $curFormats = @(if ($cur -and $cur.Formats) { @($cur.Formats | ForEach-Object { ([string]$_).ToLower() }) } else { @('pem', 'pfx') })
+    $defFmt = if ($curFormats.Count -eq 1 -and $curFormats[0] -eq 'pem') { 'P' } elseif ($curFormats.Count -eq 1 -and $curFormats[0] -eq 'pfx') { 'X' } else { 'B' }
+    Write-UiOption '[P] PEM (cert / chain / fullchain / privkey)   [X] PFX (one password-protected bundle)   [B] both'
+    $formats = $null
+    while ($null -eq $formats) {
+        $fmt = ([string](Read-UiInput 'Format' -Default $defFmt)).Trim().ToUpper()
+        if (-not $fmt) { $fmt = $defFmt }
+        switch ($fmt) {
+            'P'     { $formats = @('pem') }
+            'X'     { $formats = @('pfx') }
+            'B'     { $formats = @('pem', 'pfx') }
+            default { Write-UiResult 'Enter P, X or B' -Kind Warn }
+        }
+    }
+
+    # Directory: the platform default under the install root unless the admin names one (D2). A literal
+    # backslash rather than Join-Path, as Get-FilesDeploymentTarget does, so the Linux test leg renders the
+    # Windows layout correctly.
+    $liveDir    = (Get-PlatformPaths).LiveDir
+    $defaultDir = if ($has) { [string]$cur.Directory } elseif ($liveDir) { "$liveDir\$FQDN" } else { "C:\Cert\Renewal\live\$FQDN" }
+    $dir = ([string](Read-UiInput 'Directory' -Default $defaultDir)).Trim()
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = $defaultDir }
+
+    # Read access (D3/D6): validated with the SAME lookup the renewal's ACL uses, so a typo is caught here
+    # and not silently skipped at 03:00. Enter keeps the current list (or none); '-' clears it.
+    $curRead = @(if ($cur -and $cur.ReadAccess) { @($cur.ReadAccess | ForEach-Object { [string]$_ } | Where-Object { $_ }) } else { @() })
+    Write-UiOption "Accounts that may READ the files: the service's account, e.g. NT SERVICE\nginx or CORP\svc-tomcat. Administrators and SYSTEM always can. '-' clears."
+    $readAccess = @()
+    $decided = $false
+    while (-not $decided) {
+        $raw = ([string](Read-UiInput 'Read access (comma-separated, Enter for administrators only)' -Default ($curRead -join ', '))).Trim()
+        if (-not $raw)        { $readAccess = @($curRead); $decided = $true; continue }
+        if ($raw -eq '-')     { $readAccess = @();         $decided = $true; continue }
+        $names = @($raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $bad   = @($names | Where-Object { -not (Resolve-WindowsPrincipalSid -Name $_) })
+        if ($bad.Count) { Write-UiResult "not found on this box: $($bad -join ', ')" -Kind Warn; continue }
+        $readAccess = $names; $decided = $true
+    }
+
+    $files = [ordered]@{ Directory = $dir }
+    if ($formats.Count -eq 1)   { $files['Formats']    = @($formats) }
+    if ($readAccess.Count -gt 0) { $files['ReadAccess'] = @($readAccess) }
+    Write-UiResult (Get-FilesExportSummary -Files ([pscustomobject]$files)) -Kind Ok
+    return [pscustomobject]$files
 }
 
 function Read-DeploymentType {
@@ -3445,7 +3630,8 @@ function Read-DomainsToAdd {
         # Deployment Type (shared with the Update flow)
         $deploy = Read-DeploymentType -FQDN $fqdn -KnownBindings $knownNetsh
         $type = $deploy.Type; $guid = $deploy.Guid; $netshIpPorts = $deploy.NetshIpPorts
-        $files = $deploy.Files   # 'Files' deployment block (Linux); $null on Windows
+        $files = $deploy.Files   # 'Files' deployment block (Linux); on Windows the optional export below (issue #152)
+        if ($IsWindowsHost) { $files = Read-FilesExport -FQDN $fqdn }
 
         # Optional post-renewal service restart (shared with the Update flow)
         $restartService = Read-RestartService
@@ -3632,19 +3818,23 @@ function Invoke-DeleteFlow {
     if ((Read-Host 'Are you sure you want to delete these? (Y/N)').Trim().ToUpper() -ne 'Y') { Write-Log 'Deletion cancelled.' -Level INFO; return }
 
     # On Linux the certificate is a set of FILES, so removing the config entry leaves a private key on
-    # disk. Windows has no equivalent step: the store certificate is deliberately left in place there
-    # too, but it is not sitting in a directory the admin forgets about. Default No - a service may
-    # still be reading them, and deleting a key is not recoverable.
+    # disk; on Windows the same is true of a domain that exported files (issue #152), while the store
+    # certificate is deliberately left in place (it is not sitting in a directory the admin forgets
+    # about). Default No - a service may still be reading them, and deleting a key is not recoverable.
     $removeDirs = @()
-    if (-not $IsWindowsHost) {
-        foreach ($name in $toDelete) {
-            $entry = $domains | Where-Object { [string]$_.MainDomain -eq $name } | Select-Object -First 1
-            $dir = if ($entry -and $entry.Files -and $entry.Files.Directory) { [string]$entry.Files.Directory }
-                   else { $liveRoot = (Get-PlatformPaths).LiveDir; if ($liveRoot) { "$liveRoot/$name" } else { $null } }
-            if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
-            if ((Read-Host "Also delete the deployed certificate files in $dir? (y/N)").Trim().ToUpper() -eq 'Y') { $removeDirs += $dir }
-            else { Write-Log "Leaving $dir in place." -Level INFO }
-        }
+    foreach ($name in $toDelete) {
+        $entry = $domains | Where-Object { [string]$_.MainDomain -eq $name } | Select-Object -First 1
+        if (-not $entry) { continue }
+        if ($IsWindowsHost -and -not (Test-FilesExportConfigured -DomainConfig $entry)) { continue }
+        $dir = if ($entry.Files -and $entry.Files.Directory) { [string]$entry.Files.Directory }
+               else {
+                   $liveRoot = (Get-PlatformPaths).LiveDir
+                   if (-not $liveRoot) { $null } elseif ($IsWindowsHost) { "$liveRoot\$name" } else { "$liveRoot/$name" }
+               }
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
+        # ${dir}: a bare "$dir?" is the variable named 'dir?' - the prompt showed no directory at all before #152.
+        if ((Read-Host "Also delete the deployed certificate files in ${dir}? (y/N)").Trim().ToUpper() -eq 'Y') { $removeDirs += $dir }
+        else { Write-Log "Leaving $dir in place." -Level INFO }
     }
 
     $remaining = @($domains | Where-Object { $toDelete -notcontains [string]$_.MainDomain })
@@ -3750,6 +3940,9 @@ function Invoke-UpdateFlow {
         Write-UiField 'Owner:Group'   ("{0}:{1}" -f $(if ($fx -and $fx.Owner) { $fx.Owner } else { 'root' }), $(if ($fx -and $fx.Group) { $fx.Group } else { 'root' }))
         Write-UiField 'Private key'   $(if ($fx -and $fx.PrivateMode) { [string]$fx.PrivateMode } else { '0600 (default)' })
     }
+    else {
+        Write-UiField 'Export files'  $(if (Test-FilesExportConfigured -DomainConfig $selected) { Get-FilesExportSummary -Files $selected.Files } else { '' })
+    }
     Write-UiField $(if ($IsWindowsHost) { 'Restart service' } else { 'Reload unit' })   ([string]$selected.RestartService)
     Write-UiField 'Pre-renewal hook'  ([string]$selected.PreRenewalScript)
     Write-UiField 'Post-renewal hook' ([string]$selected.PostRenewalScript)
@@ -3771,6 +3964,7 @@ function Invoke-UpdateFlow {
     $deploy = Read-DeploymentType -FQDN ([string]$selected.MainDomain) -KnownBindings $knownNetsh `
         -CurrentType ([string]$selected.Type) -CurrentGuid ([string]$selected.Guid) -CurrentNetshIpPorts ($selected.NetshIpPorts) `
         -CurrentFiles ($selected.Files)
+    if ($IsWindowsHost) { $deploy.Files = Read-FilesExport -FQDN ([string]$selected.MainDomain) -CurrentFiles $selected.Files }   # issue #152
     $restartService = Read-RestartService -Current ([string]$selected.RestartService)
     $preRenewalScript  = Read-RenewalHook -Phase Pre  -Current ([string]$selected.PreRenewalScript)
     $postRenewalScript = Read-RenewalHook -Phase Post -Current ([string]$selected.PostRenewalScript)
@@ -3792,17 +3986,33 @@ function Invoke-UpdateFlow {
                 Initialize-PoshAcme -Config $Config | Out-Null
                 try { Get-PACertificate -MainDomain ([string]$selected.MainDomain) -ErrorAction SilentlyContinue } catch { $null }
             }
+    $deployConfig = [pscustomobject]@{
+        MainDomain   = $selected.MainDomain
+        Type         = $deploy.Type
+        Guid         = $deploy.Guid
+        SANs         = @($selected.SANs | Where-Object { $_ })
+        NetshIpPorts = $deploy.NetshIpPorts
+        Files        = $deploy.Files
+    }
+    # Windows + an export (issue #152): the files are COPIED from Posh-ACME's own output, which the store
+    # object does not carry, so fetch the Posh-ACME certificate too. Absent (a v1 box, a cert issued
+    # elsewhere), the files are written at the next renewal and the flow says so.
+    $paCert = $null
+    if ($IsWindowsHost -and (Test-FilesExportConfigured -DomainConfig $deployConfig)) {
+        Initialize-PoshAcme -Config $Config | Out-Null
+        $paCert = try { Get-PACertificate -MainDomain ([string]$selected.MainDomain) -ErrorAction SilentlyContinue } catch { $null }
+        if (-not $paCert) { Write-Log "Posh-ACME has no certificate for $($selected.MainDomain) on this box; the files are written at the next renewal." -Level WARNING }
+    }
     if ($cert) {
-        $deployConfig = [pscustomobject]@{
-            MainDomain   = $selected.MainDomain
-            Type         = $deploy.Type
-            Guid         = $deploy.Guid
-            SANs         = @($selected.SANs | Where-Object { $_ })
-            NetshIpPorts = $deploy.NetshIpPorts
-            Files        = $deploy.Files
-        }
         Write-Log "Re-deploying existing certificate (thumbprint $($cert.Thumbprint)) as Type=$($deploy.Type)..." -Level INFO
-        $null = Deploy-Certificate -DomainConfig $deployConfig -NewCert $cert
+        # A hand-made Windows Type = Files deploys FROM the Posh-ACME object (the store object has no files).
+        $deployWith = if ($IsWindowsHost -and $deploy.Type -eq 'Files' -and $paCert) { $paCert } else { $cert }
+        $null = Deploy-Certificate -DomainConfig $deployConfig -NewCert $deployWith
+        if ($paCert -and $deploy.Type -ne 'Files') {
+            if (-not (Install-CertificateToFiles -DomainConfig $deployConfig -NewCert $paCert)) {
+                Write-Log '  The certificate is re-deployed, but the file export failed (see above); the daily renewal retries it.' -Level WARNING
+            }
+        }
     }
     else {
         $where = if ($IsWindowsHost) { 'in LocalMachine\My' } else { 'in the Posh-ACME store' }
@@ -4046,8 +4256,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBYrSNugrVhtLPl
-# PkvkXJSkEhmPrlaujptg2QW5PYgYEqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDY6DZF/n4olWdb
+# QEuy1eY8Vado2wD7s6Wje1fqgBWgbqCCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -4178,31 +4388,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEINE4laTtQ/THf+wyjhm16eB10uDtRR2LQ5nd
-# DR4FryxcMA0GCSqGSIb3DQEBAQUABIIBgEk/c/N5dRCGZhLPyCUAa+8/eNbgWDbe
-# 29dvDMbCpEMz4C+ZAdRZP8r9HgohXWA8TeXVK/10N+NK3WQZAv6SGQmdns7T0ABh
-# qh0LBwf7chGX5lCMiNjaBVtj5mts7HXu48j4BJ68NGlAmD5Q2PwWDm7oXeqsFZf3
-# qnna0BanJgHiHSZ8h2Vxtjxhti49+VYzBwHII/eRXAj1HE8sMfxD3/Zj6eHh4tAO
-# 5Mcr2m+eNaDuGjkpy/uM33I3KxOZGSNmVadRzt0Wde4JPcqYf00hwegcH5ZvmmYn
-# xmbc/DjvAnZN+WwoxvLwGC7P+MlbJ8qfA/OWfsfKYAJcOcQb5QWt2Bzzypn3NGaR
-# u6sV/mfgALWMLjyd3LU9AsVfWwqlMoChqYtwW6O1NWO7shRZRi5qGLMv48MHYJzs
-# K3L5DVW8cEu4v1Q88lmza0q9rmRFNGeqcNCJQzlKBV6fc+IB3nL1AHqq+aNEsr1i
-# MB3KayQKK50HMCcxhYZLwGeVVBYlTYvtq6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEICnjbB+xyLMfyLgarr/lMGTPE+1hrFs8fAVZ
+# UjtTQ/pUMA0GCSqGSIb3DQEBAQUABIIBgEkJUQT4X/UhGvl/4s+QybJb7ZRlmvpG
+# KuIXGmLv8K/PJYqIgLud0jZY0hBobDRY7rwhiTAy8gODzVu1J9109jFY4clsziXe
+# 9Sl5NyAYxn8/oDipN2jCudut20IHJ/FVvZxvYv6vPtgYiqshbcHKDc6CDf2qD40j
+# yjq2EwFGExVNbbiRmLFATfvLSulYVhOMukTFh8gHMbkpB4e/OXMY8z/nD9sjwSwZ
+# Id1Sw40V9KZNnMLgU87gU34RvAJPFIcNe8gHV1jcjngWv9avbp96vGOiT9ENr1dP
+# BV5gLK0ezuapmJxy7FylvqM9hLpOVvEAuS2TZBr3EfmSb8VBtGen9eActkHWcL07
+# ZVjS94eZ5QSPpEGpNnJVltBGdXO7vb+MgAicQeKRsXQU51lXrqtR1DHWEV7tRPgF
+# PaZg8qme03zzOg/PElvkxlPphayQz9ux33mjKOFevzcWLMmkcZQ136JHN5spFFRY
+# O75hrezbEoZPEGn/AredkamfCRJF1yg+maGCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjEwMjYxMTUyMjNaMC8GCSqGSIb3DQEJBDEiBCD1ov/DIO+4FxMn+fSBFQI/
-# cn6OLCiS4mMRNRWIx/Iu3DANBgkqhkiG9w0BAQEFAASCAgBho0Y7LA7/r8LS1U11
-# 1kGJ+mXBmyKeXsvuNmM1OZVzvfCwYOkrDfB8xwft/VQ4xO/aSX09fLjeUXqkOYZF
-# 6R8C3uDsDiAc7Oq5x8Lc3FaFGTGOIgOczLlODcTu7WL+ohMxgxQAQeVVqA9ahhxj
-# ZHVEk51FITRhlLgwEUh3+0QBbW6ne0frf/FU04m4a8xiksNHEQatiCIjCeoaL7t4
-# 6Uh/19S/CpKNuPycQHZ8g7rwVFVivk4cMAtUInOlHPNnN5x0qiEuBnUm0qaDlgMy
-# YXPt28Pjk5Fvykv2lv2ZuAoptrZ0yBGlderLOpZwapelmlED56fnh+jerP/CO0de
-# ZcbuEKmNyfdGs3dJO8YKITQf9/+lxglYQG2Qk+AiN23OiJm4+1dzJ2ePykRaq++h
-# E64Y+VSMjGHJrQ5+35hdMmYZndMczhyy65A6mXZ9Hm3HWVXWus4t76aALTpknkkn
-# RcvyAVMFNyd9KUyPZhsAAGro5zIl9FmS0M7tfpWFvAg9eCjOP+BEjcH0F3WB2Pr1
-# oPXKEyJZqd9nyUIUa/ng1K+3RPuiCaG7SDwOyGT8l02RGu8aUqhNlZUhipnFVVjZ
-# Q05f0xLVhhV+dD+G/Uj0t/9W0IrEwhLQj8l9LY4KpVNUCc4kmwozsqAoh+6r1R7a
-# uLoYVx5q8QE7PIPHSl9BHLhIDQ==
+# Fw0yNjEwMjcxNTA0MzBaMC8GCSqGSIb3DQEJBDEiBCBfrGQhTdgNyXZVLCUS4NBu
+# wonRjbXLwtOgVvKOgCS7pTANBgkqhkiG9w0BAQEFAASCAgB32neXQSrTZ/1+jM76
+# 8ePodA2Vp29X78f9xLjopi4sw7TkeyH1e4do03y82pCX6CwXin6aH+mzMeRIWi8/
+# 52x7d7v9qu/D8lpMcqn8HzCXwO7rp/Q4AOdJpvQkjxmG1KJxlkzEoxByU2ZTfiPv
+# 5SZwgZJKdUifk6IARB948uoLksg5nx5n3RcdHh66EnZCJTP8hvxAoE3o7uHv1H3E
+# YVQQc7qDc1No6hToX+mnw3ew8FzGxfdYSDBiBTw/Ti2CTP5yTQGQiGP2FrSNmNZh
+# oXbjdxchnnXKD5FiMM9ptNnBd451Ei5ETo324qpssYNloXeL/xZgWMgPMkdBhF83
+# EzvtvCL60MG+H4ZWjSLzLkSSdmqBHYFUrthlm0OSAh7PaXF/yC3bwkCGg3F4Oyq/
+# AGEmqem0iM66zm993Yi/9xsbQxgYOlgJFpHfsE840k9lRYw0Vvcke2s8nOF2dsVf
+# 190tGiXKFSqu60/no9ISn8VM4V3zXY6qkl9oRW6rPm1oOQ3YDa5RS2ewlYR++Sb1
+# 8Za4MN65JEb8cD5A4vFO9e4cL6WhY9ttVroTsBcf+bvAG44sHty6a/6Kyyrn7jiH
+# oYwLSyDD8PX03/YPiaE+jLhs2SMGJNVfG45+axizp4uCsNB0WmWCeqSjn41l6Ay0
+# UyXNbeyWKaEhGOafZ0NKxFFLtg==
 # SIG # End signature block

@@ -56,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # CI replaces 'DEV' with the release tag (e.g. 2.7.0) at publish time.
-$ScriptVersion = '2.12.0'
+$ScriptVersion = '2.13.0'
 
 # The shared Entra app (one per tenant) the fleet authenticates as to update App Proxy certs.
 $AppName = 'AppProxy-Certificate-Updater'
@@ -143,7 +143,7 @@ function Get-PlatformPaths {
             ConfigBackups   = "$root\config-backups"
             PoshAcmeHome    = 'C:\ProgramData\Posh-ACME'
             KeyDir          = $null    # Windows keeps machine credentials in LocalMachine\My, not as files
-            LiveDir         = $null    # 'Files' deployment is Linux-only for now (D9)
+            LiveDir         = "$root\live"   # default export root, <LiveDir>\<MainDomain> per domain (issue #152)
         }
     }
     return [pscustomobject]@{
@@ -1129,8 +1129,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIIeDwYJKoZIhvcNAQcCoIIeADCCHfwCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAzx5lxopFmM+VU
-# q6mx1y/Dhuy2E/TXEzqbc94LbtELe6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDV/4lM6CdnYJOV
+# T4NzkgE7LTOfhAyogBypwVxSlFStO6CCF6gwggRqMIIC0qADAgECAhA9a+7a4tnR
 # tULR4ioNgMJCMA0GCSqGSIb3DQEBCwUAME0xCzAJBgNVBAYTAk5PMREwDwYDVQQK
 # DAhJdGVhbSBBUzErMCkGA1UEAwwiSXRlYW0gQVMgQ2VydC1SZW5ld2FsIENvZGUg
 # U2lnbmluZzAeFw0yNjA2MDQxMTQyMTJaFw0zNjA2MDQxMTUyMTJaME0xCzAJBgNV
@@ -1261,31 +1261,31 @@ exit $exitCode
 # bSBBUyBDZXJ0LVJlbmV3YWwgQ29kZSBTaWduaW5nAhA9a+7a4tnRtULR4ioNgMJC
 # MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJ
 # KoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQB
-# gjcCARUwLwYJKoZIhvcNAQkEMSIEIBJoDJzlDr70JuS1Vejkoek5Ht6O71CoWJy8
-# y5ebtVxgMA0GCSqGSIb3DQEBAQUABIIBgMw26397pLiWesrnd9v57a3u8KlVYd01
-# yiuxSExsnjtryaQrkGhvQ9LJSCtdp4XHC+u7++TYTPdfK1O4x6/q/8ESqYL0Acf6
-# BBxgpT3BpnKuap6m5PRA7wxwsCcdbMC0/8rOslCS1d6knX3hb0C2iO4Phr9lQYse
-# rLQSXuAJFQ+lcXQUSVpgf8YntM/1krHauew/+cUpTFZViqJHKFHufCa69QL87m5l
-# 75FH0TRB7j0jzOuu9zPWghSMIJBTTfDewIOka4JLT5TjQsJDC5NZR5vekrJJs4sH
-# rCPJoRhTo8BkG8vt4Nb1RvT566pltydbc2pNO4dHH8ozHLwz7OImJ7xKpdF1pH8J
-# 3lCfk/7wv+tYhu/ZjsuVWFApjEQ7pOKwIHQoI4uyrIMf2bSt4iPbM83Cy7q0eTPy
-# m3w+/xiwayLX5I7M0o/yWRwckLSbYvRDFH5Tr4siqQLPmh1GwunFTXGnZYHJpeq8
-# ue/6QzoZvg9+41iQbjx9XrlnkfT9cPTs5qGCAyYwggMiBgkqhkiG9w0BCQYxggMT
+# gjcCARUwLwYJKoZIhvcNAQkEMSIEICvkpEVesWerTbMZsPOE/6HOfGwHRKTNljUa
+# TEksVDSjMA0GCSqGSIb3DQEBAQUABIIBgKw82EIVtUFc4wzdEP3VMADJIdFQkiVa
+# axwxkCoL6EBHMNVc33AWjK38bqhVb4uTGUAGVBfaNqo7sQrMlwUtrglq6SwGyT6o
+# 2YQWIO/qE7IssdGTWviDQX74G65DMWmiCA66oypKVh1XidmZAb7eHrwZWcxyYS17
+# dfhiRSWvK2+hIs2QfND+YCo5B3SlsB7AcNw8XHgpDE0Yx6BbrDzAoCavhk9AR1/k
+# Jh0WqJHVp3Zz86XyEMEAuQ58KIqtoXLEaE3QWXDetnZoTOpf9r5MC/ekj20ZKz0A
+# bZEVmhoyeoJCn9yOgHNIs8JQJbf89BfRTVkLEWkzgjZOk+OTaa5W2xWANVNJAQCo
+# YsA+zJiWZ+sZh0BowiBEIeCimjpvfbWOlHxMuAp3N53F/bDie97ICH4LuQ5Ko5es
+# zxYveyp5D3FQzRZpU/dEU7xFtQOirh8Sdx9t6s8DL9SuPs6CObJHAxWnQgWiz4N7
+# YjSX1iDgb5hdwkwcEMyL6VVdCilrUAxQT6GCAyYwggMiBgkqhkiG9w0BCQYxggMT
 # MIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5j
 # LjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNB
 # NDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUD
 # BAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEP
-# Fw0yNjEwMjYxMTUyMjVaMC8GCSqGSIb3DQEJBDEiBCAcVy3yNAIH94G34E0HjW7O
-# sePlwWj7zJwKpF+qnTr4vTANBgkqhkiG9w0BAQEFAASCAgA5B6H1LlYyi8SC38Dq
-# /aGCmpgJeHfJvbXOX2nRZgtK/6DLWwY4ew4Qk8CU/QU+Eqj9SaYGtuL6/lCPA7IU
-# lkMuzeXOZjZVtcPtYx1wmuCrPIkMT80Ca+9+UZ8E+6vHHVrBtC8ZujmmEeUpt+L9
-# S9sUWzPW0FlRuWVxHFxQXJjPGlkbvsfvsVgNQF9RLpg5zz6L1IVd2a/IMzMrsWN2
-# LpE3pgERX19LRFuNuHnh3Kim8BEwg2YU5xsONNNztQISTTQzE6JjymsPKYPxyvpj
-# 4hIPR1BaeYAzMGzmKUYf33UdWHDgDY3kn7GE+tcM72N9lw6lxXU8MwRt3UurIH3k
-# 7sFjq1t9pP79rrn09zcTA3kB6HUEPHsgDxk36qxjzv3EDoYS6Mj7deAdSZpidJZU
-# Pwez/hpBbvo/6DYkC4SyMUVWUTIbGlMAi4ojNdLD2qOIo9cnyrPBzy8GWvegWnh+
-# g2NVjRXP6gKo2sa7AAszwnK+AN0v/tNr/9NivQZt/4F8sbk2zYYAmDlKqn8vD8pk
-# jgiBcNm3EPlHS9GXDsUTo8ViqvvTFJz/tF5Cu/WieRDXjYwq0CNpKTCrZWVUIOXw
-# qKFMsLzwwvrf/PTrqhaiGHuww5IyIdEBg+PyhoLE9zi1aHtAxNdglpGtoBaUVQI7
-# Hpu2duKiNL72jeEPxjbYnDd/Ng==
+# Fw0yNjEwMjcxNTA0MzNaMC8GCSqGSIb3DQEJBDEiBCA+Nv2Tnt12PvJys8+sPg3G
+# BzV6EEpz5ew05iYHMCTD1jANBgkqhkiG9w0BAQEFAASCAgARDg0OI0tzGV2v/X7S
+# T1cuo9ew5xJNHXN6S2VAxR7psN/rA2Yn01p3I+R98Yy5mNHMPEHoETAUa4pFumIs
+# XGX1i+B2e7aQEtfcnk08bFo9yAYl9zz2n3GrHF8MzUKdX/NNcpUGA//tkM+051CC
+# UsT9Y/CzVaUwImVD4N13yP3+55MFIOGht6ylsuQipf2mcrG4hRSm/2RkAevhXp2/
+# OxmwZmajXBAfKB0pEnrHrhCVPFlvv8jOAkt9NF7xFnZlAXJyZyH+WRvoYf4lYxX9
+# ceCBepzSYvCperm7PM6vgikswIBPjxyX9N4STuP6baHdYvtF0BqJ598pIXaQ23I6
+# GAWz6gS2mX73U2csSgmsWBgimAOZ0Q+M4zEo3+V8gONsdsUHF/xLX8xIUKD0ITGl
+# qBpV4nZGdtYqIzDKhkhGrwxOj+vTIbsdGKTFaMDg2HikHucMrFpNr62HobQ+QJ3a
+# doDHnKmAmNr32czrqR7dIeWhEHzPY8QfNN+svKe+Jezue9v9vmcY8pa7g+uxNt07
+# MQBUG+aa2nY6Il6b29cwkG62kBhIVEvRYefDr43UqLyewQMgoUJ5QakMaX06z2z6
+# o2mBK9u1ojHXUrgnnlZ4bgrON/Rlf5CEDh8vzLxMv2+blm+v69OMUAyFdk7Czrh6
+# zsE9tOaGiNtzILmVHfiGJy7c/w==
 # SIG # End signature block
